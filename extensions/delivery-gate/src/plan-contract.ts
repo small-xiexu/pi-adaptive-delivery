@@ -1,11 +1,23 @@
-export const PLAN_CONTRACT_VERSION = 1 as const;
+import path from "node:path";
+
+export const PLAN_CONTRACT_VERSION = 2 as const;
+export const DOCUMENT_TARGET_CONTRACT_VERSION = 1 as const;
 export const PLAN_RISKS = ["low", "medium", "high"] as const;
 export const PLAN_COMPLEXITIES = ["small", "medium", "large"] as const;
 export const PLAN_UNCERTAINTIES = ["low", "medium", "high"] as const;
+export const DOCUMENT_SELECTION_SOURCES = ["user", "project", "global", "package-default"] as const;
 
 export type PlanRisk = (typeof PLAN_RISKS)[number];
 export type PlanComplexity = (typeof PLAN_COMPLEXITIES)[number];
 export type PlanUncertainty = (typeof PLAN_UNCERTAINTIES)[number];
+export type DocumentSelectionSource = (typeof DOCUMENT_SELECTION_SOURCES)[number];
+
+export interface PlanningDocumentsContract {
+	requirementName: string;
+	solutionPath: string;
+	planPath: string;
+	selectionSource: DocumentSelectionSource;
+}
 
 export interface ValidationCommand {
 	id: string;
@@ -25,6 +37,7 @@ export interface ApprovedPlanContract {
 	risk: PlanRisk;
 	complexity: PlanComplexity;
 	uncertainty: PlanUncertainty;
+	documents: PlanningDocumentsContract;
 	validation: readonly ValidationCommand[];
 	progressTargets: readonly string[];
 	progressChecks: readonly ProgressCheck[];
@@ -32,6 +45,49 @@ export interface ApprovedPlanContract {
 
 function oneOf<T extends readonly string[]>(value: unknown, options: T): value is T[number] {
 	return typeof value === "string" && (options as readonly string[]).includes(value);
+}
+
+function planningDocumentPath(value: unknown): string | undefined {
+	if (typeof value !== "string" || !value.trim() || value.includes("\0") || /[\r\n\\]/.test(value)) return undefined;
+	const input = value.trim();
+	if (input.length > 512 || path.isAbsolute(input)) return undefined;
+	const normalized = path.normalize(input);
+	if (
+		normalized !== input ||
+		normalized === "." ||
+		normalized === ".." ||
+		normalized.startsWith(`..${path.sep}`) ||
+		path.extname(normalized).toLowerCase() !== ".md"
+	) {
+		return undefined;
+	}
+	const first = normalized.split(path.sep)[0];
+	if (!first || first === ".git" || first === ".pi" || first === "node_modules") return undefined;
+	return normalized;
+}
+
+export function parsePlanningDocumentsValue(value: unknown): PlanningDocumentsContract | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const input = value as Record<string, unknown>;
+	const keys = Object.keys(input).sort();
+	const allowed = ["planPath", "requirementName", "selectionSource", "solutionPath"].sort();
+	if (keys.length !== allowed.length || keys.some((key) => !allowed.includes(key))) return undefined;
+	if (
+		typeof input.requirementName !== "string" ||
+		!input.requirementName.trim() ||
+		Buffer.byteLength(input.requirementName.trim(), "utf8") > 240 ||
+		/[\u0000-\u001f\u007f/\\]/u.test(input.requirementName) ||
+		!oneOf(input.selectionSource, DOCUMENT_SELECTION_SOURCES)
+	) {
+		return undefined;
+	}
+	const requirementName = input.requirementName.trim();
+	const solutionPath = planningDocumentPath(input.solutionPath);
+	const planPath = planningDocumentPath(input.planPath);
+	if (!solutionPath || !planPath || solutionPath === planPath) return undefined;
+	if (!path.basename(solutionPath, ".md").includes(requirementName)) return undefined;
+	if (!path.basename(planPath, ".md").includes(requirementName)) return undefined;
+	return { requirementName, solutionPath, planPath, selectionSource: input.selectionSource };
 }
 
 function parseValidation(value: unknown): ValidationCommand[] | undefined {
@@ -118,7 +174,7 @@ export function parsePlanContractValue(value: unknown): ApprovedPlanContract | u
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const input = value as Record<string, unknown>;
 	const keys = Object.keys(input).sort();
-	const allowed = ["complexity", "progressChecks", "progressTargets", "risk", "uncertainty", "validation", "version"].sort();
+	const allowed = ["complexity", "documents", "progressChecks", "progressTargets", "risk", "uncertainty", "validation", "version"].sort();
 	if (keys.some((key) => !allowed.includes(key))) return undefined;
 	if (
 		input.version !== PLAN_CONTRACT_VERSION ||
@@ -129,21 +185,25 @@ export function parsePlanContractValue(value: unknown): ApprovedPlanContract | u
 		return undefined;
 	}
 	const validation = parseValidation(input.validation);
+	const documents = parsePlanningDocumentsValue(input.documents);
 	const progressTargets = parseProgressTargets(input.progressTargets);
 	const progressChecks = parseProgressChecks(input.progressChecks);
-	if (!validation || !progressTargets || !progressChecks) return undefined;
+	if (!validation || !documents || !progressTargets || !progressChecks || !progressTargets.includes(documents.planPath)) {
+		return undefined;
+	}
 	return {
 		version: PLAN_CONTRACT_VERSION,
 		risk: input.risk,
 		complexity: input.complexity,
 		uncertainty: input.uncertainty,
+		documents,
 		validation,
 		progressTargets,
 		progressChecks,
 	};
 }
 
-function textFromContent(content: unknown): string {
+export function textFromContent(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
@@ -152,6 +212,21 @@ function textFromContent(content: unknown): string {
 		)
 		.map((item) => item.text)
 		.join("\n");
+}
+
+export function parsePlanningDocumentsFromContent(content: unknown): PlanningDocumentsContract | undefined {
+	const text = textFromContent(content);
+	const matches = [...text.matchAll(/```adaptive-delivery-documents\s*\n([\s\S]*?)\n```/g)];
+	if (matches.length !== 1) return undefined;
+	try {
+		const parsed = JSON.parse(matches[0]![1]!);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const { version, ...documents } = parsed as Record<string, unknown>;
+		if (version !== DOCUMENT_TARGET_CONTRACT_VERSION) return undefined;
+		return parsePlanningDocumentsValue(documents);
+	} catch {
+		return undefined;
+	}
 }
 
 export function parsePlanContractFromContent(content: unknown): ApprovedPlanContract | undefined {

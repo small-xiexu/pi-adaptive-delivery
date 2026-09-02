@@ -79,6 +79,8 @@ test("fails closed for malformed or unknown persisted state", () => {
 			updatedAt: NOW.toISOString(),
 		},
 		{ version: 1, snapshot: { state: "VALIDATING" }, validationStatus: "unknown", updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "PLANNING" }, planningDocuments: { version: 1 }, updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "PLANNING" }, proposedDocuments: { requirementName: "x" }, updatedAt: NOW.toISOString() },
 	];
 
 	for (const data of malformedStates) {

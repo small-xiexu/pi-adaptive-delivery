@@ -81,10 +81,12 @@ pi install /absolute/path/to/pi-adaptive-delivery
 
 ```text
 /delivery-approve-solution
-/delivery-plan
 /delivery-approve-plan
-/delivery-run
 ```
+
+批准 solution 后会在对话区显示状态并自动生成实施计划；批准 plan 后会先同步两份规划文档，再自动开始实现。
+
+`/delivery-approve-plan` 的确认框会显示当前需求名称、技术方案路径、实施计划路径和选择来源。确认后 Package 先 create-only 写入两份需求级 Markdown；任一文件已存在或路径无法证明时保持只读，不会覆盖文件或进入实现。
 
 ### 小型低风险任务
 
@@ -92,8 +94,9 @@ pi install /absolute/path/to/pi-adaptive-delivery
 
 ```text
 /delivery-approve-plan
-/delivery-run
 ```
+
+批准后自动同步两份规划文档并开始实现。
 
 ### 阻塞恢复
 
@@ -109,14 +112,16 @@ pi install /absolute/path/to/pi-adaptive-delivery
 | 命令 | 作用 |
 |---|---|
 | `/delivery-status` | 显示状态、阻塞原因、断点和下一步 |
-| `/delivery-approve-solution` | TUI 用户确认当前技术方案 |
-| `/delivery-approve-plan` | TUI 用户确认当前实施计划或合并方案 |
+| `/delivery-approve-solution` | TUI 用户确认当前技术方案；成功后自动进入 `/delivery-plan` |
+| `/delivery-approve-plan` | TUI 用户确认当前实施计划或合并方案；文档同步成功后自动进入 `/delivery-run` |
 | `/delivery-revise [plan]` | 撤销批准并返回方案或计划阶段 |
 | `/delivery-resume` | TUI 用户确认后从 BLOCKED 恢复 |
 | `/delivery-force-release-lease` | TUI 用户确认后强制释放当前 workspace lease |
 | `/delivery-cancel` | 取消流程并锁定只读 |
 
 approve、resume 和 force-release 必须在真实 TUI 中弹出用户确认。RPC、JSON、print、Extension 注入消息和 child 请求不能独立放宽权限。
+
+`/delivery-plan` 和 `/delivery-run` 仍可手工调用，但正常流程无需输入；它们用于自动续跑失败后的恢复。自动续跑失败会在 TUI 显示 warning 和应手工执行的命令，不会重新批准或扩大权限。
 
 ## 模型可调用工具
 
@@ -195,21 +200,52 @@ Package 不硬编码 Provider 或模型。可以在 `~/.pi/agent/settings.json` 
 
 模型名称只是当前环境示例。请根据自己的 Provider、额度和模型目录调整，并使用 `/subagents-models` 检查实际映射。
 
+## 需求级规划文档
+
+Package 先服从当前用户要求、项目 `AGENTS.md`/文档路由和用户全局规则。已有总技术方案或总计划默认只作为背景事实；没有其他规则时使用：
+
+```text
+docs/<需求短名称>-技术方案.md
+docs/<需求短名称>-实施计划.md
+```
+
+技术方案和实施计划先作为不可变 Session 消息获得批准，再由 `/delivery-approve-plan` 同步到上述新文件。两份文件成功落盘前不会开放源码写权限。Session message 是授权主体，项目文档是长期记录。
+
+下方 marker 和 JSON fence 是内部协议。TUI 使用 display-only transformer 隐藏它们，写入项目文档时也会移除；用户只看到并保存人类可读的方案、路径说明和计划正文。
+
+技术方案中的路径契约示例：
+
+```adaptive-delivery-documents
+{
+  "version": 1,
+  "requirementName": "避免重复扣款",
+  "solutionPath": "docs/避免重复扣款-技术方案.md",
+  "planPath": "docs/避免重复扣款-实施计划.md",
+  "selectionSource": "user"
+}
+```
+
 ## 实施计划契约
 
-`/delivery-plan` 会在人类可读计划后附加一个严格 JSON fence：
+`/delivery-plan` 会在标记的计划正文中附加一个严格 JSON fence：
 
 ````markdown
 ```adaptive-delivery-plan
 {
-  "version": 1,
+  "version": 2,
   "risk": "medium",
   "complexity": "medium",
   "uncertainty": "low",
+  "documents": {
+    "requirementName": "避免重复扣款",
+    "solutionPath": "docs/避免重复扣款-技术方案.md",
+    "planPath": "docs/避免重复扣款-实施计划.md",
+    "selectionSource": "user"
+  },
   "validation": [
     { "id": "typecheck", "command": "npm run typecheck", "timeoutMs": 120000 }
   ],
-  "progressTargets": ["docs/实施计划.md"],
+  "progressTargets": ["docs/避免重复扣款-实施计划.md"],
   "progressChecks": [
     { "id": "diff-check", "command": "git", "args": ["diff", "--check"], "timeoutMs": 30000 }
   ]
@@ -217,13 +253,17 @@ Package 不硬编码 Provider 或模型。可以在 `~/.pi/agent/settings.json` 
 ```
 ````
 
-该 block 只绑定风险分类、验证命令和可选 progress target/check，不定义项目的进度格式。
+该 block 绑定风险分类、需求级文档路径、选择来源、验证命令和 progress target/check，不定义项目的进度格式。`documents.planPath` 必须同时出现在 `progressTargets` 中。
+
+plan contract v1 不包含规划文档身份，当前版本会失败关闭并要求重新生成、重新批准。
 
 ## 安全与恢复
 
 - Package/Extension 以当前用户权限运行，不是沙箱。
 - writer lease 只约束加载本 Package 的受控 Pi 流程，不能阻止外部编辑器或其他进程。
 - candidate digest 用于检测外部变化，不证明代码正确。
+- planning document sync 只 create-only 新 Markdown，不覆盖现有总文档或同名需求文档。
+- 内部 planning marker/contract 保留在 Session 原始消息用于批准与恢复，但不在 TUI 或需求级文档正文中显示。
 - 未知 process-terminal proof 不会按超时自动释放 lease。
 - force-release 可能遗留未知 writer，必须人工确认风险。
 - progress-sync 使用 exact target、realpath、逐级 symlink 检查、`O_NOFOLLOW`、target/parent dev+ino 复验和固定 argv checks。

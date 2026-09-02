@@ -30,7 +30,16 @@ import {
 	type ResumeState,
 } from "./src/domain.ts";
 import { PolicyController } from "./src/policy.ts";
-import { parsePlanContractFromContent } from "./src/plan-contract.ts";
+import {
+	parsePlanContractFromContent,
+	parsePlanningDocumentsFromContent,
+} from "./src/plan-contract.ts";
+import {
+	assertPlanningDocumentsExist,
+	extractPlanningDocumentContent,
+	stripAdaptiveDeliveryProtocol,
+	writePlanningDocuments,
+} from "./src/planning-documents.ts";
 import {
 	READONLY_DELEGATE_ROLES,
 	SubagentBoundary,
@@ -74,6 +83,10 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		applySubagentAccess: (access) => subagents.applyAccess(access),
 	});
 
+	pi.registerMarkdownTransformer((markdown, context) =>
+		context.messageType === "assistant" ? stripAdaptiveDeliveryProtocol(markdown) : markdown,
+	);
+
 	function updateStatus(ctx: ExtensionContext): void {
 		const label = formatDeliveryState(state.snapshot.state);
 		ctx.ui.setStatus(STATUS_KEY, state.snapshot.state === "BLOCKED" ? ctx.ui.theme.fg("warning", label) : label);
@@ -112,6 +125,36 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (text) texts.push(text);
 		}
 		return texts.join("\n\n").slice(0, 20000);
+	}
+
+	function approvalMessageContent(ctx: ExtensionContext, record: ApprovalRecord | undefined): unknown | undefined {
+		if (!record) return undefined;
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (!entry || typeof entry !== "object" || entry.type !== "message" || entry.id !== record.entryId) continue;
+			if (entry.message.role === "assistant") return entry.message.content;
+		}
+		return undefined;
+	}
+
+	function queueAutomaticContinuation(
+		ctx: ExtensionContext,
+		command: "/delivery-plan" | "/delivery-run",
+		message: string,
+	): void {
+		try {
+			pi.sendMessage({
+				customType: "pi-adaptive-delivery.status",
+				content: message,
+				display: true,
+			});
+			pi.sendUserMessage(command, { expandPromptTemplates: true });
+			ctx.ui.notify(message, "info");
+		} catch (error) {
+			ctx.ui.notify(
+				`${message}\n自动继续失败：${error instanceof Error ? error.message : String(error)}\n请手动运行 ${command}`,
+				"warning",
+			);
+		}
 	}
 
 	function readOnlyContext() {
@@ -171,7 +214,15 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			canonicalCwd: identity.cwdPath,
 			gitRoot: identity.gitRoot,
 		}, requirement);
-		return result.ok ? undefined : result.reason;
+		if (!result.ok) return result.reason;
+		if (state.planningDocuments) {
+			try {
+				await assertPlanningDocumentsExist(identity.gitRoot, state.planningDocuments);
+			} catch (error) {
+				return `Planning documents cannot be proven: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
+		return undefined;
 	}
 
 	async function restore(ctx: ExtensionContext): Promise<void> {
@@ -416,9 +467,37 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			ctx.ui.notify("实施计划缺少唯一有效的 adaptive-delivery-plan 契约。", "error");
 			return;
 		}
+		const proposedDocuments = kind === "solution" || kind === "combined"
+			? parsePlanningDocumentsFromContent(target.content)
+			: state.proposedDocuments;
+		if (!proposedDocuments) {
+			ctx.ui.notify("当前方案缺少唯一有效的 adaptive-delivery-documents 契约。", "error");
+			return;
+		}
+		if (
+			planContract &&
+			digestApprovalContent(proposedDocuments) !== digestApprovalContent(planContract.documents)
+		) {
+			ctx.ui.notify("实施计划中的规划文档路径与已批准技术方案不一致。", "error");
+			return;
+		}
+		let planningDocumentContent: { solution: string; plan: string } | undefined;
+		if (planContract) {
+			const solutionSource = kind === "combined"
+				? target.content
+				: approvalMessageContent(ctx, state.approvals?.solution);
+			const solution = extractPlanningDocumentContent(solutionSource, "solution");
+			const plan = extractPlanningDocumentContent(target.content, "plan");
+			if (!solution || !plan) {
+				ctx.ui.notify("技术方案或实施计划缺少唯一有效的规划文档内容标记。", "error");
+				return;
+			}
+			planningDocumentContent = { solution, plan };
+		}
+		const documentSummary = `\n需求：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n路径来源：${proposedDocuments.selectionSource}`;
 		const confirmed = await requireTuiUserConfirmation(ctx, {
 			title: kind === "solution" ? "确认技术方案" : kind === "plan" ? "确认实施计划" : "确认方案与计划",
-			message: `批准当前 assistant 条目 ${record.entryId}？\nSHA-256: ${record.contentDigest}`,
+			message: `批准当前 assistant 条目 ${record.entryId}？\nSHA-256: ${record.contentDigest}${documentSummary}`,
 		});
 		if (!confirmed) {
 			ctx.ui.notify("未授予权限。", "warning");
@@ -449,11 +528,62 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 		state = checkpointRuntimeState(state, {
 			approvals: { ...state.approvals, [kind]: record },
+			proposedDocuments,
 			...(planContract ? { planContract } : {}),
 		});
 		const widening = transition.snapshot.state === "IMPLEMENTING";
-		if (widening && !(await ensureParentWriterLease(ctx))) return;
-		commitSnapshot(transition.snapshot, ctx, widening);
+		if (widening) {
+			if (!planContract || !planningDocumentContent) {
+				setBlocked("Planning document contract is missing", resumableState(state.snapshot.state));
+				persistCurrentState();
+				updateStatus(ctx);
+				return;
+			}
+			if (!(await ensureParentWriterLease(ctx))) return;
+			try {
+				const identity = await resolveWorkspaceIdentity(ctx.cwd);
+				const planningDocuments = await writePlanningDocuments({
+					gitRoot: identity.gitRoot,
+					documents: planContract.documents,
+					solutionContent: planningDocumentContent.solution,
+					planContent: planningDocumentContent.plan,
+				});
+				state = checkpointRuntimeState(state, {
+					planningDocuments,
+					checkpoint: {
+						summary: `Planning documents synchronized for ${planningDocuments.requirementName}`,
+						nextReadyAction: "Enter implementation using the approved requirement documents",
+					},
+				});
+			} catch (error) {
+				let releaseError: string | undefined;
+				try {
+					if (!(await releaseParentLeaseIfOwned())) releaseError = "writer lease ownership is unproven";
+				} catch (releaseFailure) {
+					releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
+				}
+				const reason = `Planning document synchronization failed: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; ${releaseError}` : ""}`;
+				setBlocked(reason, resumableState(state.snapshot.state));
+				persistCurrentState();
+				updateStatus(ctx);
+				ctx.ui.notify(reason, "error");
+				return;
+			}
+		}
+		if (!commitSnapshot(transition.snapshot, ctx, widening)) return;
+		if (kind === "solution") {
+			queueAutomaticContinuation(
+				ctx,
+				"/delivery-plan",
+				`技术方案已批准：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n正在生成实施计划...`,
+			);
+		} else {
+			queueAutomaticContinuation(
+				ctx,
+				"/delivery-run",
+				`实施计划已批准，规划文档已同步：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n正在开始实现...`,
+			);
+		}
 	}
 
 	pi.registerCommand("delivery-status", {
@@ -493,6 +623,11 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				`Candidate：${state.candidateDigest ? `${state.candidateDigest} (${candidateValidity})` : "不可证明"}`,
 				`Validation：${state.validationStatus ? `${state.validationStatus} (${evidenceValidity})` : "不可证明"}${state.validationRunId ? ` (${state.validationRunId})` : ""}`,
 				`Review：${state.reviewEvidence ? `${state.reviewEvidence.verdict} (${reviewValidity})` : "不可证明"}`,
+				`规划文档：${state.planningDocuments
+					? `${state.planningDocuments.requirementName} (${state.planningDocuments.solutionPath}, ${state.planningDocuments.planPath}; synced)`
+					: state.proposedDocuments
+						? `${state.proposedDocuments.requirementName} (${state.proposedDocuments.solutionPath}, ${state.proposedDocuments.planPath}; pending)`
+						: "不可证明"}`,
 				`Progress-sync：${state.checkpoint?.summary?.startsWith("progress-sync") ? state.checkpoint.summary : "inactive"}`,
 				...(state.blockingReason ? [`阻塞原因：${state.blockingReason}`] : []),
 				...(state.checkpoint?.summary ? [`断点：${state.checkpoint.summary}`] : []),
@@ -540,7 +675,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			}
 			state = checkpointRuntimeState(state, {
 				approvals: event.type === "REVISE_PLAN" ? { solution: state.approvals?.solution } : {},
+				proposedDocuments: event.type === "REVISE_PLAN" ? state.proposedDocuments : undefined,
 				planContract: undefined,
+				planningDocuments: undefined,
 				candidateDigest: undefined,
 				validationRunId: undefined,
 				validationStatus: undefined,
@@ -1063,8 +1200,10 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			state = checkpointRuntimeState(state, {
 				snapshot: { state: target },
 				approvals: target === "PLANNING" ? { solution: state.approvals?.solution } : {},
+				proposedDocuments: target === "PLANNING" ? state.proposedDocuments : undefined,
 				writerLease: undefined,
 				planContract: undefined,
+				planningDocuments: undefined,
 				candidateDigest: undefined,
 				validationRunId: undefined,
 				validationStatus: undefined,

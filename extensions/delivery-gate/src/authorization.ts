@@ -4,8 +4,16 @@ import {
 	type ApprovalMessageEntry,
 } from "./approvals.ts";
 import type { DeliveryState } from "./domain.ts";
-import { parsePlanContractFromContent } from "./plan-contract.ts";
+import {
+	parsePlanContractFromContent,
+	parsePlanningDocumentsFromContent,
+	type PlanningDocumentsContract,
+} from "./plan-contract.ts";
 import type { DeliveryRuntimeState } from "./runtime-state.ts";
+import {
+	digestPlanningDocumentContent,
+	extractPlanningDocumentContent,
+} from "./planning-documents.ts";
 
 export interface AuthorizationContext {
 	sessionId: string;
@@ -34,6 +42,13 @@ function effectiveState(state: DeliveryRuntimeState): DeliveryState {
 		: state.snapshot.state;
 }
 
+function samePlanningDocuments(left: PlanningDocumentsContract, right: PlanningDocumentsContract): boolean {
+	return left.requirementName === right.requirementName &&
+		left.solutionPath === right.solutionPath &&
+		left.planPath === right.planPath &&
+		left.selectionSource === right.selectionSource;
+}
+
 export function validateAuthorizationBundle(
 	state: DeliveryRuntimeState,
 	context: AuthorizationContext,
@@ -52,6 +67,13 @@ export function validateAuthorizationBundle(
 	if (needsSolution && !state.approvals?.solution) {
 		return { ok: false, reason: "A valid solution approval is required before planning" };
 	}
+	if (needsSolution && state.approvals?.solution) {
+		const entry = approvalEntry(context.branch, state.approvals.solution.entryId);
+		const proposed = entry ? parsePlanningDocumentsFromContent(entry.message.content) : undefined;
+		if (!proposed || !state.proposedDocuments || !samePlanningDocuments(proposed, state.proposedDocuments)) {
+			return { ok: false, reason: "Planning document paths do not match the approved solution entry" };
+		}
+	}
 	if (needsImplementationBundle) {
 		const combined = state.approvals?.combined;
 		const standard = state.approvals?.solution && state.approvals?.plan;
@@ -63,10 +85,40 @@ export function validateAuthorizationBundle(
 			return { ok: false, reason: "Approved plan contract is missing" };
 		}
 		const entry = approvalEntry(context.branch, planApproval.entryId);
-		const parsed = entry ? parsePlanContractFromContent(entry.message.content) : undefined;
+		if (!entry) return { ok: false, reason: "Approved plan entry is absent" };
+		const parsed = parsePlanContractFromContent(entry.message.content);
 		if (!parsed) return { ok: false, reason: "Approved plan entry no longer contains a valid plan contract" };
 		if (digestApprovalContent(parsed) !== digestApprovalContent(state.planContract)) {
 			return { ok: false, reason: "Runtime plan contract does not match the approved assistant entry" };
+		}
+		const solutionApproval = combined ?? state.approvals?.solution;
+		const solutionEntry = solutionApproval ? approvalEntry(context.branch, solutionApproval.entryId) : undefined;
+		const proposed = solutionEntry ? parsePlanningDocumentsFromContent(solutionEntry.message.content) : undefined;
+		const solutionContent = solutionEntry
+			? extractPlanningDocumentContent(solutionEntry.message.content, "solution")
+			: undefined;
+		const planContent = extractPlanningDocumentContent(entry.message.content, "plan");
+		const documents = state.planningDocuments;
+		if (
+			!proposed ||
+			!state.proposedDocuments ||
+			!samePlanningDocuments(proposed, state.proposedDocuments) ||
+			!samePlanningDocuments(state.proposedDocuments, state.planContract.documents) ||
+			!solutionContent ||
+			!planContent ||
+			!documents
+		) {
+			return { ok: false, reason: "Approved planning documents have not been synchronized" };
+		}
+		if (
+			documents.requirementName !== state.planContract.documents.requirementName ||
+			documents.solutionPath !== state.planContract.documents.solutionPath ||
+			documents.planPath !== state.planContract.documents.planPath ||
+			documents.selectionSource !== state.planContract.documents.selectionSource ||
+			documents.solutionContentDigest !== digestPlanningDocumentContent(solutionContent) ||
+			documents.planContentDigest !== digestPlanningDocumentContent(planContent)
+		) {
+			return { ok: false, reason: "Planning document evidence does not match the approved entries" };
 		}
 	}
 	if ((targetState === "VALIDATING" || targetState === "REWORKING") && !state.candidateDigest) {

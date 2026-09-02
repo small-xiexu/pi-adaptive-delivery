@@ -13,6 +13,7 @@ description: 使用技术方案、实施计划、用户授权、单 writer、真
 4. 只有 runtime 执行的 gate 是 verified evidence。
 5. review 必须绑定当前 candidate digest，并使用 fresh context。
 6. commit、push、PR、发布和部署需要独立授权。
+7. 技术方案和实施计划必须在源码实现前同步为目标项目中的需求级 Markdown。
 
 ## 先用大白话对齐最终效果
 
@@ -27,6 +28,23 @@ description: 使用技术方案、实施计划、用户授权、单 writer、真
 
 技术术语和实现细节放在第二层，并说明它们如何支撑前述效果。实施计划中的每个里程碑都必须对应已批准效果或验收项；无法对应的工作不进入当前任务。开发、测试或 review 期间若需要改变最终效果、范围、架构、非目标或验收标准，必须停止并请求 `/delivery-revise`，不能借实现细节静默偏离原计划。
 
+## 规划文档路径
+
+先读取并服从用户明确要求、目标项目最近的 `AGENTS.md` 与文档索引、用户全局规则；Package 默认只补空白。已有总技术方案或总实施计划默认是只读背景，不因为存在就自动追加。除非规则明确要求复用，否则使用同一需求短名称创建：
+
+```text
+docs/<需求短名称>-技术方案.md
+docs/<需求短名称>-实施计划.md
+```
+
+需求短名称描述稳定用户目标，不使用日期、版本尾缀、代码行号或可能变化的实现方式。方案回复必须展示需求名、两条路径和 `user|project|global|package-default` 选择来源。规则冲突、远程 Issue/TODO、多个唯一台账候选或路径职责不明确时停止询问，不能静默 fallback。
+
+solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 只 create-only 写入两份新 Markdown；目标存在或任一路径无法证明时保持只读。两份文档成功并记录摘要后才进入 `IMPLEMENTING`。Session entry 仍是批准主体，文件不能反向授予权限。
+
+这些 marker 和 JSON fence 只属于内部协议；Extension 在 TUI 显示和规划文档落盘时隐藏它们。父会话仍需输出完整协议供原始 Session 解析，但面向用户的正文不能要求用户阅读或解释内部 JSON。
+
+正常 TUI 流程只要求用户执行批准动作：solution approval 成功后 Extension 显示可见状态并自动展开 `/delivery-plan`；plan approval、文档同步和策略提交成功后显示两条路径并自动展开 `/delivery-run`。两条命令继续作为手工恢复入口。非 TUI、用户取消、同步或状态提交失败不得自动继续；自动发送本身失败时保留已批准状态并明确提示手工命令。
+
 ## 自适应路由
 
 - 小型、低风险、低不确定性：单强 Agent + focused validation。
@@ -39,7 +57,7 @@ description: 使用技术方案、实施计划、用户授权、单 writer、真
 
 技术方案回答“为什么改、改成什么”，必须基于当前项目事实，并包含目标、非目标、验收、设计、取舍和风险。
 
-实施计划回答“如何落地和证明完成”，必须包含有序里程碑、边界、测试、停止条件，并在结尾给出唯一 `adaptive-delivery-plan` JSON fence。该 fence 只承载批准的风险分类、验证命令和可选 progress target/check，不定义项目进度格式。
+实施计划回答“如何落地和证明完成”，必须包含有序里程碑、边界、测试、停止条件，并给出唯一 `adaptive-delivery-plan` v2 JSON fence。该 fence 只承载批准的风险分类、需求级文档路径、验证命令和 progress target/check，不定义项目进度格式。
 
 ## 子 Agent 契约
 

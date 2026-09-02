@@ -15,8 +15,14 @@ import {
 } from "./workspace.ts";
 import {
 	parsePlanContractValue,
+	parsePlanningDocumentsValue,
 	type ApprovedPlanContract,
+	type PlanningDocumentsContract,
 } from "./plan-contract.ts";
+import {
+	parsePlanningDocumentEvidence,
+	type PlanningDocumentEvidence,
+} from "./planning-documents.ts";
 
 export const DELIVERY_STATE_CUSTOM_TYPE = "pi-adaptive-delivery.state";
 export const DELIVERY_RUNTIME_STATE_VERSION = 1 as const;
@@ -48,7 +54,9 @@ export interface DeliveryRuntimeState {
 	goal?: string;
 	approvals?: Partial<Record<ApprovalKind, ApprovalRecord>>;
 	writerLease?: WriterLeaseReference;
+	proposedDocuments?: PlanningDocumentsContract;
 	planContract?: ApprovedPlanContract;
+	planningDocuments?: PlanningDocumentEvidence;
 	candidateDigest?: string;
 	validationRunId?: string;
 	validationStatus?: "pending" | "passed" | "failed";
@@ -190,10 +198,26 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 	}
 
 	let planContract: ApprovedPlanContract | undefined;
+	let proposedDocuments: PlanningDocumentsContract | undefined;
+	if (input.proposedDocuments !== undefined) {
+		proposedDocuments = parsePlanningDocumentsValue(input.proposedDocuments);
+		if (!proposedDocuments) {
+			const reason = "Delivery planning document proposal is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
 	if (input.planContract !== undefined) {
 		planContract = parsePlanContractValue(input.planContract);
 		if (!planContract) {
 			const reason = "Delivery plan contract is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
+	let planningDocuments: PlanningDocumentEvidence | undefined;
+	if (input.planningDocuments !== undefined) {
+		planningDocuments = parsePlanningDocumentEvidence(input.planningDocuments);
+		if (!planningDocuments) {
+			const reason = "Delivery planning document evidence is malformed";
 			return { ok: false, state: blockedState(reason, now), reason };
 		}
 	}
@@ -293,8 +317,10 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			...(optionalString(input.taskId) ? { taskId: optionalString(input.taskId) } : {}),
 			...(optionalString(input.goal) ? { goal: optionalString(input.goal) } : {}),
 			...(approvals ? { approvals } : {}),
-			...(writerLease ? { writerLease } : {}),
-			...(planContract ? { planContract } : {}),
+				...(writerLease ? { writerLease } : {}),
+				...(proposedDocuments ? { proposedDocuments } : {}),
+				...(planContract ? { planContract } : {}),
+				...(planningDocuments ? { planningDocuments } : {}),
 			...(candidateDigest ? { candidateDigest } : {}),
 			...(validationRunId ? { validationRunId } : {}),
 			...(validationStatus ? { validationStatus } : {}),

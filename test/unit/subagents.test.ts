@@ -329,15 +329,21 @@ test("builds validation spawn only from the approved plan contract", async () =>
 		});
 	});
 	const plan = {
-		version: 1,
+		version: 2,
 		risk: "medium",
 		complexity: "medium",
 		uncertainty: "low",
+		documents: {
+			requirementName: "候选验证",
+			solutionPath: "docs/候选验证-技术方案.md",
+			planPath: "docs/候选验证-实施计划.md",
+			selectionSource: "package-default",
+		},
 		validation: [
 			{ id: "typecheck", command: "npm run typecheck", timeoutMs: 120000 },
 			{ id: "unit", command: "npm test", timeoutMs: 120000 },
 		],
-		progressTargets: [],
+		progressTargets: ["docs/候选验证-实施计划.md"],
 		progressChecks: [],
 	} as const;
 	const candidate = "a".repeat(64);

@@ -45,7 +45,13 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 		assert.match(prompt.body, /adaptive-delivery/i, prompt.name);
 	}
 	assert.match(prompts[0]!.body, /不得修改项目文件/);
+	assert.match(prompts[0]!.body, /adaptive-delivery:solution:start/);
+	assert.match(prompts[0]!.body, /adaptive-delivery-documents/);
+	assert.match(prompts[0]!.body, /用户明确要求.*项目规则.*用户全局规则.*Package 默认/);
 	assert.match(prompts[1]!.body, /本阶段禁止项目写入/);
+	assert.match(prompts[1]!.body, /adaptive-delivery:plan:start/);
+	assert.match(prompts[1]!.body, /"version": 2/);
+	assert.match(prompts[1]!.body, /documents\.planPath/);
 	assert.match(prompts[2]!.body, /delivery_submit_candidate/);
 	assert.match(prompts[2]!.body, /可验证关闭义务/);
 	assert.match(prompts[2]!.body, /closure review/);
@@ -65,6 +71,11 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /可验证关闭义务/);
 	assert.match(skill.body, /一次 closure review/);
 	assert.match(skill.body, /同一最小复现仍失败/);
+	assert.match(skill.body, /规划文档路径/);
+	assert.match(skill.body, /docs\/<需求短名称>-技术方案\.md/);
+	assert.match(skill.body, /create-only/);
+	assert.match(skill.body, /自动展开 `\/delivery-plan`/);
+	assert.match(skill.body, /自动展开 `\/delivery-run`/);
 	assert.doesNotMatch(skill.body, /默认最多三轮/);
 	assert.match(skill.body, /不得重放结果未知/);
 });
