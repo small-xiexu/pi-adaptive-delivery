@@ -1,0 +1,66 @@
+{
+  "name": "pi-adaptive-delivery",
+  "version": "0.1.0",
+  "description": "Adaptive, approval-gated delivery orchestration for Pi coding tasks",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "delivery",
+    "subagents"
+  ],
+  "files": [
+    "README.md",
+    "docs/技术方案.md",
+    "docs/实施计划.md",
+    "extensions",
+    "prompts",
+    "skills"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/delivery-gate/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "npm run test:unit",
+    "test:unit": "node --import tsx --test test/unit/*.test.ts",
+    "test:integration": "node --import tsx --test test/integration/*.test.ts",
+    "test:e2e": "node --import tsx --test test/e2e/*.test.ts",
+    "test:all": "npm run test:unit && npm run test:integration && npm run test:e2e"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "pi-subagents": "0.62.0"
+  },
+  "bundledDependencies": [
+    "pi-subagents"
+  ],
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@types/node": "25.0.3",
+    "typebox": "1.3.7",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3"
+  }
+}
