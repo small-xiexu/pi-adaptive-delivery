@@ -52,6 +52,45 @@ test("restores the latest state from the active branch entries", () => {
 	assert.equal(result.state.snapshot.state, "BLOCKED");
 	assert.equal(result.state.snapshot.resumeState, "VALIDATING");
 	assert.equal(result.state.blockingReason, "candidate changed");
+
+	const infrastructureFailure = parseRuntimeState({
+		version: 1,
+		snapshot: { state: "BLOCKED", resumeState: "VALIDATING" },
+		validationStatus: "failed",
+		validationFailureKind: "infrastructure",
+		updatedAt: "2026-01-01T00:03:00.000Z",
+	}, NOW);
+	assert.equal(infrastructureFailure.ok, true);
+	assert.equal(infrastructureFailure.state.validationFailureKind, "infrastructure");
+
+	const passedValidation = parseRuntimeState({
+		version: 1,
+		snapshot: { state: "VALIDATING" },
+		candidateDigest: "b".repeat(64),
+		validationRunId: "validation-batch",
+		validationStatus: "passed",
+		validationEvidence: {
+			candidateDigest: "b".repeat(64),
+			runId: "validation-batch",
+			outcome: "passed",
+			commands: [{ id: "unit", status: "passed", durationMs: 25, exitCode: 0 }],
+			completedAt: "2026-01-01T00:03:30.000Z",
+		},
+		updatedAt: "2026-01-01T00:03:30.000Z",
+	}, NOW);
+	assert.equal(passedValidation.ok, true);
+	assert.equal(passedValidation.state.validationEvidence?.commands[0]?.status, "passed");
+
+	const runningWorker = parseRuntimeState({
+		version: 1,
+		snapshot: { state: "IMPLEMENTING" },
+		workerRunId: "worker-run",
+		workerStatus: "running",
+		workerLaunchContractDigest: "a".repeat(64),
+		updatedAt: "2026-01-01T00:04:00.000Z",
+	}, NOW);
+	assert.equal(runningWorker.ok, true);
+	assert.equal(runningWorker.state.workerStatus, "running");
 });
 
 test("uses IDLE when the active branch has no delivery state", () => {
@@ -78,7 +117,58 @@ test("fails closed for malformed or unknown persisted state", () => {
 			approvals: { solution: { version: 1, kind: "solution" } },
 			updatedAt: NOW.toISOString(),
 		},
+		{
+			version: 1,
+			snapshot: { state: "VALIDATING" },
+			candidateDigest: "b".repeat(64),
+			validationRunId: "validation-batch",
+			validationStatus: "failed",
+			validationFailureKind: "infrastructure",
+			validationEvidence: {
+				candidateDigest: "b".repeat(64),
+				runId: "validation-batch",
+				outcome: "failed",
+				commands: [{ id: "unit", status: "failed", durationMs: 1, exitCode: 1 }],
+				completedAt: NOW.toISOString(),
+			},
+			updatedAt: NOW.toISOString(),
+		},
 		{ version: 1, snapshot: { state: "VALIDATING" }, validationStatus: "unknown", updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "VALIDATING" }, validationStatus: "failed", validationFailureKind: "unknown", updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "VALIDATING" }, validationStatus: "pending", validationFailureKind: "candidate", updatedAt: NOW.toISOString() },
+		{
+			version: 1,
+			snapshot: { state: "VALIDATING" },
+			candidateDigest: "b".repeat(64),
+			validationRunId: "validation-batch",
+			validationStatus: "passed",
+			validationEvidence: {
+				candidateDigest: "b".repeat(64),
+				runId: "other-batch",
+				outcome: "passed",
+				commands: [{ id: "unit", status: "passed", durationMs: 1 }],
+				completedAt: NOW.toISOString(),
+			},
+			updatedAt: NOW.toISOString(),
+		},
+		{
+			version: 1,
+			snapshot: { state: "VALIDATING" },
+			candidateDigest: "b".repeat(64),
+			validationRunId: "validation-batch",
+			validationStatus: "passed",
+			validationEvidence: {
+				candidateDigest: "b".repeat(64),
+				runId: "validation-batch",
+				outcome: "passed",
+				commands: [{ id: "unit", status: "failed", durationMs: 1 }],
+				completedAt: NOW.toISOString(),
+			},
+			updatedAt: NOW.toISOString(),
+		},
+		{ version: 1, snapshot: { state: "IMPLEMENTING" }, workerStatus: "running", updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "IMPLEMENTING" }, workerStatus: "unknown", updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "IMPLEMENTING" }, workerLaunchContractDigest: "bad", updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "PLANNING" }, planningDocuments: { version: 1 }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "PLANNING" }, proposedDocuments: { requirementName: "x" }, updatedAt: NOW.toISOString() },
 	];

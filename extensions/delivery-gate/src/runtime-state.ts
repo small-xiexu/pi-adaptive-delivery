@@ -41,6 +41,19 @@ export interface ReviewEvidence {
 	completedAt: string;
 }
 
+export interface ValidationEvidence {
+	candidateDigest: string;
+	runId: string;
+	outcome: "passed" | "failed" | "infrastructure";
+	commands: Array<{
+		id: string;
+		status: "passed" | "failed" | "timed-out" | "cancelled" | "error";
+		durationMs: number;
+		exitCode?: number;
+	}>;
+	completedAt: string;
+}
+
 export interface FinalEvidence {
 	candidateDigest: string;
 	progressArtifacts: Array<{ path: string; digest: string }>;
@@ -57,9 +70,14 @@ export interface DeliveryRuntimeState {
 	proposedDocuments?: PlanningDocumentsContract;
 	planContract?: ApprovedPlanContract;
 	planningDocuments?: PlanningDocumentEvidence;
+	workerRunId?: string;
+	workerStatus?: "starting" | "running" | "completed" | "failed";
+	workerLaunchContractDigest?: string;
 	candidateDigest?: string;
 	validationRunId?: string;
 	validationStatus?: "pending" | "passed" | "failed";
+	validationFailureKind?: "candidate" | "infrastructure";
+	validationEvidence?: ValidationEvidence;
 	reviewEvidence?: ReviewEvidence;
 	reworkApproved?: boolean;
 	finalEvidence?: FinalEvidence;
@@ -221,6 +239,27 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			return { ok: false, state: blockedState(reason, now), reason };
 		}
 	}
+	const workerRunId = optionalString(input.workerRunId);
+	const workerStatus = input.workerStatus;
+	if (
+		workerStatus !== undefined &&
+		workerStatus !== "starting" &&
+		workerStatus !== "running" &&
+		workerStatus !== "completed" &&
+		workerStatus !== "failed"
+	) {
+		const reason = "Delivery worker status is malformed";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
+	if ((workerStatus === "running" || workerStatus === "completed" || workerStatus === "failed") && !workerRunId) {
+		const reason = "Delivery worker status requires a run id";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
+	const workerLaunchContractDigest = optionalString(input.workerLaunchContractDigest);
+	if (workerLaunchContractDigest && !/^[a-f0-9]{64}$/.test(workerLaunchContractDigest)) {
+		const reason = "Delivery worker launch contract digest is malformed";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
 	const candidateDigest = optionalString(input.candidateDigest);
 	if (candidateDigest && !/^[a-f0-9]{64}$/.test(candidateDigest)) {
 		const reason = "Delivery candidate digest is malformed";
@@ -236,6 +275,101 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 	) {
 		const reason = "Delivery validation status is malformed";
 		return { ok: false, state: blockedState(reason, now), reason };
+	}
+	const validationFailureKind = input.validationFailureKind;
+	if (
+		validationFailureKind !== undefined &&
+		(validationFailureKind !== "candidate" && validationFailureKind !== "infrastructure")
+	) {
+		const reason = "Delivery validation failure kind is malformed";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
+	if (validationFailureKind !== undefined && validationStatus !== "failed") {
+		const reason = "Delivery validation failure kind requires failed validation status";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
+	let validationEvidence: ValidationEvidence | undefined;
+	if (input.validationEvidence !== undefined) {
+		if (!input.validationEvidence || typeof input.validationEvidence !== "object" || Array.isArray(input.validationEvidence)) {
+			const reason = "Delivery validation evidence is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+		const evidence = input.validationEvidence as Record<string, unknown>;
+		const commands = Array.isArray(evidence.commands) ? evidence.commands : undefined;
+		const seen = new Set<string>();
+		if (
+			typeof evidence.candidateDigest !== "string" ||
+			!/^[a-f0-9]{64}$/.test(evidence.candidateDigest) ||
+			typeof evidence.runId !== "string" ||
+			!evidence.runId ||
+			(evidence.outcome !== "passed" && evidence.outcome !== "failed" && evidence.outcome !== "infrastructure") ||
+			!commands ||
+			commands.length > 12 ||
+			!commands.every((value) => {
+				if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+				const command = value as Record<string, unknown>;
+				if (
+					typeof command.id !== "string" ||
+					!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(command.id) ||
+					seen.has(command.id) ||
+					(command.status !== "passed" && command.status !== "failed" && command.status !== "timed-out" && command.status !== "cancelled" && command.status !== "error") ||
+					typeof command.durationMs !== "number" ||
+					!Number.isInteger(command.durationMs) ||
+					command.durationMs < 0 ||
+					(command.exitCode !== undefined && (typeof command.exitCode !== "number" || !Number.isInteger(command.exitCode)))
+				) return false;
+				seen.add(command.id);
+				return true;
+			}) ||
+			typeof evidence.completedAt !== "string" ||
+			Number.isNaN(Date.parse(evidence.completedAt))
+		) {
+			const reason = "Delivery validation evidence is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+		if (evidence.outcome === "passed" && (commands.length === 0 || commands.some((value) => (value as Record<string, unknown>).status !== "passed"))) {
+			const reason = "Passed validation evidence contains a non-passing command";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+		validationEvidence = {
+			candidateDigest: evidence.candidateDigest,
+			runId: evidence.runId,
+			outcome: evidence.outcome,
+			commands: commands.map((value) => {
+				const command = value as Record<string, unknown>;
+				return {
+					id: command.id as string,
+					status: command.status as ValidationEvidence["commands"][number]["status"],
+					durationMs: command.durationMs as number,
+					...(typeof command.exitCode === "number" ? { exitCode: command.exitCode } : {}),
+				};
+			}),
+			completedAt: evidence.completedAt,
+		};
+		if (
+			validationEvidence.runId !== validationRunId ||
+			validationEvidence.candidateDigest !== candidateDigest ||
+			validationStatus === undefined ||
+			validationStatus === "pending" ||
+			(validationStatus === "passed" && validationEvidence.outcome !== "passed") ||
+			(validationStatus === "failed" && validationEvidence.outcome === "passed") ||
+			(validationEvidence.outcome === "failed" && validationFailureKind !== "candidate") ||
+			(validationEvidence.outcome === "infrastructure" && validationFailureKind !== "infrastructure")
+		) {
+			const reason = "Delivery validation evidence does not match validation state";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+		if (planContract) {
+			const expected = planContract.validation;
+			const prefixMatches = validationEvidence.commands.every((command, index) => command.id === expected[index]?.id);
+			if (
+				!prefixMatches ||
+				(validationEvidence.outcome !== "infrastructure" && validationEvidence.commands.length !== expected.length)
+			) {
+				const reason = "Delivery validation evidence does not match the approved plan contract";
+				return { ok: false, state: blockedState(reason, now), reason };
+			}
+		}
 	}
 	let reviewEvidence: ReviewEvidence | undefined;
 	if (input.reviewEvidence !== undefined) {
@@ -317,13 +451,18 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			...(optionalString(input.taskId) ? { taskId: optionalString(input.taskId) } : {}),
 			...(optionalString(input.goal) ? { goal: optionalString(input.goal) } : {}),
 			...(approvals ? { approvals } : {}),
-				...(writerLease ? { writerLease } : {}),
-				...(proposedDocuments ? { proposedDocuments } : {}),
-				...(planContract ? { planContract } : {}),
-				...(planningDocuments ? { planningDocuments } : {}),
+			...(writerLease ? { writerLease } : {}),
+			...(proposedDocuments ? { proposedDocuments } : {}),
+			...(planContract ? { planContract } : {}),
+			...(planningDocuments ? { planningDocuments } : {}),
+			...(workerRunId ? { workerRunId } : {}),
+			...(workerStatus ? { workerStatus } : {}),
+			...(workerLaunchContractDigest ? { workerLaunchContractDigest } : {}),
 			...(candidateDigest ? { candidateDigest } : {}),
 			...(validationRunId ? { validationRunId } : {}),
 			...(validationStatus ? { validationStatus } : {}),
+			...(validationFailureKind ? { validationFailureKind } : {}),
+			...(validationEvidence ? { validationEvidence } : {}),
 			...(reviewEvidence ? { reviewEvidence } : {}),
 			...(typeof input.reworkApproved === "boolean" ? { reworkApproved: input.reworkApproved } : {}),
 			...(finalEvidence ? { finalEvidence } : {}),

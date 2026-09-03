@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -31,8 +32,19 @@ import {
 } from "./src/domain.ts";
 import { PolicyController } from "./src/policy.ts";
 import {
+	formatDocumentSelectionSource,
+	formatEvidenceValidity,
+	formatReviewVerdict,
+	formatRuntimeText,
+	formatValidationStatus,
+	formatValidationVerifyStatus,
+	formatWriterKind,
+	formatWorkerStatus,
+} from "./src/presentation.ts";
+import {
 	parsePlanContractFromContent,
 	parsePlanningDocumentsFromContent,
+	selectDeliveryRoute,
 } from "./src/plan-contract.ts";
 import {
 	assertPlanningDocumentsExist,
@@ -53,10 +65,16 @@ import {
 	type DeliveryRuntimeState,
 } from "./src/runtime-state.ts";
 import { WriterLeaseManager, resolveWorkspaceIdentity } from "./src/workspace.ts";
+import {
+	runApprovedValidation,
+	type ValidationBatchResult,
+	type ValidationCommandResult,
+} from "./src/validation.ts";
 
 const STATUS_KEY = "adaptive-delivery";
 const SERIALIZED_DELIVERY_TOOLS = new Set([
 	"delivery_begin",
+	"delivery_delegate_worker",
 	"delivery_submit_candidate",
 	"delivery_validate",
 	"delivery_review_candidate",
@@ -81,7 +99,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		getActiveTools: () => pi.getActiveTools(),
 		setActiveTools: (names) => pi.setActiveTools(names),
 		applySubagentAccess: (access) => subagents.applyAccess(access),
-	});
+	}, { baselineKey: leaseStateRoot });
 
 	pi.registerMarkdownTransformer((markdown, context) =>
 		context.messageType === "assistant" ? stripAdaptiveDeliveryProtocol(markdown) : markdown,
@@ -187,6 +205,102 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			: undefined;
 	}
 
+	function plannedImplementationWriter(): "parent" | "worker" | undefined {
+		if (!state.planContract) return undefined;
+		return selectDeliveryRoute(state.planContract) === "single" ? "parent" : "worker";
+	}
+
+	function implementationWriter(): "parent" | "worker" {
+		return plannedImplementationWriter() ?? "parent";
+	}
+
+	function runtimePhaseGuidance(): string {
+		if (state.snapshot.state === "BLOCKED") {
+			return "当前保持只读。先解决阻塞原因，再由 TUI 用户执行 /delivery-resume；Agent 不能自行恢复权限。";
+		}
+		switch (state.snapshot.state) {
+			case "IMPLEMENTING":
+			case "REWORKING":
+				return implementationWriter() === "worker"
+					? "当前由唯一 worker 执行已批准实现；父 Pi 不得修改源码。调用 delivery_delegate_worker，worker 成功结束后会自动冻结候选并进入验证。"
+					: "当前是 small/low/low 直接实现路径；父 Pi 完成后调用 delivery_submit_candidate。验证与审查工具会在候选提交后的下一轮出现。";
+			case "VALIDATING":
+				if (state.validationStatus === "pending") {
+					return "固定验证工具尚未写入终态；不要重复启动。若 Pi 已 reload 或上次工具被中断，先确认没有遗留命令，再由 TUI 用户恢复并重试同一候选。";
+				}
+				if (state.validationStatus === "failed" && state.validationFailureKind !== "candidate") {
+					return "验证命令未能可靠执行或终态未保存；解决本机执行问题后重试 delivery_validate，不要返工代码。";
+				}
+				if (state.validationStatus === "failed" || state.reviewEvidence?.verdict === "BLOCK") {
+					return "批准命令未通过或审查阻塞。先判断原因属于候选代码、验证环境还是已批准计划；只有代码问题才使用 delivery_begin_rework，计划错误使用 /delivery-revise。";
+				}
+				if (state.validationStatus === "passed" && state.reviewEvidence) {
+					return "验证和审查证据已就绪；确认仍绑定当前候选后调用 delivery_finalize。";
+				}
+				if (state.validationStatus === "passed") {
+					return "固定验证已通过；下一步使用 delivery_review_candidate 审查同一候选。";
+				}
+				return "候选已冻结；下一步使用 delivery_validate。验证通过后再使用 delivery_review_candidate。";
+			case "SHAPING":
+			case "SOLUTION_PENDING_APPROVAL":
+			case "PLANNING":
+			case "PLAN_PENDING_APPROVAL":
+			case "COMBINED_PENDING_APPROVAL":
+				return "当前只能只读梳理方案或计划；批准必须由 TUI 用户完成。";
+			case "IDLE":
+				return "当前尚未开始交付流程；修改型任务先使用 delivery_begin。";
+			case "DELIVERED":
+			case "CANCELLED":
+				return "当前流程已经结束，不能继续修改项目。";
+		}
+	}
+
+	function formatElapsed(startedAt: number): string {
+		const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+		if (seconds < 60) return `${seconds} 秒`;
+		const minutes = Math.floor(seconds / 60);
+		return `${minutes} 分 ${seconds % 60} 秒`;
+	}
+
+	function formatValidationRuns(
+		runs: ReadonlyArray<Pick<ValidationCommandResult, "id" | "status" | "durationMs" | "exitCode">>,
+	): string[] {
+		return runs.map((run) => {
+			const details = [
+				run.exitCode !== undefined ? `退出码 ${run.exitCode}` : undefined,
+				run.durationMs !== undefined ? `耗时 ${(run.durationMs / 1000).toFixed(1)} 秒` : undefined,
+			].filter((value): value is string => Boolean(value));
+			return `- ${run.id}：${formatValidationVerifyStatus(run.status)}${details.length ? `（${details.join("，")}）` : ""}`;
+		});
+	}
+
+	function validationFailureExcerpts(runs: readonly ValidationCommandResult[]): string[] {
+		const lines: string[] = [];
+		for (const run of runs) {
+			if (run.status === "passed") continue;
+			const output = (run.stderr || run.stdout || "").trim();
+			if (!output) continue;
+			const excerpt = output.length > 1200 ? `...${output.slice(-1200)}` : output;
+			lines.push(`${run.id} 输出摘要：\n${excerpt}`);
+		}
+		return lines;
+	}
+
+	function buildValidationEvidence(runId: string, candidateDigest: string, result: ValidationBatchResult) {
+		return {
+			candidateDigest,
+			runId,
+			outcome: result.status,
+			commands: result.runs.map((run) => ({
+				id: run.id,
+				status: run.status,
+				durationMs: run.durationMs,
+				...(run.exitCode !== undefined ? { exitCode: run.exitCode } : {}),
+			})),
+			completedAt: new Date().toISOString(),
+		} as const;
+	}
+
 	function persistCurrentState(): boolean {
 		try {
 			pi.appendEntry(DELIVERY_STATE_CUSTOM_TYPE, state);
@@ -225,12 +339,32 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		return undefined;
 	}
 
+	async function preflightReviewer(ctx: ExtensionContext): Promise<void> {
+		const identity = await resolveWorkspaceIdentity(ctx.cwd);
+		await subagents.preflight(
+			"reviewer",
+			"Preflight the required fresh review without launching a child or modifying files.",
+			ctx,
+			identity.gitRoot,
+		);
+	}
+
 	async function restore(ctx: ExtensionContext): Promise<void> {
 		currentContext = ctx;
 		subagents.bindSession(ctx.sessionManager.getSessionId());
-		policy.captureBaseline();
 		const restored = restoreRuntimeState(ctx.sessionManager.getBranch());
 		state = restored.state;
+		try {
+			policy.captureBaseline();
+		} catch (error) {
+			setBlocked(
+				`Failed to capture the original Pi tool baseline: ${error instanceof Error ? error.message : String(error)}`,
+				resumableState(state.snapshot.state),
+			);
+			persistCurrentState();
+			updateStatus(ctx);
+			return;
+		}
 		let approvalError: string | undefined;
 		if (restored.ok) {
 			try {
@@ -245,7 +379,8 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!leaseValid) approvalError = approvalError ?? "Writer lease cannot be proven for the current process";
 		}
 		const applied = policy.apply(state.snapshot, state.writerLease ? approvalPolicyContext() : readOnlyContext());
-		if (!restored.ok || approvalError || !applied.ok || applied.policy.reason) {
+		const restorationValid = restored.ok && !approvalError && applied.ok && !applied.policy.reason;
+		if (!restorationValid) {
 			const reason = !restored.ok
 				? restored.reason
 				: approvalError ?? applied.reason ?? applied.policy.reason ?? "Failed to apply delivery policy";
@@ -255,68 +390,31 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			persistCurrentState();
 		}
 		updateStatus(ctx);
-		if (state.validationStatus === "pending" && state.validationRunId) {
-			try {
-				const status = await subagents.status(state.validationRunId);
-				if (status.state !== "running" && status.state !== "queued") {
-					await handleValidationCompletion(
-						{
-							runId: state.validationRunId,
-							state: status.state,
-							success: status.state === "complete",
-						},
-						ctx,
-					);
-				}
-			} catch (error) {
-				setBlocked(`Pending validation status cannot be proven: ${error instanceof Error ? error.message : String(error)}`, "VALIDATING");
-				persistCurrentState();
-				updateStatus(ctx);
-			}
-		}
-	}
-
-	async function handleValidationCompletion(payload: unknown, ctx?: ExtensionContext): Promise<void> {
-		if (
-			!payload ||
-			typeof payload !== "object" ||
-			state.snapshot.state !== "VALIDATING" ||
-			!state.validationRunId ||
-			state.validationStatus !== "pending"
-		) return;
-		const result = payload as Record<string, unknown>;
-		const runId = typeof result.runId === "string" ? result.runId : typeof result.id === "string" ? result.id : undefined;
-		if (runId !== state.validationRunId) return;
-		const activeContext = ctx ?? currentContext;
-		if (!activeContext) {
-			setBlocked("Validation completed without an active parent context", "VALIDATING");
-			state = checkpointRuntimeState(state, { validationStatus: "failed" });
-			persistCurrentState();
-			return;
-		}
-		const terminalState = typeof result.status === "string" ? result.status : typeof result.state === "string" ? result.state : undefined;
-		const success = result.success === true && (terminalState === "completed" || terminalState === "complete");
-		if (!success) {
-			setBlocked(`Validation run failed: ${terminalState ?? "unknown state"}`, "VALIDATING");
-			state = checkpointRuntimeState(state, { validationStatus: "failed" });
-			persistCurrentState();
-			updateStatus(activeContext);
-			return;
-		}
-		try {
-			await requireCurrentCandidate(activeContext);
+		if (restorationValid && state.validationStatus === "pending") {
+			setBlocked("Validation was interrupted before its terminal checkpoint", "VALIDATING");
 			state = checkpointRuntimeState(state, {
-				validationStatus: "passed",
+				validationStatus: "failed",
+				validationFailureKind: "infrastructure",
+				validationEvidence: undefined,
 				checkpoint: {
-					summary: `Validation passed for ${state.candidateDigest}`,
-					nextReadyAction: "Run fresh review for the same candidate",
+					summary: `Validation infrastructure failed for ${state.candidateDigest}`,
+					nextReadyAction: "Confirm no validation command is still running, then retry the same candidate",
 				},
 			});
 			persistCurrentState();
-			updateStatus(activeContext);
-		} catch {
-			state = checkpointRuntimeState(state, { validationStatus: "failed" });
+			updateStatus(ctx);
+		} else if (restorationValid && state.validationStatus === "passed" && !state.validationEvidence) {
+			setBlocked("Passed validation state has no recoverable command evidence", "VALIDATING");
+			state = checkpointRuntimeState(state, {
+				validationStatus: "failed",
+				validationFailureKind: "infrastructure",
+				checkpoint: {
+					summary: `Validation infrastructure failed for ${state.candidateDigest}`,
+					nextReadyAction: "Retry fixed validation to create recoverable command evidence",
+				},
+			});
 			persistCurrentState();
+			updateStatus(ctx);
 		}
 	}
 
@@ -326,7 +424,21 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			writerLeaseHeld: leaseValid,
 			writerLeaseOwner: leaseValid ? "parent" : null,
 			reworkApproved: state.reworkApproved === true,
+			implementationWriter: implementationWriter(),
 		};
+	}
+
+	function workerTask(ctx: ExtensionContext, additionalInstructions?: string): string {
+		return [
+			"Implement the currently approved Adaptive Delivery plan in the current repository.",
+			"You are the sole implementation worker for this foreground handoff. Modify only project/source files allowed by the approved plan.",
+			"Read and follow project AGENTS.md. Do not start subagents, change product/scope/architecture decisions, update progress documents, commit, push, publish, deploy, access credentials, or call real providers unless the approved plan explicitly authorizes it.",
+			"Run no unapproved release or production action. Stop and report when an unapproved decision is required.",
+			state.goal ? `Goal: ${state.goal}` : undefined,
+			`Approved solution and implementation plan:\n${approvedContextText(ctx) || "(approved entries unavailable)"}`,
+			additionalInstructions ? `Parent instructions for this approved slice:\n${additionalInstructions}` : undefined,
+			"Return a concise handoff with changed files, checks attempted, remaining risks, and any blocked decision. Child-reported checks are claimed evidence only; the parent runtime performs formal validation after your terminal result.",
+		].filter((value): value is string => Boolean(value)).join("\n\n");
 	}
 
 	function commitSnapshot(next: DeliverySnapshot, ctx: ExtensionContext, widening: boolean): boolean {
@@ -455,7 +567,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		if (kind === "plan") {
 			const reason = await validateStoredApprovals(ctx);
 			if (reason) {
-				ctx.ui.notify(reason, "error");
+				ctx.ui.notify(formatRuntimeText(reason) ?? "授权信息无效", "error");
 				return;
 			}
 		}
@@ -493,8 +605,17 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				return;
 			}
 			planningDocumentContent = { solution, plan };
+			try {
+				await preflightReviewer(ctx);
+			} catch (error) {
+				ctx.ui.notify(
+					`独立审查暂时不可用：${error instanceof Error ? error.message : String(error)}\n请先配置至少一个可用 reviewer 模型或 fallback，再重新批准实施计划。固定命令验证本身不依赖模型。`,
+					"error",
+				);
+				return;
+			}
 		}
-		const documentSummary = `\n需求：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n路径来源：${proposedDocuments.selectionSource}`;
+		const documentSummary = `\n需求：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n路径来源：${formatDocumentSelectionSource(proposedDocuments.selectionSource)}`;
 		const confirmed = await requireTuiUserConfirmation(ctx, {
 			title: kind === "solution" ? "确认技术方案" : kind === "plan" ? "确认实施计划" : "确认方案与计划",
 			message: `批准当前 assistant 条目 ${record.entryId}？\nSHA-256: ${record.contentDigest}${documentSummary}`,
@@ -516,20 +637,28 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		if (submitEvent) {
 			const submitted = transitionDelivery(approvalSnapshot, submitEvent);
 			if (!submitted.ok) {
-				ctx.ui.notify(submitted.reason, "error");
+				ctx.ui.notify(formatRuntimeText(submitted.reason) ?? "无法提交当前方案", "error");
 				return;
 			}
 			approvalSnapshot = submitted.snapshot;
 		}
 		const transition = transitionDelivery(approvalSnapshot, event);
 		if (!transition.ok) {
-			ctx.ui.notify(transition.reason, "error");
+			ctx.ui.notify(formatRuntimeText(transition.reason) ?? "交付状态转换失败", "error");
 			return;
 		}
 		state = checkpointRuntimeState(state, {
 			approvals: { ...state.approvals, [kind]: record },
 			proposedDocuments,
 			...(planContract ? { planContract } : {}),
+			...(kind === "solution"
+				? {
+						checkpoint: {
+							summary: "Technical solution approved",
+							nextReadyAction: "Generate the implementation plan",
+						},
+					}
+				: {}),
 		});
 		const widening = transition.snapshot.state === "IMPLEMENTING";
 		if (widening) {
@@ -566,11 +695,33 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				setBlocked(reason, resumableState(state.snapshot.state));
 				persistCurrentState();
 				updateStatus(ctx);
-				ctx.ui.notify(reason, "error");
+				ctx.ui.notify(formatRuntimeText(reason) ?? "规划文档同步失败", "error");
 				return;
 			}
 		}
 		if (!commitSnapshot(transition.snapshot, ctx, widening)) return;
+		if (widening && implementationWriter() === "worker") {
+			try {
+				const identity = await resolveWorkspaceIdentity(ctx.cwd);
+				await subagents.preflightWorker(workerTask(ctx), ctx, identity.gitRoot);
+			} catch (error) {
+				let released = false;
+				try {
+					released = await releaseParentLeaseIfOwned();
+				} catch {
+					// Keep the lease reference when release cannot be proven.
+				}
+				const reason = `Controlled worker preflight failed: ${error instanceof Error ? error.message : String(error)}`;
+				setBlocked(reason, "IMPLEMENTING");
+				state = checkpointRuntimeState(state, {
+					...(released ? { writerLease: undefined } : {}),
+				});
+				persistCurrentState();
+				updateStatus(ctx);
+				ctx.ui.notify(`唯一 worker 当前不可用：${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+		}
 		if (kind === "solution") {
 			queueAutomaticContinuation(
 				ctx,
@@ -589,12 +740,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerCommand("delivery-status", {
 		description: "显示 Adaptive Delivery 当前状态",
 		handler: async (_args, ctx) => {
-			let writerOwner = "(none)";
+			let writerOwner = "无";
 			if (state.writerLease) {
 				try {
 					const record = await writerLeases.read(state.writerLease.workspaceKey);
 					writerOwner = record?.leaseId === state.writerLease.leaseId
-						? `${record.owner.kind}:${record.owner.sessionId}${record.owner.runId ? `/${record.owner.runId}` : ""}`
+						? `${formatWriterKind(record.owner.kind)}：${record.owner.sessionId}${record.owner.runId ? `/${record.owner.runId}` : ""}`
 						: "不可证明";
 				} catch {
 					writerOwner = "不可证明";
@@ -616,22 +767,29 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					? "stale"
 					: evidenceValidity
 				: "unproven";
+			const planningApproved = state.snapshot.state === "PLANNING" && Boolean(state.approvals?.solution);
+			const checkpointSummary = planningApproved ? "Technical solution approved" : state.checkpoint?.summary;
+			const nextReadyAction = planningApproved ? "Generate the implementation plan" : state.checkpoint?.nextReadyAction;
 			const lines = [
 				`状态：${formatDeliveryState(state.snapshot.state)}`,
-				`恢复状态：${state.snapshot.resumeState ? formatDeliveryState(state.snapshot.resumeState) : "(none)"}`,
-				`Writer owner：${writerOwner}`,
-				`Candidate：${state.candidateDigest ? `${state.candidateDigest} (${candidateValidity})` : "不可证明"}`,
-				`Validation：${state.validationStatus ? `${state.validationStatus} (${evidenceValidity})` : "不可证明"}${state.validationRunId ? ` (${state.validationRunId})` : ""}`,
-				`Review：${state.reviewEvidence ? `${state.reviewEvidence.verdict} (${reviewValidity})` : "不可证明"}`,
+				`恢复状态：${state.snapshot.resumeState ? formatDeliveryState(state.snapshot.resumeState) : "无"}`,
+				`开发方式：${plannedImplementationWriter() === "worker" ? "唯一 worker" : plannedImplementationWriter() === "parent" ? "父 Pi 直接实现" : "待实施计划决定"}`,
+				`开发执行者：${state.workerStatus ? `${formatWorkerStatus(state.workerStatus)}${state.workerRunId ? `（运行 ID：${state.workerRunId}）` : ""}` : "未启动"}`,
+				`写入者：${writerOwner}`,
+				`候选版本：${state.candidateDigest ? `${state.candidateDigest}（${formatEvidenceValidity(candidateValidity)}）` : "不可证明"}`,
+				`验证：${state.validationStatus ? `${formatValidationStatus(state.validationStatus)}（${formatEvidenceValidity(evidenceValidity)}）${state.validationFailureKind === "infrastructure" ? "（本机执行未完成）" : state.validationFailureKind === "candidate" ? "（批准命令未通过）" : state.validationStatus === "failed" ? "（失败类型不可证明）" : ""}` : "不可证明"}${state.validationRunId ? `（批次 ID：${state.validationRunId}）` : ""}`,
+				`验证命令：${state.validationEvidence ? `\n${formatValidationRuns(state.validationEvidence.commands).join("\n")}` : "无终态证据"}`,
+				`审查：${state.reviewEvidence ? `${formatReviewVerdict(state.reviewEvidence.verdict)}（${formatEvidenceValidity(reviewValidity)}）` : "不可证明"}`,
 				`规划文档：${state.planningDocuments
-					? `${state.planningDocuments.requirementName} (${state.planningDocuments.solutionPath}, ${state.planningDocuments.planPath}; synced)`
+					? `${state.planningDocuments.requirementName}（${state.planningDocuments.solutionPath}，${state.planningDocuments.planPath}；已同步）`
 					: state.proposedDocuments
-						? `${state.proposedDocuments.requirementName} (${state.proposedDocuments.solutionPath}, ${state.proposedDocuments.planPath}; pending)`
+						? `${state.proposedDocuments.requirementName}（${state.proposedDocuments.solutionPath}，${state.proposedDocuments.planPath}；待同步）`
 						: "不可证明"}`,
-				`Progress-sync：${state.checkpoint?.summary?.startsWith("progress-sync") ? state.checkpoint.summary : "inactive"}`,
-				...(state.blockingReason ? [`阻塞原因：${state.blockingReason}`] : []),
-				...(state.checkpoint?.summary ? [`断点：${state.checkpoint.summary}`] : []),
-				...(state.checkpoint?.nextReadyAction ? [`下一步：${state.checkpoint.nextReadyAction}`] : []),
+				`进度同步：${state.checkpoint?.summary?.startsWith("progress-sync") ? formatRuntimeText(state.checkpoint.summary) : "未运行"}`,
+				...(state.blockingReason ? [`阻塞原因：${formatRuntimeText(state.blockingReason)}`] : []),
+				...(state.recoveryCondition ? [`恢复条件：${formatRuntimeText(state.recoveryCondition)}`] : []),
+				...(checkpointSummary ? [`断点：${formatRuntimeText(checkpointSummary)}`] : []),
+				...(nextReadyAction ? [`下一步：${formatRuntimeText(nextReadyAction)}`] : []),
 			];
 			ctx.ui.notify(lines.join("\n"), state.snapshot.state === "BLOCKED" ? "warning" : "info");
 		},
@@ -670,7 +828,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const event: DeliveryEvent = { type: args.trim() === "plan" ? "REVISE_PLAN" : "REVISE_SOLUTION" };
 			const transition = transitionDelivery(state.snapshot, event);
 			if (!transition.ok) {
-				ctx.ui.notify(transition.reason, "error");
+				ctx.ui.notify(formatRuntimeText(transition.reason) ?? "无法修改当前方案", "error");
 				return;
 			}
 			state = checkpointRuntimeState(state, {
@@ -678,9 +836,14 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				proposedDocuments: event.type === "REVISE_PLAN" ? state.proposedDocuments : undefined,
 				planContract: undefined,
 				planningDocuments: undefined,
+				workerRunId: undefined,
+				workerStatus: undefined,
+				workerLaunchContractDigest: undefined,
 				candidateDigest: undefined,
 				validationRunId: undefined,
 				validationStatus: undefined,
+				validationFailureKind: undefined,
+				validationEvidence: undefined,
 				reviewEvidence: undefined,
 				reworkApproved: false,
 				finalEvidence: undefined,
@@ -708,13 +871,15 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			}
 			const transition = transitionDelivery(state.snapshot, { type: "CANCEL" });
 			if (!transition.ok) {
-				ctx.ui.notify(transition.reason, "error");
+				ctx.ui.notify(formatRuntimeText(transition.reason) ?? "无法取消当前流程", "error");
 				return;
 			}
 			if (state.validationStatus === "pending") {
 				state = checkpointRuntimeState(state, {
 					validationRunId: undefined,
 					validationStatus: undefined,
+					validationFailureKind: undefined,
+					validationEvidence: undefined,
 				});
 			}
 			if (!commitSnapshot(transition.snapshot, ctx, false)) {
@@ -728,12 +893,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();
 			if (state.snapshot.state !== "BLOCKED" || !state.snapshot.resumeState) {
-				ctx.ui.notify("当前没有可恢复的 BLOCKED 状态。", "warning");
+				ctx.ui.notify("当前没有可恢复的已阻塞 [BLOCKED] 状态。", "warning");
 				return;
 			}
 			const authorizationError = await validateStoredApprovals(ctx);
 			if (authorizationError) {
-				ctx.ui.notify(`无法恢复：${authorizationError}`, "error");
+				ctx.ui.notify(`无法恢复：${formatRuntimeText(authorizationError)}`, "error");
 				return;
 			}
 			const confirmed = await requireTuiUserConfirmation(ctx, {
@@ -743,12 +908,29 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!confirmed) return;
 			const transition = transitionDelivery(state.snapshot, { type: "RESUME" });
 			if (!transition.ok) {
-				ctx.ui.notify(transition.reason, "error");
+				ctx.ui.notify(formatRuntimeText(transition.reason) ?? "交付状态恢复失败", "error");
 				return;
 			}
 			const widening = transition.snapshot.state === "IMPLEMENTING" || transition.snapshot.state === "REWORKING";
 			if (widening && !(await ensureParentWriterLease(ctx))) return;
-			commitSnapshot(transition.snapshot, ctx, widening);
+			if (!commitSnapshot(transition.snapshot, ctx, widening)) return;
+			if (transition.snapshot.state === "PLANNING") {
+				queueAutomaticContinuation(
+					ctx,
+					"/delivery-plan",
+					`流程已恢复到 ${formatDeliveryState(transition.snapshot.state)}，正在继续生成实施计划...`,
+				);
+			} else if (
+				transition.snapshot.state === "IMPLEMENTING" ||
+				transition.snapshot.state === "REWORKING" ||
+				transition.snapshot.state === "VALIDATING"
+			) {
+				queueAutomaticContinuation(
+					ctx,
+					"/delivery-run",
+					`流程已恢复到 ${formatDeliveryState(transition.snapshot.state)}，正在从已批准断点继续...`,
+				);
+			}
 		},
 	});
 
@@ -759,25 +941,82 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const identity = await resolveWorkspaceIdentity(ctx.cwd);
 			const existing = await writerLeases.read(identity.key);
 			if (!existing) {
-				ctx.ui.notify("当前 workspace 没有 writer lease。", "info");
+				ctx.ui.notify("当前工作区没有写入租约。", "info");
 				return;
 			}
 			const confirmed = await requireTuiUserConfirmation(ctx, {
 				title: "强制释放 writer lease",
-				message: `workspace=${existing.workspace.workspacePath}\nowner=${existing.owner.sessionId}\nrun=${existing.owner.runId ?? "(parent)"}\n强制释放可能遗留未知 writer，确认继续？`,
+				message: `工作区：${existing.workspace.workspacePath}\n持有者：${existing.owner.sessionId}\n运行 ID：${existing.owner.runId ?? "父会话"}\n强制释放可能遗留未知写入进程，确认继续？`,
 			});
 			if (!confirmed) return;
 			await writerLeases.forceRelease(identity.key, existing.leaseId);
 			leaseValid = false;
 			const resumeState =
-				state.snapshot.state === "IMPLEMENTING" || state.snapshot.state === "REWORKING"
+				state.snapshot.state === "BLOCKED"
+					? state.snapshot.resumeState
+					: state.snapshot.state === "IMPLEMENTING" || state.snapshot.state === "REWORKING"
 					? state.snapshot.state
 					: undefined;
 			setBlocked("Writer lease was force-released by the user", resumeState);
-			state = checkpointRuntimeState(state, { writerLease: undefined });
+			state = checkpointRuntimeState(state, {
+				writerLease: undefined,
+				...(state.workerStatus === "starting" || state.workerStatus === "running"
+					? { workerStatus: "failed" as const }
+					: {}),
+			});
 			persistCurrentState();
 			updateStatus(ctx);
-			ctx.ui.notify("writer lease 已强制释放；流程保持只读，需显式 resume。", "warning");
+			ctx.ui.notify("写入租约已强制释放；流程保持只读，需要显式执行 /delivery-resume。", "warning");
+		},
+	});
+
+	pi.registerTool({
+		name: "delivery_runtime_status",
+		label: "读取交付阶段",
+		description: "只读返回当前 Adaptive Delivery 阶段、当前可用工具和下一步。工具按阶段开放；未来阶段工具暂时不可见不代表运行时故障。",
+		parameters: Type.Object({}),
+		async execute() {
+			const activeTools = pi.getActiveTools();
+			const deliveryTools = activeTools.filter((name) => name.startsWith("delivery_"));
+			const nextReadyAction = formatRuntimeText(state.checkpoint?.nextReadyAction);
+			const guidance = runtimePhaseGuidance();
+			const lines = [
+				`当前状态：${formatDeliveryState(state.snapshot.state)}`,
+				...(state.snapshot.resumeState ? [`可恢复到：${formatDeliveryState(state.snapshot.resumeState)}`] : []),
+				`当前可用交付工具：${deliveryTools.join(", ") || "无"}`,
+				...(nextReadyAction ? [`已记录下一步：${nextReadyAction}`] : []),
+				...(state.blockingReason ? [`阻塞原因：${formatRuntimeText(state.blockingReason)}`] : []),
+				`阶段说明：${guidance}`,
+			];
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: {
+					state: state.snapshot.state,
+					resumeState: state.snapshot.resumeState,
+					activeTools,
+					nextReadyAction: state.checkpoint?.nextReadyAction,
+					blockingReason: state.blockingReason,
+					writerLeaseHeld: Boolean(state.writerLease && leaseValid),
+					implementationWriter: plannedImplementationWriter(),
+					workerRunId: state.workerRunId,
+					workerStatus: state.workerStatus,
+					workerLaunchContractDigest: state.workerLaunchContractDigest,
+					candidateDigest: state.candidateDigest,
+					validationRunId: state.validationRunId,
+					validationStatus: state.validationStatus,
+					validationFailureKind: state.validationFailureKind,
+					validationEvidence: state.validationEvidence,
+					reviewVerdict: state.reviewEvidence?.verdict,
+					planningDocuments: state.planningDocuments
+						? {
+								requirementName: state.planningDocuments.requirementName,
+								solutionPath: state.planningDocuments.solutionPath,
+								planPath: state.planningDocuments.planPath,
+							}
+						: undefined,
+					guidance,
+				},
+			};
 		},
 	});
 
@@ -835,6 +1074,208 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		name: "delivery_delegate_worker",
+		label: "委派唯一开发执行者",
+		description: "仅在 standard/high-risk 的 IMPLEMENTING 或批准 REWORKING 中启动一个受控 foreground worker。成功后自动冻结候选并进入验证。",
+		parameters: Type.Object({
+			instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 8000 })),
+		}),
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			if (state.snapshot.state !== "IMPLEMENTING" && state.snapshot.state !== "REWORKING") {
+				throw new Error("Worker delegation requires IMPLEMENTING or REWORKING state");
+			}
+			if (implementationWriter() !== "worker") {
+				throw new Error("This approved route requires direct parent implementation");
+			}
+			if (state.workerStatus === "starting" || state.workerStatus === "running") {
+				throw new Error("A controlled worker is already active or lacks terminal proof");
+			}
+			await requireAuthorization(ctx, "implementation");
+			if (!state.writerLease || !leaseValid) throw new Error("Worker delegation requires a proven parent-custodied writer lease");
+			if (activeMutationTools.size > 0) throw new Error("Worker delegation cannot start beside an active parent mutation tool");
+
+			const sourceState = state.snapshot.state;
+			const identity = await resolveWorkspaceIdentity(ctx.cwd);
+			const task = workerTask(ctx, params.instructions);
+			const contract = await subagents.preflightWorker(task, ctx, identity.gitRoot);
+			state = checkpointRuntimeState(state, {
+				workerRunId: undefined,
+				workerStatus: "starting",
+				workerLaunchContractDigest: contract.launchContractDigest,
+				checkpoint: {
+					summary: "Controlled worker launch preflight passed",
+					nextReadyAction: "Wait for the sole foreground worker terminal result",
+				},
+			});
+			if (!persistCurrentState()) throw new Error("Worker preflight passed but its starting checkpoint could not be persisted");
+
+			let workerCheckpointFailed = false;
+			let result;
+			try {
+				result = await subagents.delegateWorker(task, ctx, contract.launchContractDigest, {
+					signal,
+					onRunId: (runId) => {
+						state = checkpointRuntimeState(state, {
+							workerRunId: runId,
+							workerStatus: "running",
+							checkpoint: {
+								summary: `Controlled worker running: ${runId}`,
+								nextReadyAction: "Wait for the sole foreground worker terminal result",
+							},
+						});
+						if (!persistCurrentState()) workerCheckpointFailed = true;
+					},
+					onUpdate: (update) => {
+						onUpdate?.({
+							content: [{
+								type: "text",
+								text: update.currentTool
+									? `唯一 worker 正在执行：${update.currentTool}`
+									: "唯一 worker 正在执行已批准计划...",
+							}],
+							details: { runId: update.runId, toolCount: update.toolCount },
+						});
+					},
+				});
+			} catch (error) {
+				setBlocked(
+					`Controlled worker terminal proof is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+					sourceState,
+				);
+				persistCurrentState();
+				updateStatus(ctx);
+				throw error;
+			}
+
+			if (workerCheckpointFailed) {
+				let released = false;
+				let releaseError: string | undefined;
+				try {
+					released = await releaseParentLeaseIfOwned();
+				} catch (error) {
+					releaseError = error instanceof Error ? error.message : String(error);
+				}
+				setBlocked(
+					`Controlled worker completed but its running checkpoint was not durable${releaseError ? `; lease release failed: ${releaseError}` : ""}`,
+					sourceState,
+				);
+				state = checkpointRuntimeState(state, {
+					workerRunId: result.runId,
+					workerStatus: "failed",
+					workerLaunchContractDigest: result.launchContractDigest,
+					...(released ? { writerLease: undefined } : {}),
+				});
+				persistCurrentState();
+				updateStatus(ctx);
+				throw new Error("Worker checkpoint persistence failed");
+			}
+
+			if (result.status !== "completed") {
+				let released = false;
+				let releaseError: string | undefined;
+				try {
+					released = await releaseParentLeaseIfOwned();
+				} catch (error) {
+					releaseError = error instanceof Error ? error.message : String(error);
+				}
+				setBlocked(
+					`Controlled worker failed: ${result.error ?? result.status}${releaseError ? `; lease release failed: ${releaseError}` : ""}`,
+					sourceState,
+				);
+				state = checkpointRuntimeState(state, {
+					workerRunId: result.runId,
+					workerStatus: "failed",
+					workerLaunchContractDigest: result.launchContractDigest,
+					...(released ? { writerLease: undefined } : {}),
+				});
+				persistCurrentState();
+				updateStatus(ctx);
+				throw new Error(result.error ?? `Controlled worker ended with ${result.status}`);
+			}
+
+			let candidate;
+			try {
+				candidate = await recomputeCandidate(ctx);
+			} catch (error) {
+				let released = false;
+				let releaseError: string | undefined;
+				try {
+					released = await releaseParentLeaseIfOwned();
+				} catch (releaseFailure) {
+					releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
+				}
+				setBlocked(
+					`Candidate snapshot failed after controlled worker: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; lease release failed: ${releaseError}` : ""}`,
+					sourceState,
+				);
+				state = checkpointRuntimeState(state, {
+					workerRunId: result.runId,
+					workerStatus: "failed",
+					workerLaunchContractDigest: result.launchContractDigest,
+					...(released ? { writerLease: undefined } : {}),
+				});
+				persistCurrentState();
+				updateStatus(ctx);
+				throw error;
+			}
+			let released = false;
+			let releaseError: string | undefined;
+			try {
+				released = await releaseParentLeaseIfOwned();
+			} catch (error) {
+				releaseError = error instanceof Error ? error.message : String(error);
+			}
+			if (!released) {
+				setBlocked(
+					`Cannot freeze worker candidate while writer lease ownership is unproven${releaseError ? `: ${releaseError}` : ""}`,
+					sourceState,
+				);
+				persistCurrentState();
+				updateStatus(ctx);
+				throw new Error("Writer lease ownership is unproven after controlled worker completion");
+			}
+			const transition = transitionDelivery(
+				{ state: sourceState },
+				{ type: sourceState === "IMPLEMENTING" ? "BEGIN_VALIDATION" : "FINISH_REWORK" },
+			);
+			if (!transition.ok) throw new Error(transition.reason);
+			state = checkpointRuntimeState(state, {
+				workerRunId: result.runId,
+				workerStatus: "completed",
+				workerLaunchContractDigest: result.launchContractDigest,
+				candidateDigest: candidate.digest,
+				validationRunId: undefined,
+				validationStatus: undefined,
+				validationFailureKind: undefined,
+				validationEvidence: undefined,
+				reviewEvidence: undefined,
+				reworkApproved: false,
+				finalEvidence: undefined,
+				writerLease: undefined,
+				checkpoint: {
+					summary: `Candidate frozen after controlled worker: ${candidate.digest}`,
+					nextReadyAction: "Run fixed validation and fresh review",
+				},
+			});
+			if (!commitSnapshot(transition.snapshot, ctx, false)) {
+				throw new Error("Failed to persist the controlled worker candidate transition");
+			}
+			return {
+				content: [{
+					type: "text",
+					text: `${result.text ?? "唯一 worker 已完成。"}\n\n候选已冻结：${candidate.digest}`,
+				}],
+				details: {
+					runId: result.runId,
+					model: result.model,
+					launchContractDigest: result.launchContractDigest,
+					candidateDigest: candidate.digest,
+				},
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "delivery_submit_candidate",
 		label: "提交候选进行验证",
 		description: "冻结当前候选、释放 parent writer lease，并进入验证中状态。",
@@ -842,6 +1283,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			if (state.snapshot.state !== "IMPLEMENTING" && state.snapshot.state !== "REWORKING") {
 				throw new Error("Candidate can only be submitted from IMPLEMENTING or REWORKING");
+			}
+			if (implementationWriter() !== "parent") {
+				throw new Error("This approved route requires the controlled worker to submit the candidate");
 			}
 			if (!state.planContract) throw new Error("Approved plan contract is missing");
 			await requireAuthorization(ctx, "implementation");
@@ -862,6 +1306,11 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				candidateDigest: candidate.digest,
 				validationRunId: undefined,
 				validationStatus: undefined,
+				validationFailureKind: undefined,
+				validationEvidence: undefined,
+				workerRunId: undefined,
+				workerStatus: undefined,
+				workerLaunchContractDigest: undefined,
 				reviewEvidence: undefined,
 				reworkApproved: false,
 				finalEvidence: undefined,
@@ -884,27 +1333,133 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delivery_validate",
 		label: "执行固定验证",
-		description: "对当前 candidate 执行已批准计划中的固定验证命令。调用者不能传入命令。",
+		description: "对当前 candidate 执行已批准计划中的固定验证命令，并在同一工具调用中等待权威终态。调用者不能传入命令；不要循环查询状态。",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, _params, signal, onUpdate, ctx) {
 			if (state.snapshot.state !== "VALIDATING") throw new Error("Validation requires VALIDATING state");
 			if (!state.planContract) throw new Error("Approved plan contract is missing");
 			await requireAuthorization(ctx, "implementation");
 			if (state.validationStatus === "pending") throw new Error("Validation is already pending for this candidate");
 			const candidateDigest = await requireCurrentCandidate(ctx);
-			const spawned = await subagents.spawnValidation(state.planContract, candidateDigest, ctx);
+			const planContract = state.planContract;
+			const commandIds = planContract.validation.map((command) => command.id);
+			const startedAt = Date.now();
+			const runId = randomUUID();
+			onUpdate?.({
+				content: [{ type: "text", text: `正在启动固定验证\n批准命令：${commandIds.join("、")}` }],
+				details: { state: "starting", candidateDigest, commandIds },
+			});
 			state = checkpointRuntimeState(state, {
-				validationRunId: spawned.runId,
+				validationRunId: runId,
 				validationStatus: "pending",
+				validationFailureKind: undefined,
+				validationEvidence: undefined,
 				checkpoint: {
-					summary: `Validation launched for ${candidateDigest}`,
-					nextReadyAction: "Wait for validation result, then review the same candidate",
+					summary: `Validation started for ${candidateDigest}`,
+					nextReadyAction: "Wait in the current validation tool call for terminal command results",
 				},
 			});
 			if (!persistCurrentState()) throw new Error("Validation started but its checkpoint could not be persisted");
+
+			const completedRuns: ValidationCommandResult[] = [];
+			const result: ValidationBatchResult = await runApprovedValidation({
+				pi,
+				cwd: ctx.cwd,
+				commands: planContract.validation,
+				signal,
+				onProgress: (progress) => {
+					if (progress.phase === "completed" && progress.result) completedRuns.push(progress.result);
+					const current = progress.phase === "completed"
+						? `已完成 ${progress.index + 1}/${progress.total}：${progress.command.id}`
+						: `正在执行 ${progress.index + 1}/${progress.total}：${progress.command.id}`;
+					const visibleCommand = progress.command.command.length > 500
+						? `${progress.command.command.slice(0, 500)}...`
+						: progress.command.command;
+					onUpdate?.({
+						content: [{
+							type: "text",
+							text: [
+								`${current}（已运行 ${formatElapsed(startedAt)}）`,
+								`命令：${visibleCommand}`,
+								`验证批次：${runId}`,
+								...formatValidationRuns(completedRuns),
+							].join("\n"),
+						}],
+						details: { runId, candidateDigest, commandIds, completedRuns: [...completedRuns] },
+					});
+				},
+			});
+
+			try {
+				await requireCurrentCandidate(ctx);
+			} catch (error) {
+				setBlocked("Candidate changed after validation completed", "VALIDATING");
+				state = checkpointRuntimeState(state, {
+					validationStatus: "failed",
+					validationFailureKind: "candidate",
+					validationEvidence: undefined,
+				});
+				persistCurrentState();
+				updateStatus(ctx);
+				return {
+					content: [{ type: "text", text: `验证期间候选版本发生变化，当前结果已失效：${error instanceof Error ? error.message : String(error)}` }],
+					details: { runId, candidateDigest, result, staleCandidate: true },
+				};
+			}
+
+			if (result.status === "passed") {
+				state = checkpointRuntimeState(state, {
+					validationStatus: "passed",
+					validationFailureKind: undefined,
+					validationEvidence: buildValidationEvidence(runId, candidateDigest, result),
+					checkpoint: {
+						summary: `Validation passed for ${candidateDigest}`,
+						nextReadyAction: "Run fresh review for the same candidate",
+					},
+				});
+				if (!persistCurrentState()) throw new Error("Validation passed but its terminal checkpoint could not be persisted");
+				updateStatus(ctx);
+				return {
+					content: [{ type: "text", text: [
+						`固定验证已通过，且结果绑定当前候选版本：${candidateDigest}`,
+						...formatValidationRuns(result.runs),
+						"下一步进行同一候选版本的独立审查。",
+					].join("\n") }],
+					details: { runId, candidateDigest, result },
+				};
+			}
+
+			const failedIds = result.runs
+				.filter((run) => run.status === "failed" || run.status === "timed-out")
+				.map((run) => run.id);
+			const failureKind = result.status === "failed" ? "candidate" as const : "infrastructure" as const;
+			const reason = failureKind === "candidate"
+				? `Approved validation command(s) failed: ${failedIds.join(", ")}`
+				: `Validation infrastructure failed: ${result.error ?? "unknown execution error"}`;
+			setBlocked(reason, "VALIDATING");
+			state = checkpointRuntimeState(state, {
+				validationStatus: "failed",
+				validationFailureKind: failureKind,
+				validationEvidence: buildValidationEvidence(runId, candidateDigest, result),
+				checkpoint: {
+					summary: failureKind === "candidate"
+						? `Approved validation failed for ${candidateDigest}`
+						: `Validation infrastructure failed for ${candidateDigest}`,
+					nextReadyAction: failureKind === "candidate"
+						? "Classify the failed command as a candidate, environment, or approved-plan problem"
+						: "Restore validation infrastructure, then retry the same candidate",
+				},
+			});
+			if (!persistCurrentState()) throw new Error("Validation failed but its terminal checkpoint could not be persisted");
+			updateStatus(ctx);
 			return {
-				content: [{ type: "text", text: `验证已启动：${spawned.runId}` }],
-				details: { runId: spawned.runId, candidateDigest },
+				content: [{ type: "text", text: [
+					`固定验证未通过：${runId}`,
+					...formatValidationRuns(result.runs),
+					...validationFailureExcerpts(result.runs),
+					"该结果只证明批准命令未通过，不自动等同于源码缺陷；需要区分候选代码、验证环境和已批准计划。",
+				].join("\n") }],
+				details: { runId, candidateDigest, result },
 			};
 		},
 	});
@@ -920,6 +1475,14 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (state.snapshot.state !== "VALIDATING") throw new Error("Review requires VALIDATING state");
 			await requireAuthorization(ctx, "implementation");
 			const candidateDigest = await requireCurrentCandidate(ctx);
+			if (
+				state.validationStatus !== "passed" ||
+				!state.validationEvidence ||
+				state.validationEvidence.candidateDigest !== candidateDigest ||
+				state.validationEvidence.outcome !== "passed"
+			) {
+				throw new Error("Fresh review requires passed fixed validation evidence for the current candidate");
+			}
 			const identity = await resolveWorkspaceIdentity(ctx.cwd);
 			const task = [
 				"Review the current repository candidate without modifying project/source files.",
@@ -972,6 +1535,13 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			await requireAuthorization(ctx, "implementation");
 			await requireCurrentCandidate(ctx);
 			if (state.validationStatus === "pending") throw new Error("Cannot begin rework while validation is still pending");
+			if (
+				state.validationStatus === "failed" &&
+				state.validationFailureKind !== "candidate" &&
+				state.reviewEvidence?.verdict !== "BLOCK"
+			) {
+				throw new Error("Validation infrastructure failure must be retried before code rework");
+			}
 			if (state.validationStatus !== "failed" && state.reviewEvidence?.verdict !== "BLOCK") {
 				throw new Error("Rework requires failed validation or a BLOCK review verdict");
 			}
@@ -1005,6 +1575,18 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			await requireAuthorization(ctx, "implementation");
 			const candidateDigest = await requireCurrentCandidate(ctx);
 			if (state.validationStatus !== "passed") throw new Error("Validation evidence has not passed");
+			const validationEvidence = state.validationEvidence;
+			const approvedValidationIds = state.planContract?.validation.map((command) => command.id) ?? [];
+			if (
+				!validationEvidence ||
+				validationEvidence.candidateDigest !== candidateDigest ||
+				validationEvidence.runId !== state.validationRunId ||
+				validationEvidence.outcome !== "passed" ||
+				validationEvidence.commands.length !== approvedValidationIds.length ||
+				validationEvidence.commands.some((command, index) => command.id !== approvedValidationIds[index] || command.status !== "passed")
+			) {
+				throw new Error("Validation command evidence is missing, stale, or does not match the approved plan");
+			}
 			if (!state.reviewEvidence || state.reviewEvidence.candidateDigest !== candidateDigest) {
 				throw new Error("Fresh review evidence is missing or stale");
 			}
@@ -1177,12 +1759,13 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delivery_invalidate",
 		label: "撤销交付授权",
-		description: "只能撤销 Adaptive Delivery 批准并退回只读状态；不能授予权限。",
+		description: "只能降低权限。BLOCKED 暂时阻塞并保留批准与证据；SHAPING/PLANNING 才撤销相应批准。",
 		parameters: Type.Object({
 			target: StringEnum(["SHAPING", "PLANNING", "BLOCKED"] as const),
 			reason: Type.String({ minLength: 1 }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const priorSnapshot = state.snapshot;
 			const locked = policy.forceReadOnly();
 			if (!locked.ok) {
 				setBlocked(`Cannot invalidate because read-only policy failed: ${locked.reason ?? "unknown error"}`);
@@ -1197,26 +1780,44 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				throw new Error("Writer lease ownership is unproven");
 			}
 			const target = params.target;
-			state = checkpointRuntimeState(state, {
-				snapshot: { state: target },
-				approvals: target === "PLANNING" ? { solution: state.approvals?.solution } : {},
-				proposedDocuments: target === "PLANNING" ? state.proposedDocuments : undefined,
-				writerLease: undefined,
-				planContract: undefined,
-				planningDocuments: undefined,
-				candidateDigest: undefined,
-				validationRunId: undefined,
-				validationStatus: undefined,
-				reviewEvidence: undefined,
-				reworkApproved: false,
-				finalEvidence: undefined,
-				blockingReason: target === "BLOCKED" ? params.reason : undefined,
-			});
+			if (target === "BLOCKED") {
+				const resumeState = priorSnapshot.state === "BLOCKED"
+					? priorSnapshot.resumeState
+					: resumableState(priorSnapshot.state);
+				state = checkpointRuntimeState(state, {
+					snapshot: { state: "BLOCKED", ...(resumeState ? { resumeState } : {}) },
+					writerLease: undefined,
+					blockingReason: params.reason,
+					recoveryCondition: "Resolve the blocking condition, then ask the TUI user to run /delivery-resume",
+				});
+			} else {
+				state = checkpointRuntimeState(state, {
+					snapshot: { state: target },
+					approvals: target === "PLANNING" ? { solution: state.approvals?.solution } : {},
+					proposedDocuments: target === "PLANNING" ? state.proposedDocuments : undefined,
+					writerLease: undefined,
+					planContract: undefined,
+					planningDocuments: undefined,
+					workerRunId: undefined,
+					workerStatus: undefined,
+					workerLaunchContractDigest: undefined,
+					candidateDigest: undefined,
+					validationRunId: undefined,
+					validationStatus: undefined,
+					validationFailureKind: undefined,
+					validationEvidence: undefined,
+					reviewEvidence: undefined,
+					reworkApproved: false,
+					finalEvidence: undefined,
+					blockingReason: undefined,
+					recoveryCondition: undefined,
+				});
+			}
 			if (!persistCurrentState()) throw new Error("Authorization was invalidated but its checkpoint could not be persisted");
 			updateStatus(ctx);
 			return {
 				content: [{ type: "text", text: `已降权到 ${formatDeliveryState(target)}：${params.reason}` }],
-				details: { target, reason: params.reason },
+				details: { target, reason: params.reason, resumeState: state.snapshot.resumeState },
 			};
 		},
 	});
@@ -1262,9 +1863,6 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
-	pi.events.on("subagent:async-complete", async (payload) => {
-		await handleValidationCompletion(payload);
-	});
 	pi.on("session_before_tree", async (_event, _ctx) => {
 		const result = policy.forceReadOnly();
 		if (!result.ok) return { cancel: true };

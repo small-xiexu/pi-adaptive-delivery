@@ -11,6 +11,7 @@ import {
 	SubagentBoundary,
 	pathIsInside,
 	validateReadOnlyContract,
+	validateWorkerContract,
 } from "../../extensions/delivery-gate/src/subagents.ts";
 
 function contract(overrides: Record<string, unknown> = {}): SubagentLaunchContract {
@@ -157,6 +158,36 @@ test("rejects project, arbitrary external, and symlink-escaped output paths", as
 	}
 });
 
+test("accepts only the builtin fresh worker with the bounded mutation tools", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-worker-root-"));
+	const managed = await mkdtemp(path.join(os.tmpdir(), "adaptive-worker-managed-"));
+	const safe = contract({
+		agent: {
+			...contract().agent,
+			name: "worker",
+			filePath: "<builtin:worker>",
+		},
+		tools: {
+			...contract().tools,
+			requestedBuiltin: ["read", "grep", "find", "ls", "edit", "write"],
+			declaredBuiltin: ["read", "grep", "find", "ls", "edit", "write"],
+			effectiveAllowlist: ["read", "grep", "find", "ls", "edit", "write"],
+		},
+		roots: { cwd: root, artifactsDir: managed, outputPath: path.join(managed, "worker.md") },
+	});
+
+	assert.deepEqual(await validateWorkerContract(safe, root), { ok: true });
+	for (const unsafe of [
+		contract({ ...safe, agent: { ...safe.agent, source: "project" } }),
+		contract({ ...safe, context: "fork" }),
+		contract({ ...safe, tools: { ...safe.tools, effectiveAllowlist: ["read", "edit", "write", "bash"] } }),
+		contract({ ...safe, tools: { ...safe.tools, effectiveAllowlist: ["read", "edit"] } }),
+		contract({ ...safe, tools: { ...safe.tools, capabilityAudit: { extensionsDenied: false } } }),
+	]) {
+		assert.equal((await validateWorkerContract(unsafe, root)).ok, false);
+	}
+});
+
 test("validates RPC ping and structured delegation response", async () => {
 	const { pi, events } = createEventPi();
 	const boundary = new SubagentBoundary(pi);
@@ -190,6 +221,63 @@ test("validates RPC ping and structured delegation response", async () => {
 		launchContractDigest: "launch-digest",
 	});
 	boundary.dispose();
+});
+
+test("requires exact run and launch proof for a controlled worker terminal response", async () => {
+	const successHarness = createEventPi();
+	installPingResponder(successHarness.events);
+	const boundary = new SubagentBoundary(successHarness.pi);
+	const runIds: string[] = [];
+	successHarness.events.on("prompt-template:subagent:request", (payload: any) => {
+		successHarness.events.emit("prompt-template:subagent:update", {
+			requestId: payload.requestId,
+			ownerRunId: payload.ownerRunId,
+			nodeId: payload.nodeId,
+			runId: "worker-run",
+			currentTool: "edit",
+		});
+		successHarness.events.emit("prompt-template:subagent:response", {
+			requestId: payload.requestId,
+			ownerRunId: payload.ownerRunId,
+			nodeId: payload.nodeId,
+			status: "completed",
+			runId: "worker-run",
+			launchContractDigest: "launch-digest",
+			result: { kind: "text", text: "implemented" },
+		});
+	});
+	const result = await boundary.delegateWorker(
+		"Implement approved scope",
+		{ cwd: "/repo", sessionManager: { getSessionId: () => "session" } } as any,
+		"launch-digest",
+		{ onRunId: (runId) => runIds.push(runId) },
+	);
+	assert.equal(result.status, "completed");
+	assert.equal(result.runId, "worker-run");
+	assert.equal(result.text, "implemented");
+	assert.deepEqual(runIds, ["worker-run"]);
+
+	const missingProofHarness = createEventPi();
+	installPingResponder(missingProofHarness.events);
+	const missingProofBoundary = new SubagentBoundary(missingProofHarness.pi);
+	missingProofHarness.events.on("prompt-template:subagent:request", (payload: any) => {
+		missingProofHarness.events.emit("prompt-template:subagent:response", {
+			requestId: payload.requestId,
+			ownerRunId: payload.ownerRunId,
+			nodeId: payload.nodeId,
+			status: "failed",
+			runId: "worker-run",
+			error: "worker failed",
+		});
+	});
+	await assert.rejects(
+		missingProofBoundary.delegateWorker(
+			"Implement approved scope",
+			{ cwd: "/repo", sessionManager: { getSessionId: () => "session" } } as any,
+			"launch-digest",
+		),
+		/launch contract digest is missing or changed/,
+	);
 });
 
 test("fails closed for duplicate or failed delegation responses", async () => {
@@ -288,75 +376,4 @@ test("ping fails closed when no runtime owner answers", async () => {
 	const { pi } = createEventPi();
 	const boundary = new SubagentBoundary(pi);
 	await assert.rejects(boundary.ping(5), /did not answer/);
-});
-
-test("reads validation state from the versioned public async status snapshot", async () => {
-	const { pi, events } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	installPingResponder(events);
-	events.on("subagents:rpc:v1:request", (payload: any) => {
-		if (payload.method !== "status") return;
-		events.emit(`subagents:rpc:v1:reply:${payload.requestId}`, {
-			version: 1,
-			requestId: payload.requestId,
-			success: true,
-			data: {
-				text: "Run: validation-run\nState: complete",
-				details: { mode: "single", results: [] },
-				asyncSnapshot: {
-					kind: "pi-subagents.async-status-snapshot",
-					version: 1,
-					runs: [{ id: "validation-run", kind: "workflow", label: "validation", state: "complete" }],
-				},
-			},
-		});
-	});
-	assert.deepEqual(await boundary.status("validation-run"), { state: "complete" });
-	await assert.rejects(boundary.status("other-run"), /exactly one run/);
-});
-
-test("builds validation spawn only from the approved plan contract", async () => {
-	const { pi, events, emitted } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	installPingResponder(events);
-	events.on("subagents:rpc:v1:request", (payload: any) => {
-		if (payload.method !== "spawn") return;
-		events.emit(`subagents:rpc:v1:reply:${payload.requestId}`, {
-			version: 1,
-			requestId: payload.requestId,
-			success: true,
-			data: { details: { asyncId: "validation-run" } },
-		});
-	});
-	const plan = {
-		version: 2,
-		risk: "medium",
-		complexity: "medium",
-		uncertainty: "low",
-		documents: {
-			requirementName: "候选验证",
-			solutionPath: "docs/候选验证-技术方案.md",
-			planPath: "docs/候选验证-实施计划.md",
-			selectionSource: "package-default",
-		},
-		validation: [
-			{ id: "typecheck", command: "npm run typecheck", timeoutMs: 120000 },
-			{ id: "unit", command: "npm test", timeoutMs: 120000 },
-		],
-		progressTargets: ["docs/候选验证-实施计划.md"],
-		progressChecks: [],
-	} as const;
-	const candidate = "a".repeat(64);
-
-	const result = await boundary.spawnValidation(plan, candidate, { cwd: "/repo" } as any);
-	assert.equal(result.runId, "validation-run");
-	const spawn = emitted.find((entry) => entry.event === "subagents:rpc:v1:request" && entry.payload.method === "spawn");
-	assert.ok(spawn);
-	const script = spawn.payload.params.workflowScript as string;
-	assert.match(script, /candidate-validation/);
-	assert.match(script, /npm run typecheck/);
-	assert.match(script, /npm test/);
-	assert.match(script, new RegExp(candidate));
-	assert.equal(spawn.payload.params.context, "fresh");
-	assert.equal(spawn.payload.params.async, true);
 });

@@ -13,8 +13,11 @@ import {
 	SUBAGENT_DELEGATION_CANCEL_EVENT,
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
 	SUBAGENT_DELEGATION_RESPONSE_EVENT,
+	SUBAGENT_DELEGATION_UPDATE_EVENT,
 	type SubagentDelegationRequest,
 	type SubagentDelegationResponse,
+	type SubagentDelegationStatus,
+	type SubagentDelegationUpdate,
 } from "pi-subagents/delegation";
 import {
 	resolveSubagentLaunchContract,
@@ -22,7 +25,6 @@ import {
 } from "pi-subagents/preflight";
 
 import type { SubagentAccess } from "./domain.ts";
-import type { ApprovedPlanContract } from "./plan-contract.ts";
 
 const RPC_PROTOCOL_VERSION = 1 as const;
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
@@ -32,6 +34,7 @@ export const READONLY_DELEGATE_ROLES = ["scout", "oracle", "reviewer"] as const;
 export type ReadonlyDelegateRole = (typeof READONLY_DELEGATE_ROLES)[number];
 
 const READONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+const WORKER_TOOLS = ["read", "grep", "find", "ls", "edit", "write"] as const;
 const MUTATION_TOOLS = new Set(["bash", "edit", "write", "subagent", "bg_wait"]);
 
 function ceilingForAccess(accessMode: SubagentAccess): SubagentCapabilityCeiling {
@@ -41,7 +44,7 @@ function ceilingForAccess(accessMode: SubagentAccess): SubagentCapabilityCeiling
 		case "validation":
 			return { allowedAgents: ["reviewer"], allowedTools: ["read", "grep", "find", "ls"], denyExtensions: true };
 		case "controlled-writer":
-			return { allowedAgents: ["worker", ...READONLY_DELEGATE_ROLES] };
+			return { allowedAgents: ["worker"], allowedTools: WORKER_TOOLS, denyExtensions: true };
 		case "none":
 		default:
 			return { allowedAgents: [], allowedTools: [] };
@@ -68,6 +71,31 @@ async function canonicalizePotentialPath(input: string): Promise<string> {
 export function pathIsInside(root: string, candidate: string): boolean {
 	const relative = path.relative(root, candidate);
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function validateManagedOutput(contract: SubagentLaunchContract, gitRoot: string, label: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+	if (!contract.roots.outputPath) return { ok: true };
+	const canonicalRoot = await realpath(gitRoot);
+	const canonicalOutput = await canonicalizePotentialPath(contract.roots.outputPath);
+	if (pathIsInside(canonicalRoot, canonicalOutput)) {
+		return { ok: false, reason: `${label} output is inside Git root: ${canonicalOutput}` };
+	}
+	const managedRoots = [contract.roots.artifactsDir, contract.roots.sessionRoot]
+		.filter((root): root is string => typeof root === "string" && root.length > 0);
+	if (managedRoots.length === 0) {
+		return { ok: false, reason: `${label} output has no runtime-managed root` };
+	}
+	let managed = false;
+	for (const root of managedRoots) {
+		const canonicalManagedRoot = await canonicalizePotentialPath(root);
+		if (pathIsInside(canonicalRoot, canonicalManagedRoot)) {
+			return { ok: false, reason: `${label} managed root is inside Git root: ${canonicalManagedRoot}` };
+		}
+		if (pathIsInside(canonicalManagedRoot, canonicalOutput)) managed = true;
+	}
+	return managed
+		? { ok: true }
+		: { ok: false, reason: `${label} output is outside runtime-managed roots: ${canonicalOutput}` };
 }
 
 export async function validateReadOnlyContract(
@@ -97,30 +125,33 @@ export async function validateReadOnlyContract(
 	if (contract.tools.effectiveAllowlist.some((tool) => !READONLY_TOOLS.includes(tool as (typeof READONLY_TOOLS)[number]))) {
 		return { ok: false, reason: "Read-only delegation resolved an unapproved tool" };
 	}
-	if (contract.roots.outputPath) {
-		const canonicalRoot = await realpath(gitRoot);
-		const canonicalOutput = await canonicalizePotentialPath(contract.roots.outputPath);
-		if (pathIsInside(canonicalRoot, canonicalOutput)) {
-			return { ok: false, reason: `Read-only delegation output is inside Git root: ${canonicalOutput}` };
-		}
-		const managedRoots = [contract.roots.artifactsDir, contract.roots.sessionRoot]
-			.filter((root): root is string => typeof root === "string" && root.length > 0);
-		if (managedRoots.length === 0) {
-			return { ok: false, reason: "Read-only delegation output has no runtime-managed root" };
-		}
-		let managed = false;
-		for (const root of managedRoots) {
-			const canonicalManagedRoot = await canonicalizePotentialPath(root);
-			if (pathIsInside(canonicalRoot, canonicalManagedRoot)) {
-				return { ok: false, reason: `Read-only delegation managed root is inside Git root: ${canonicalManagedRoot}` };
-			}
-			if (pathIsInside(canonicalManagedRoot, canonicalOutput)) managed = true;
-		}
-		if (!managed) {
-			return { ok: false, reason: `Read-only delegation output is outside runtime-managed roots: ${canonicalOutput}` };
+	return validateManagedOutput(contract, gitRoot, "Read-only delegation");
+}
+
+export async function validateWorkerContract(
+	contract: SubagentLaunchContract,
+	gitRoot: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+	if (contract.agent.name !== "worker" || contract.agent.source !== "builtin") {
+		return { ok: false, reason: `Resolved agent '${contract.agent.name}' is not the builtin 'worker'` };
+	}
+	if (contract.context !== "fresh") return { ok: false, reason: "Worker delegation must use fresh context" };
+	if (contract.tools.fanoutAuthorized) return { ok: false, reason: "Worker delegation cannot authorize fanout" };
+	if (!contract.tools.disableAmbientExtensions || contract.tools.capabilityAudit?.extensionsDenied !== true) {
+		return { ok: false, reason: "Worker delegation must prove ambient Extensions are disabled" };
+	}
+	if (contract.tools.effectiveMcpTools.length > 0 || contract.tools.toolExtensionPaths.length > 0) {
+		return { ok: false, reason: "Worker delegation cannot load MCP or tool Extension paths" };
+	}
+	if (contract.tools.effectiveAllowlist.some((tool) => !WORKER_TOOLS.includes(tool as (typeof WORKER_TOOLS)[number]))) {
+		return { ok: false, reason: "Worker delegation resolved an unapproved tool" };
+	}
+	for (const required of ["edit", "write"] as const) {
+		if (!contract.tools.effectiveAllowlist.includes(required)) {
+			return { ok: false, reason: `Worker delegation is missing required tool '${required}'` };
 		}
 	}
-	return { ok: true };
+	return validateManagedOutput(contract, gitRoot, "Worker delegation");
 }
 
 interface RpcReply {
@@ -131,46 +162,13 @@ interface RpcReply {
 	error?: { message?: unknown };
 }
 
-export type ValidationRunStatus =
-	| "queued"
-	| "running"
-	| "complete"
-	| "failed"
-	| "partial"
-	| "paused"
-	| "stopped"
-	| "rejected";
-
-const VALIDATION_RUN_STATUSES = new Set<ValidationRunStatus>([
-	"queued",
-	"running",
-	"complete",
-	"failed",
-	"partial",
-	"paused",
-	"stopped",
-	"rejected",
-]);
-
-function validationRunStatusFromSnapshot(data: Record<string, unknown>, runId: string): ValidationRunStatus {
-	const snapshot = data.asyncSnapshot;
-	if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-		throw new Error("pi-subagents status response has no async status snapshot");
-	}
-	const record = snapshot as Record<string, unknown>;
-	if (record.kind !== "pi-subagents.async-status-snapshot" || record.version !== 1 || !Array.isArray(record.runs)) {
-		throw new Error("pi-subagents async status snapshot is incompatible");
-	}
-	const matches = record.runs.filter(
-		(value): value is Record<string, unknown> =>
-			Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).id === runId),
-	);
-	if (matches.length !== 1) throw new Error(`pi-subagents status did not return exactly one run '${runId}'`);
-	const state = matches[0]!.state;
-	if (typeof state !== "string" || !VALIDATION_RUN_STATUSES.has(state as ValidationRunStatus)) {
-		throw new Error(`pi-subagents run '${runId}' returned an invalid state`);
-	}
-	return state as ValidationRunStatus;
+export interface WorkerDelegationResult {
+	status: Exclude<SubagentDelegationStatus, "invalid_request">;
+	runId: string;
+	launchContractDigest: string;
+	text?: string;
+	error?: string;
+	model?: string;
 }
 
 export class SubagentBoundary {
@@ -208,7 +206,7 @@ export class SubagentBoundary {
 		return this.rpcRequest("ping", undefined, timeoutMs);
 	}
 
-	private async rpcRequest(method: "ping" | "spawn" | "status", params: unknown, timeoutMs: number): Promise<Record<string, unknown>> {
+	private async rpcRequest(method: "ping", params: unknown, timeoutMs: number): Promise<Record<string, unknown>> {
 		const requestId = randomUUID();
 		return new Promise((resolve, reject) => {
 			let settled = false;
@@ -251,52 +249,6 @@ export class SubagentBoundary {
 		});
 	}
 
-	async status(runId: string): Promise<{ state: ValidationRunStatus }> {
-		await this.ping();
-		const data = await this.rpcRequest("status", { id: runId }, 5000);
-		return { state: validationRunStatusFromSnapshot(data, runId) };
-	}
-
-	async spawnValidation(
-		contract: ApprovedPlanContract,
-		candidateDigest: string,
-		ctx: ExtensionContext,
-	): Promise<{ runId: string; receipt: Record<string, unknown> }> {
-		await this.ping();
-		const task = [
-			"Validate the approved candidate without modifying project/source files.",
-			`Candidate digest: ${candidateDigest}`,
-			"Report only the runtime verification result and residual risks.",
-		].join("\n");
-		const acceptance = {
-			level: "verified",
-			criteria: [`Validation evidence must apply to candidate ${candidateDigest}`],
-			evidence: ["commands-run", "validation-output", "residual-risks"],
-			verify: contract.validation,
-		};
-		const workflowScript = [
-			"return runs.run(\"candidate-validation\", {",
-			"  agent: \"reviewer\",",
-			`  task: ${JSON.stringify(task)},`,
-			`  acceptance: ${JSON.stringify(acceptance)}`,
-			"});",
-		].join("\n");
-		const receipt = await this.rpcRequest(
-			"spawn",
-			{
-				workflowScript,
-				cwd: ctx.cwd,
-				context: "fresh",
-				async: true,
-				mission: false,
-			},
-			5000,
-		);
-		const runId = findRunId(receipt);
-		if (!runId) throw new Error("pi-subagents validation spawn returned no run id");
-		return { runId, receipt };
-	}
-
 	async preflight(
 		role: ReadonlyDelegateRole,
 		task: string,
@@ -318,9 +270,142 @@ export class SubagentBoundary {
 			parentLeafId: ctx.sessionManager.getLeafId(),
 		});
 		if (!result.ok) throw new Error(result.message);
+		if (result.contract.modelCandidates.length === 0) {
+			throw new Error(`No usable subagent model is configured for builtin '${role}'`);
+		}
 		const safe = await validateReadOnlyContract(result.contract, role, gitRoot);
 		if (!safe.ok) throw new Error(safe.reason);
 		return result.contract;
+	}
+
+	async preflightWorker(
+		task: string,
+		ctx: ExtensionContext,
+		gitRoot: string,
+	): Promise<SubagentLaunchContract> {
+		if (!this.sessionId) throw new Error("Subagent boundary is not bound to a session");
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			task,
+			context: "fresh",
+			cwd: ctx.cwd,
+			parentModel: ctx.model
+				? { provider: ctx.model.provider, id: ctx.model.id }
+				: undefined,
+			availableModels: ctx.modelRegistry.getAvailable(),
+			capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(this.sessionId),
+			parentSessionFile: ctx.sessionManager.getSessionFile(),
+			parentLeafId: ctx.sessionManager.getLeafId(),
+		});
+		if (!result.ok) throw new Error(result.message);
+		if (result.contract.modelCandidates.length === 0) {
+			throw new Error("No usable subagent model is configured for builtin 'worker'");
+		}
+		const safe = await validateWorkerContract(result.contract, gitRoot);
+		if (!safe.ok) throw new Error(safe.reason);
+		return result.contract;
+	}
+
+	async delegateWorker(
+		task: string,
+		ctx: ExtensionContext,
+		expectedLaunchContractDigest: string,
+		options: {
+			signal?: AbortSignal;
+			timeoutMs?: number;
+			onRunId?: (runId: string) => void;
+			onUpdate?: (update: SubagentDelegationUpdate) => void;
+		} = {},
+	): Promise<WorkerDelegationResult> {
+		await this.ping();
+		const requestId = randomUUID();
+		const ownerRunId = `adaptive-delivery-${ctx.sessionManager.getSessionId()}`;
+		const nodeId = `worker-${expectedLaunchContractDigest}-${requestId}`;
+		const request: SubagentDelegationRequest = {
+			requestId,
+			ownerRunId,
+			nodeId,
+			agent: "worker",
+			task,
+			context: "fresh",
+			cwd: ctx.cwd,
+			thinking: "high",
+			artifacts: true,
+			result: { kind: "text" },
+		};
+
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			let observedRunId: string | undefined;
+			const cleanup = () => {
+				clearTimeout(timer);
+				unsubscribeUpdate?.();
+				unsubscribeResponse?.();
+				options.signal?.removeEventListener("abort", abort);
+			};
+			const finish = (error?: Error, value?: WorkerDelegationResult) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				if (error) reject(error);
+				else if (value) resolve(value);
+				else reject(new Error("Worker delegation finished without a terminal result"));
+			};
+			const abort = () => {
+				this.pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId, ownerRunId, nodeId });
+				finish(new Error("Worker delegation aborted before terminal proof"));
+			};
+			const unsubscribeUpdate = this.pi.events.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (payload) => {
+				const update = payload as SubagentDelegationUpdate;
+				if (update.requestId !== requestId || update.ownerRunId !== ownerRunId || update.nodeId !== nodeId) return;
+				if (update.runId) {
+					if (observedRunId && observedRunId !== update.runId) {
+						this.pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId, ownerRunId, nodeId });
+						finish(new Error("Worker delegation run id changed during execution"));
+						return;
+					}
+					if (!observedRunId) {
+						observedRunId = update.runId;
+						options.onRunId?.(update.runId);
+					}
+				}
+				options.onUpdate?.(update);
+			});
+			const unsubscribeResponse = this.pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => {
+				const response = payload as SubagentDelegationResponse;
+				if (response.requestId !== requestId || response.ownerRunId !== ownerRunId || response.nodeId !== nodeId) return;
+				if (response.status === "invalid_request") {
+					finish(new Error(response.error ?? "Worker delegation request was rejected"));
+					return;
+				}
+				if (!response.runId || (observedRunId && response.runId !== observedRunId)) {
+					finish(new Error("Worker delegation terminal run id is missing or changed"));
+					return;
+				}
+				if (!response.launchContractDigest || response.launchContractDigest !== expectedLaunchContractDigest) {
+					finish(new Error("Worker delegation terminal launch contract digest is missing or changed"));
+					return;
+				}
+				finish(undefined, {
+					status: response.status as WorkerDelegationResult["status"],
+					runId: response.runId,
+					launchContractDigest: response.launchContractDigest,
+					...(response.result?.kind === "text" ? { text: response.result.text } : {}),
+					...(response.error ? { error: response.error } : {}),
+					...(response.model ? { model: response.model } : {}),
+				});
+			});
+			const timer = setTimeout(() => {
+				this.pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId, ownerRunId, nodeId });
+				finish(new Error("Worker delegation timed out before terminal proof"));
+			}, options.timeoutMs ?? 30 * 60_000);
+			if (options.signal?.aborted) {
+				abort();
+				return;
+			}
+			options.signal?.addEventListener("abort", abort, { once: true });
+			this.pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
+		});
 	}
 
 	async delegate(
@@ -395,17 +480,4 @@ export class SubagentBoundary {
 			this.pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
 		});
 	}
-}
-
-function findRunId(value: unknown): string | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const record = value as Record<string, unknown>;
-	for (const key of ["runId", "asyncId", "id"]) {
-		if (typeof record[key] === "string" && record[key]) return record[key];
-	}
-	for (const key of ["details", "async", "result"]) {
-		const nested = findRunId(record[key]);
-		if (nested) return nested;
-	}
-	return undefined;
 }

@@ -23,7 +23,7 @@ class RpcHarness {
 	private readonly pending = new Map<string, { resolve(value: RpcRecord): void; reject(error: Error): void }>();
 	private stderr = "";
 
-	constructor(cwd: string, agentDir: string, options: { fakeProvider?: boolean } = {}) {
+	constructor(cwd: string, agentDir: string, options: { fakeProvider?: boolean; deliveryGate?: boolean; env?: Record<string, string> } = {}) {
 		const root = process.cwd();
 		const fakeProviderArgs = options.fakeProvider
 			? [
@@ -31,8 +31,11 @@ class RpcHarness {
 					path.join(root, "test/support/fake-provider.ts"),
 					"--model",
 					"adaptive-fake/fake-model",
-				]
-			: [];
+					]
+				: [];
+		const deliveryGateArgs = options.deliveryGate === false
+			? []
+			: ["--extension", path.join(root, "extensions/delivery-gate/index.ts")];
 		this.process = spawn(
 			process.env.PI_BINARY || "pi",
 			[
@@ -43,10 +46,9 @@ class RpcHarness {
 				"--no-context-files",
 				"--no-themes",
 				"--no-extensions",
-				"--extension",
-				path.join(root, "node_modules/pi-subagents/index.ts"),
-				"--extension",
-				path.join(root, "extensions/delivery-gate/index.ts"),
+					"--extension",
+					path.join(root, "node_modules/pi-subagents/index.ts"),
+					...deliveryGateArgs,
 				...fakeProviderArgs,
 				"--no-skills",
 				"--skill",
@@ -64,8 +66,9 @@ class RpcHarness {
 				env: {
 					...process.env,
 					PI_CODING_AGENT_DIR: agentDir,
-					PI_OFFLINE: "1",
-					PI_ADAPTIVE_DELIVERY_STATE_DIR: path.join(agentDir, "adaptive-delivery"),
+						PI_OFFLINE: "1",
+						PI_ADAPTIVE_DELIVERY_STATE_DIR: path.join(agentDir, "adaptive-delivery"),
+						...options.env,
 				},
 				stdio: ["pipe", "pipe", "pipe"],
 			},
@@ -138,10 +141,17 @@ class RpcHarness {
 					resolve(match);
 					return;
 				}
-				if (Date.now() - started >= timeoutMs) {
-					clearInterval(timer);
-					reject(new Error(`RPC event wait timed out. stderr=${this.stderr}`));
-				}
+					if (Date.now() - started >= timeoutMs) {
+						clearInterval(timer);
+						const recent = this.records.slice(-20).map((record: any) => ({
+							type: record.type,
+							method: record.method,
+							success: record.success,
+							message: record.message,
+							error: record.error,
+						}));
+						reject(new Error(`RPC event wait timed out. stderr=${this.stderr} recent=${JSON.stringify(recent)}`));
+					}
 			}, 10);
 		});
 	}
@@ -247,6 +257,38 @@ test("real Pi RPC runs the shaping tool lifecycle through a local fake provider"
 			),
 			true,
 		);
+	} finally {
+		harness.stop();
+	}
+});
+
+test("real Pi RPC validation executes the fixed host command without a child", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-validation-repo-"));
+	execFileSync("git", ["init", "-q"], { cwd });
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-validation-agent-"));
+	const harness = new RpcHarness(cwd, agentDir, {
+		fakeProvider: true,
+		deliveryGate: false,
+		env: { PI_ADAPTIVE_VALIDATION_PROBE: "1" },
+	});
+	try {
+		const response = await harness.send("prompt", { message: "/adaptive-validation-probe" }, 30000);
+		assert.equal(response.success, true);
+		const notification = await harness.waitFor(
+			(record) =>
+				record.type === "extension_ui_request" &&
+				record.method === "notify" &&
+				typeof (record as any).message === "string" &&
+				((record as any).message.includes('"status":"passed"') || (record as any).message.startsWith("validation-probe-error:")),
+				30000,
+			);
+		assert.equal((notification as any).message.startsWith("validation-probe-error:"), false, (notification as any).message);
+		const payload = JSON.parse((notification as any).message);
+		assert.equal(payload.result.runs.length, 1);
+		assert.equal(payload.result.runs[0].id, "runtime-probe");
+		assert.equal(payload.result.runs[0].status, "passed");
+		assert.equal(payload.result.runs[0].stdout, "validation-runtime-ok");
+		assert.equal(harness.records.some((record: any) => record.message?.customType === "subagent-notify"), false);
 	} finally {
 		harness.stop();
 	}

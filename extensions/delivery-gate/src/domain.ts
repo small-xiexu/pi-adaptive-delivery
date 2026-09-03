@@ -138,6 +138,7 @@ export interface PolicyContext {
 	writerLeaseHeld: boolean;
 	writerLeaseOwner: "parent" | "child" | null;
 	reworkApproved: boolean;
+	implementationWriter?: "parent" | "worker";
 	progressSync?: {
 		active: boolean;
 		writerFree: boolean;
@@ -217,9 +218,10 @@ export function resolveDeliveryPolicy(snapshot: DeliverySnapshot, context: Polic
 			context.writerLeaseOwner !== null &&
 			reworkAllowed
 		) {
+			const parentWrites = context.implementationWriter !== "worker";
 			return {
 				readTools: true,
-				sourceWrite: true,
+				sourceWrite: parentWrites,
 				writablePaths: [],
 				rawBash: false,
 				rawSubagent: false,

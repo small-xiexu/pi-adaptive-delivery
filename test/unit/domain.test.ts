@@ -115,6 +115,22 @@ test("only writer states with proven authorization and lease can write source fi
 	}
 });
 
+test("standard and high-risk implementation routes reserve source writes for one worker", () => {
+	const policy = resolveDeliveryPolicy(
+		{ state: "IMPLEMENTING" },
+		{
+			approvalsValid: true,
+			writerLeaseHeld: true,
+			writerLeaseOwner: "parent",
+			reworkApproved: false,
+			implementationWriter: "worker",
+		},
+	);
+
+	assert.equal(policy.sourceWrite, false);
+	assert.equal(policy.subagentAccess, "controlled-writer");
+});
+
 test("keeps writer states read-only when authorization or lease is missing", () => {
 	for (const state of ["IMPLEMENTING", "REWORKING"] as const) {
 		const policy = resolveDeliveryPolicy({ state }, BASE_CONTEXT);

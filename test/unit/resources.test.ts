@@ -53,6 +53,13 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 	assert.match(prompts[1]!.body, /"version": 2/);
 	assert.match(prompts[1]!.body, /documents\.planPath/);
 	assert.match(prompts[2]!.body, /delivery_submit_candidate/);
+	assert.match(prompts[2]!.body, /delivery_runtime_status/);
+	assert.match(prompts[2]!.body, /implementationWriter=parent/);
+	assert.match(prompts[2]!.body, /delivery_delegate_worker/);
+	assert.match(prompts[2]!.body, /工具按阶段开放/);
+	assert.match(prompts[2]!.body, /当前不可见是正常行为/);
+	assert.match(prompts[2]!.body, /只调用一次 `delivery_validate`/);
+	assert.match(prompts[2]!.body, /不要调用 `delivery_runtime_status` 定时轮询/);
 	assert.match(prompts[2]!.body, /可验证关闭义务/);
 	assert.match(prompts[2]!.body, /closure review/);
 	assert.doesNotMatch(prompts[2]!.body, /最多三轮/);
@@ -76,6 +83,32 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /create-only/);
 	assert.match(skill.body, /自动展开 `\/delivery-plan`/);
 	assert.match(skill.body, /自动展开 `\/delivery-run`/);
+	assert.match(skill.body, /delivery_runtime_status/);
+	assert.match(skill.body, /该动作只释放 writer 并保留批准链/);
+	assert.match(skill.body, /`\/delivery-resume` 经 TUI 用户确认/);
+	assert.match(skill.body, /`VALIDATING` 展开 `\/delivery-run`/);
+	assert.match(skill.body, /公开 preflight.*至少有一个可用 model candidate/);
+	assert.match(skill.body, /Pi 公开 `pi\.exec`/);
+	assert.match(skill.body, /不得定时轮询 `delivery_runtime_status`/);
+	assert.match(skill.body, /`standard\/high-risk` 从父 Pi 移除源码写入/);
+	assert.match(skill.body, /terminal response 到达后才自动冻结 candidate/);
 	assert.doesNotMatch(skill.body, /默认最多三轮/);
 	assert.match(skill.body, /不得重放结果未知/);
+});
+
+test("README leads with the user workflow and keeps machine contracts out of the quick path", async () => {
+	const source = await readFile(new URL("../../README.md", import.meta.url), "utf8");
+	assert.match(source, /## 最终效果/);
+	assert.match(source, /## 第一次使用/);
+	assert.match(source, /\/delivery-shape 继续 P6\.1/);
+	assert.match(source, /Package 会在对话区显示批准摘要，并自动生成实施计划/);
+	assert.match(source, /当前 v0\.1 不会合并或覆盖已经存在的需求文档/);
+	assert.match(source, /确认 resume.*Package 会自动继续当前阶段/);
+	assert.match(source, /worker 和 reviewer 配置至少一个 fallback/);
+	assert.match(source, /父 Pi 看不到 `edit\/write`/);
+	assert.match(source, /固定验证本身不再启动 reviewer 或依赖模型/);
+	assert.match(source, /defaultTtlMs.*300000/s);
+	assert.match(source, /## 常见恢复/);
+	assert.ok(source.indexOf("## 第一次使用") < source.indexOf("## 维护者参考"));
+	assert.doesNotMatch(source, /```adaptive-delivery-(?:documents|plan)/);
 });

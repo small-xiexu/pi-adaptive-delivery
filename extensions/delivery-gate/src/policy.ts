@@ -18,12 +18,41 @@ export interface ApplyPolicyResult {
 	reason?: string;
 }
 
+export interface PolicyControllerOptions {
+	baselineKey?: string;
+}
+
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const WRITE_TOOLS = new Set(["edit", "write"]);
-const SAFE_CONTROL_TOOLS = new Set(["delivery_begin", "delivery_invalidate", "delivery_progress_sync"]);
+const SAFE_CONTROL_TOOLS = new Set([
+	"delivery_begin",
+	"delivery_runtime_status",
+	"delivery_invalidate",
+	"delivery_progress_sync",
+]);
+const MANAGED_DELIVERY_TOOLS = new Set([
+	...SAFE_CONTROL_TOOLS,
+	"delivery_delegate_readonly",
+	"delivery_delegate_worker",
+	"delivery_submit_candidate",
+	"delivery_validate",
+	"delivery_review_candidate",
+	"delivery_begin_rework",
+	"delivery_finalize",
+]);
+const PROCESS_BASELINES_KEY = Symbol.for("pi-adaptive-delivery.policy-baselines.v1");
 
 function unique(names: readonly string[]): string[] {
 	return [...new Set(names)];
+}
+
+function processBaselines(): Map<string, string[]> {
+	const store = globalThis as unknown as { [key: symbol]: unknown };
+	const existing = store[PROCESS_BASELINES_KEY];
+	if (existing instanceof Map) return existing as Map<string, string[]>;
+	const created = new Map<string, string[]>();
+	store[PROCESS_BASELINES_KEY] = created;
+	return created;
 }
 
 function resolveActiveTools(baseline: readonly string[], policy: DeliveryPolicy): string[] {
@@ -36,7 +65,11 @@ function resolveActiveTools(baseline: readonly string[], policy: DeliveryPolicy)
 		active.push(...baseline.filter((name) => name === "delivery_delegate_readonly"));
 	}
 	if (policy.subagentAccess === "controlled-writer") {
-		active.push(...baseline.filter((name) => name === "delivery_submit_candidate"));
+		active.push(
+			...baseline.filter((name) =>
+				name === (policy.sourceWrite ? "delivery_submit_candidate" : "delivery_delegate_worker")
+			),
+		);
 	}
 	if (policy.subagentAccess === "validation") {
 		active.push(
@@ -53,17 +86,53 @@ function resolveActiveTools(baseline: readonly string[], policy: DeliveryPolicy)
 	return unique(active);
 }
 
+function requiredTools(policy: DeliveryPolicy): string[] {
+	if (policy.subagentAccess === "controlled-writer") {
+		return policy.sourceWrite
+			? ["edit", "write", "delivery_submit_candidate"]
+			: ["delivery_delegate_worker"];
+	}
+	if (policy.subagentAccess === "validation") {
+		return [
+			"delivery_validate",
+			"delivery_review_candidate",
+			"delivery_begin_rework",
+			"delivery_finalize",
+		];
+	}
+	return [];
+}
+
 export class PolicyController {
 	private baselineTools: string[] = [];
+	private baselineCaptured = false;
 	private readonly host: PolicyHost;
+	private readonly baselineKey?: string;
 
-	constructor(host: PolicyHost) {
+	constructor(host: PolicyHost, options: PolicyControllerOptions = {}) {
 		this.host = host;
+		this.baselineKey = options.baselineKey;
 	}
 
 	captureBaseline(): void {
-		if (this.baselineTools.length > 0) return;
-		this.baselineTools = unique(this.host.getActiveTools());
+		if (this.baselineCaptured) return;
+		const activeTools = unique(this.host.getActiveTools());
+		if (!this.baselineKey) {
+			this.baselineTools = activeTools;
+			this.baselineCaptured = true;
+			return;
+		}
+
+		const baselines = processBaselines();
+		const saved = baselines.get(this.baselineKey);
+		this.baselineTools = saved
+			? unique([
+					...saved,
+					...activeTools.filter((name) => MANAGED_DELIVERY_TOOLS.has(name)),
+				])
+			: activeTools;
+		baselines.set(this.baselineKey, [...this.baselineTools]);
+		this.baselineCaptured = true;
 	}
 
 	forceReadOnly(): ApplyPolicyResult {
@@ -94,9 +163,24 @@ export class PolicyController {
 	apply(snapshot: DeliverySnapshot, context: PolicyContext): ApplyPolicyResult {
 		const policy = resolveDeliveryPolicy(snapshot, context);
 		const activeTools = resolveActiveTools(this.baselineTools, policy);
+		const missingTools = requiredTools(policy).filter((name) => !activeTools.includes(name));
+		if (missingTools.length > 0) {
+			const fallback = this.forceReadOnly();
+			return {
+				ok: false,
+				policy: fallback.policy,
+				activeTools: fallback.activeTools,
+				reason: `Required tools are unavailable in the original Pi tool baseline: ${missingTools.join(", ")}`,
+			};
+		}
 
 		try {
 			this.host.setActiveTools(activeTools);
+			const observed = new Set(this.host.getActiveTools());
+			const inactiveTools = requiredTools(policy).filter((name) => !observed.has(name));
+			if (inactiveTools.length > 0) {
+				throw new Error(`Pi did not activate required tools: ${inactiveTools.join(", ")}`);
+			}
 			this.host.applySubagentAccess?.(policy.subagentAccess);
 			return { ok: true, policy, activeTools };
 		} catch (error) {

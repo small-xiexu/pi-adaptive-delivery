@@ -18,6 +18,18 @@ test("preflights the builtin scout through the bundled public API", async () => 
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 
 	try {
+		const model = {
+			id: "adaptive-test-model",
+			name: "Adaptive Test Model",
+			provider: "adaptive-test",
+			api: "openai-responses",
+			baseUrl: "http://127.0.0.1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100000,
+			maxTokens: 4096,
+		};
 		const boundary = new SubagentBoundary({ events: { on: () => () => {}, emit: () => {} } } as any);
 		boundary.bindSession("preflight-session");
 		boundary.applyAccess("readonly");
@@ -26,9 +38,9 @@ test("preflights the builtin scout through the bundled public API", async () => 
 			"Inspect the repository without modifying files.",
 			{
 				cwd: repo,
-				model: undefined,
+				model,
 				thinkingLevel: "low",
-				modelRegistry: { getAvailable: () => [] },
+				modelRegistry: { getAvailable: () => [model] },
 				sessionManager: {
 					getSessionFile: () => undefined,
 					getLeafId: () => undefined,
@@ -40,6 +52,7 @@ test("preflights the builtin scout through the bundled public API", async () => 
 		assert.equal(contract.agent.name, "scout");
 		assert.equal(contract.agent.source, "builtin");
 		assert.equal(contract.context, "fresh");
+		assert.deepEqual(contract.modelCandidates, ["adaptive-test/adaptive-test-model:low"]);
 		assert.equal(contract.tools.effectiveAllowlist.includes("bash"), false);
 		assert.equal(contract.tools.effectiveAllowlist.includes("write"), false);
 		assert.equal(contract.tools.disableAmbientExtensions, true);

@@ -8,6 +8,8 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { runApprovedValidation } from "../../extensions/delivery-gate/src/validation.ts";
+
 function baseMessage(model: Model<any>): AssistantMessage {
 	return {
 		role: "assistant",
@@ -40,7 +42,14 @@ function fakeStream(
 		const began = context.messages.some(
 			(message) => message.role === "toolResult" && message.toolName === "delivery_begin",
 		);
-		if (!began) {
+		if (process.env.PI_ADAPTIVE_VALIDATION_PROBE === "1") {
+			const text = "Validation probe parent idle.";
+			output.content.push({ type: "text", text });
+			stream.push({ type: "text_start", contentIndex: 0, partial: output });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
+			stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+			output.stopReason = "stop";
+		} else if (!began) {
 			const toolCall = {
 				type: "toolCall" as const,
 				id: "fake-delivery-begin",
@@ -83,5 +92,26 @@ export default function fakeProvider(pi: ExtensionAPI): void {
 			},
 		],
 		streamSimple: fakeStream,
+	});
+
+	if (process.env.PI_ADAPTIVE_VALIDATION_PROBE !== "1") return;
+	pi.registerCommand("adaptive-validation-probe", {
+		description: "Run the local validation-runtime E2E probe",
+		handler: async (_args, ctx) => {
+			try {
+				const result = await runApprovedValidation({
+					pi,
+					cwd: ctx.cwd,
+					commands: [{
+					id: "runtime-probe",
+					command: "node -e \"process.stdout.write('validation-runtime-ok')\"",
+					timeoutMs: 30_000,
+					}],
+				});
+				ctx.ui.notify(JSON.stringify({ result }), result.status === "passed" ? "info" : "error");
+			} catch (error) {
+				ctx.ui.notify(`validation-probe-error:${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		},
 	});
 }

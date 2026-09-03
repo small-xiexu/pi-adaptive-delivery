@@ -41,15 +41,17 @@ docs/<需求短名称>-实施计划.md
 
 solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 只 create-only 写入两份新 Markdown；目标存在或任一路径无法证明时保持只读。两份文档成功并记录摘要后才进入 `IMPLEMENTING`。Session entry 仍是批准主体，文件不能反向授予权限。
 
+显示 plan 批准对话前，Extension 必须用 pi-subagents 公开 preflight 证明 builtin reviewer 至少有一个可用 model candidate，且只读工具、`denyExtensions`、output 和 cwd 边界成立。preflight 不启动 child 或调用 Provider。无可用 reviewer/fallback 时保持待批准和只读，先让用户修复模型配置；不得先实现再等验证资源。
+
 这些 marker 和 JSON fence 只属于内部协议；Extension 在 TUI 显示和规划文档落盘时隐藏它们。父会话仍需输出完整协议供原始 Session 解析，但面向用户的正文不能要求用户阅读或解释内部 JSON。
 
-正常 TUI 流程只要求用户执行批准动作：solution approval 成功后 Extension 显示可见状态并自动展开 `/delivery-plan`；plan approval、文档同步和策略提交成功后显示两条路径并自动展开 `/delivery-run`。两条命令继续作为手工恢复入口。非 TUI、用户取消、同步或状态提交失败不得自动继续；自动发送本身失败时保留已批准状态并明确提示手工命令。
+正常 TUI 流程只要求用户执行批准或恢复确认：solution approval 成功后 Extension 显示可见状态并自动展开 `/delivery-plan`；plan approval、文档同步和策略提交成功后显示两条路径并自动展开 `/delivery-run`。`/delivery-resume` 经 TUI 用户确认且状态、lease、策略全部提交成功后也自动继续：`PLANNING` 展开 `/delivery-plan`，`IMPLEMENTING`、`REWORKING`、`VALIDATING` 展开 `/delivery-run`；待批准状态继续等待用户，不能自动批准。两条模板命令继续作为手工恢复入口。非 TUI、用户取消、同步或状态提交失败不得自动继续；自动发送本身失败时保留已批准或已恢复状态并明确提示手工命令。
 
 ## 自适应路由
 
-- 小型、低风险、低不确定性：单强 Agent + focused validation。
-- 中大型或中等风险：单 worker + runtime gate + fresh reviewer。
-- 高风险或高不确定性：方案阶段增加只读 oracle，开发阶段使用多角度 reviewer。
+- 小型、低风险、低不确定性：父 Pi 是唯一 writer，直接实现后 focused validation。
+- 中大型或中等风险：父 Pi 只编排，单 foreground worker 是唯一实现者，再运行 runtime gate + fresh reviewer。
+- 高风险或高不确定性：方案阶段增加只读 oracle，父 Pi 只编排，单 foreground worker 实现并增加多角度 reviewer。
 
 风险优先于代码量。认证、授权、密钥、迁移、删除、费用和生产操作始终按高风险处理。
 
@@ -70,14 +72,25 @@ solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标�
 
 ## 实现、审查与收敛
 
+Delivery 工具按状态动态开放。任何时候不确定当前阶段时，先调用只读的 `delivery_runtime_status`：
+
+- `IMPLEMENTING` 和授权 `REWORKING` 根据 plan route 二选一：`single` 只给父 Pi 源码写入工具与 `delivery_submit_candidate`；`standard/high-risk` 从父 Pi 移除源码写入，只给 `delivery_delegate_worker`。
+- `delivery_delegate_worker` 使用 builtin fresh foreground worker。父进程在 child 运行期间保管 workspace lease，但没有写工具、没有并行下一回合，且 tool-batch barrier 拒绝 sibling write；匹配 run ID 和 `launchContractDigest` 的 terminal response 到达后才自动冻结 candidate 与释放 lease。proof 缺失时保留 lease并 BLOCKED。
+- 候选提交成功、状态切到 `VALIDATING` 后，验证、审查、返工和完成工具才会在下一次模型请求中出现。
+- 后续阶段工具提前不可见不是运行时故障，不得以此为由撤销批准或删除规划文档。
+- 当前阶段必需工具确实缺失时可以 `delivery_invalidate(target=BLOCKED)` 暂停；该动作只释放 writer 并保留批准链、规划文档、candidate 和 evidence。恢复权限仍必须由 TUI 用户执行 `/delivery-resume`。
+- 只有需求、范围、架构或计划真的失效时，才使用 `SHAPING` 或 `PLANNING` 目标撤销相应批准。
+- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 plan contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。
+- validation terminal checkpoint 保存绑定 candidate 的批次 ID 和逐命令摘要。命令无法启动、工具中断或 terminal checkpoint 缺失按 infrastructure failure；真实非零退出或超时只证明批准命令未通过。父会话必须再区分候选代码、验证环境和已批准计划，只有代码问题调用 `delivery_begin_rework`，计划错误使用 `/delivery-revise`。
+
 ```text
-单 writer 实现
-  -> delivery_submit_candidate
+single: 父 Pi 实现 -> delivery_submit_candidate
+standard/high-risk: 唯一 worker 实现 -> terminal proof -> 自动冻结 candidate
   -> delivery_validate
   -> 同一 candidate 的集中 review wave
   -> 父会话裁决
   -> accepted P0/P1 转成可验证关闭义务
-  -> 原 writer 批量返工并运行确定性复验
+  -> 同一路由的唯一 writer 批量返工并运行确定性复验
   -> 一次 closure review
   -> delivery_finalize 或升级设计
 ```
