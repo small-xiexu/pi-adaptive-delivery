@@ -48,6 +48,11 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 	assert.match(prompts[0]!.body, /adaptive-delivery:solution:start/);
 	assert.match(prompts[0]!.body, /adaptive-delivery-documents/);
 	assert.match(prompts[0]!.body, /用户明确要求.*项目规则.*用户全局规则.*Package 默认/);
+	assert.match(prompts[0]!.body, /方案追问/);
+	assert.match(prompts[0]!.body, /每次只问一个问题/);
+	assert.match(prompts[0]!.body, /极小.*默认零追问/);
+	assert.match(prompts[0]!.body, /用户可以只回答“按推荐”/);
+	assert.doesNotMatch(prompts[0]!.body, /一次列出所有问题|同时列出问题清单/);
 	assert.match(prompts[1]!.body, /本阶段禁止项目写入/);
 	assert.match(prompts[1]!.body, /adaptive-delivery:plan:start/);
 	assert.match(prompts[1]!.body, /"version": 2/);
@@ -75,6 +80,11 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /所有修改型任务/);
 	assert.match(skill.body, /同一个 cwd\/worktree 同时只有一个 writer/);
 	assert.match(skill.body, /先用大白话对齐最终效果/);
+	assert.match(skill.body, /方案追问是本 Skill 内置行为/);
+	assert.match(skill.body, /每轮只问一个问题/);
+	assert.match(skill.body, /极小需求默认零追问/);
+	assert.match(skill.body, /所有高影响歧义关闭后立即停止/);
+	assert.match(skill.body, /方案追问面向用户确认产品和范围；oracle 面向高风险技术取舍/);
 	assert.match(skill.body, /可验证关闭义务/);
 	assert.match(skill.body, /一次 closure review/);
 	assert.match(skill.body, /同一最小复现仍失败/);
@@ -107,6 +117,8 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /worker 和 reviewer 配置至少一个 fallback/);
 	assert.match(source, /父 Pi 看不到 `edit\/write`/);
 	assert.match(source, /固定验证本身不再启动 reviewer 或依赖模型/);
+	assert.match(source, /Package 已把“方案追问”内置/);
+	assert.match(source, /极小、局部、可逆、验收明确且没有用户决策分支的需求默认不追问/);
 	assert.match(source, /defaultTtlMs.*300000/s);
 	assert.match(source, /## 常见恢复/);
 	assert.ok(source.indexOf("## 第一次使用") < source.indexOf("## 维护者参考"));
