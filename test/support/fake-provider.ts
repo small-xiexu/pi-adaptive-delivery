@@ -41,11 +41,25 @@ function fakeStream(
 	queueMicrotask(() => {
 		const output = baseMessage(model);
 		stream.push({ type: "start", partial: output });
+		const availableTools = new Set((context.tools ?? []).map((tool) => tool.name));
 		const began = context.messages.some(
 			(message) => message.role === "toolResult" && message.toolName === "delivery_begin",
 		);
+		const delegatedReadonly = context.messages.some(
+			(message) => message.role === "toolResult" && message.toolName === "delivery_delegate_readonly",
+		);
 		if (process.env.PI_ADAPTIVE_VALIDATION_PROBE === "1") {
 			const text = "Validation probe parent idle.";
+			output.content.push({ type: "text", text });
+			stream.push({ type: "text_start", contentIndex: 0, partial: output });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
+			stream.push({ type: "text_end", contentIndex: 0, content: text, partial: output });
+			output.stopReason = "stop";
+		} else if (
+			process.env.PI_ADAPTIVE_READONLY_DELEGATION_PROBE === "1" &&
+			!availableTools.has("delivery_begin")
+		) {
+			const text = "Fake read-only delegate completed.";
 			output.content.push({ type: "text", text });
 			stream.push({ type: "text_start", contentIndex: 0, partial: output });
 			stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
@@ -57,6 +71,21 @@ function fakeStream(
 				id: "fake-delivery-begin",
 				name: "delivery_begin",
 				arguments: { goal: "Fake provider E2E delivery" },
+			};
+			output.content.push(toolCall);
+			stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
+			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+			output.stopReason = "toolUse";
+		} else if (
+			process.env.PI_ADAPTIVE_READONLY_DELEGATION_PROBE === "1" &&
+			availableTools.has("delivery_delegate_readonly") &&
+			!delegatedReadonly
+		) {
+			const toolCall = {
+				type: "toolCall" as const,
+				id: "fake-readonly-delegation",
+				name: "delivery_delegate_readonly",
+				arguments: { role: "oracle", task: "Review one bounded high-risk decision without modifying files." },
 			};
 			output.content.push(toolCall);
 			stream.push({ type: "toolcall_start", contentIndex: 0, partial: output });
@@ -98,7 +127,7 @@ export default function fakeProvider(pi: ExtensionAPI): void {
 			{
 				id: "fake-model",
 				name: "Fake Model",
-				reasoning: false,
+				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 100000,

@@ -139,6 +139,7 @@ export interface PolicyContext {
 	writerLeaseOwner: "parent" | "child" | null;
 	reworkApproved: boolean;
 	implementationWriter?: "parent" | "worker";
+	tinyWritablePaths?: readonly string[];
 	progressSync?: {
 		active: boolean;
 		writerFree: boolean;
@@ -222,7 +223,7 @@ export function resolveDeliveryPolicy(snapshot: DeliverySnapshot, context: Polic
 			return {
 				readTools: true,
 				sourceWrite: parentWrites,
-				writablePaths: [],
+				writablePaths: parentWrites ? context.tinyWritablePaths ?? [] : [],
 				rawBash: false,
 				rawSubagent: false,
 				subagentAccess: "controlled-writer",

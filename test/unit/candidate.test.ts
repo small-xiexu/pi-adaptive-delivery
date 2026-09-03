@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -51,12 +51,20 @@ test("changes for HEAD, staged, tracked, untracked, symlink, and approval change
 	next = await createCandidateSnapshot({ cwd: repo });
 	assert.notEqual(next.digest, previous.digest);
 	assert.equal(next.manifest.untracked.find((item) => item.path === "untracked.bin")?.type, "file");
+	assert.equal(next.manifest.untracked.find((item) => item.path === "untracked.bin")?.mode, "100644");
+	previous = next;
+
+	await chmod(path.join(repo, "untracked.bin"), 0o755);
+	next = await createCandidateSnapshot({ cwd: repo });
+	assert.notEqual(next.digest, previous.digest);
+	assert.equal(next.manifest.untracked.find((item) => item.path === "untracked.bin")?.mode, "100755");
 	previous = next;
 
 	await symlink("tracked.txt", path.join(repo, "untracked-link"));
 	next = await createCandidateSnapshot({ cwd: repo });
 	assert.notEqual(next.digest, previous.digest);
 	assert.equal(next.manifest.untracked.find((item) => item.path === "untracked-link")?.type, "symlink");
+	assert.equal(next.manifest.untracked.find((item) => item.path === "untracked-link")?.mode, "120000");
 	previous = next;
 
 	next = await createCandidateSnapshot({

@@ -25,6 +25,16 @@ import {
 	type PlanningDocumentEvidence,
 	type SolutionDocumentEvidence,
 } from "./planning-documents.ts";
+import {
+	parseTinyContractValue,
+	type TinyDeliveryContract,
+} from "./tiny-contract.ts";
+import {
+	parseTinyApprovalBaseline,
+	parseTinyScopeEvidence,
+	type TinyApprovalBaseline,
+	type TinyScopeEvidence,
+} from "./tiny-scope.ts";
 
 export const DELIVERY_STATE_CUSTOM_TYPE = "pi-adaptive-delivery.state";
 export const DELIVERY_RUNTIME_STATE_VERSION = 1 as const;
@@ -37,6 +47,8 @@ export interface DeliveryCheckpoint {
 
 export interface ReviewEvidence {
 	candidateDigest: string;
+	candidateDiffDigest?: string;
+	reviewContractVersion?: 1;
 	verdict: "BLOCK" | "OK" | "OK_WITH_NOTES";
 	textDigest: string;
 	runId?: string;
@@ -71,6 +83,9 @@ export interface DeliveryRuntimeState {
 	writerLease?: WriterLeaseReference;
 	proposedDocuments?: PlanningDocumentsContract;
 	planContract?: ApprovedPlanContract;
+	tinyContract?: TinyDeliveryContract;
+	tinyBaseline?: TinyApprovalBaseline;
+	tinyScopeEvidence?: TinyScopeEvidence;
 	solutionDocument?: SolutionDocumentEvidence;
 	planningDocuments?: PlanningDocumentEvidence;
 	workerRunId?: string;
@@ -234,6 +249,38 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			return { ok: false, state: blockedState(reason, now), reason };
 		}
 	}
+	let tinyContract: TinyDeliveryContract | undefined;
+	let tinyBaseline: TinyApprovalBaseline | undefined;
+	let tinyScopeEvidence: TinyScopeEvidence | undefined;
+	if (input.tinyContract !== undefined) {
+		tinyContract = parseTinyContractValue(input.tinyContract);
+		if (!tinyContract) {
+			const reason = "Delivery Tiny contract is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
+	if (planContract && tinyContract) {
+		const reason = "Delivery state cannot contain both plan and Tiny contracts";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
+	if (input.tinyBaseline !== undefined) {
+		tinyBaseline = parseTinyApprovalBaseline(input.tinyBaseline);
+		if (!tinyBaseline) {
+			const reason = "Delivery Tiny approval baseline is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
+	if (input.tinyScopeEvidence !== undefined) {
+		tinyScopeEvidence = parseTinyScopeEvidence(input.tinyScopeEvidence);
+		if (!tinyScopeEvidence) {
+			const reason = "Delivery Tiny scope evidence is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
+	if ((tinyBaseline || tinyScopeEvidence) && !tinyContract) {
+		const reason = "Delivery Tiny evidence requires a Tiny contract";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
 	let planningDocuments: PlanningDocumentEvidence | undefined;
 	let solutionDocument: SolutionDocumentEvidence | undefined;
 	if (input.solutionDocument !== undefined) {
@@ -370,8 +417,9 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			const reason = "Delivery validation evidence does not match validation state";
 			return { ok: false, state: blockedState(reason, now), reason };
 		}
-		if (planContract) {
-			const expected = planContract.validation;
+		const approvedValidation = planContract?.validation ?? tinyContract?.validation;
+		if (approvedValidation) {
+			const expected = approvedValidation;
 			const prefixMatches = validationEvidence.commands.every((command, index) => command.id === expected[index]?.id);
 			if (
 				!prefixMatches ||
@@ -395,6 +443,9 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			(review.verdict !== "BLOCK" && review.verdict !== "OK" && review.verdict !== "OK_WITH_NOTES") ||
 			typeof review.textDigest !== "string" ||
 			!/^[a-f0-9]{64}$/.test(review.textDigest) ||
+			(review.candidateDiffDigest !== undefined &&
+				(typeof review.candidateDiffDigest !== "string" || !/^[a-f0-9]{64}$/.test(review.candidateDiffDigest))) ||
+			(review.reviewContractVersion !== undefined && review.reviewContractVersion !== 1) ||
 			typeof review.completedAt !== "string" ||
 			Number.isNaN(Date.parse(review.completedAt)) ||
 			(review.runId !== undefined && (typeof review.runId !== "string" || !review.runId))
@@ -404,6 +455,8 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 		}
 		reviewEvidence = {
 			candidateDigest: review.candidateDigest,
+			...(typeof review.candidateDiffDigest === "string" ? { candidateDiffDigest: review.candidateDiffDigest } : {}),
+			...(review.reviewContractVersion === 1 ? { reviewContractVersion: 1 as const } : {}),
 			verdict: review.verdict,
 			textDigest: review.textDigest,
 			...(typeof review.runId === "string" ? { runId: review.runId } : {}),
@@ -465,6 +518,9 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			...(writerLease ? { writerLease } : {}),
 			...(proposedDocuments ? { proposedDocuments } : {}),
 			...(planContract ? { planContract } : {}),
+			...(tinyContract ? { tinyContract } : {}),
+			...(tinyBaseline ? { tinyBaseline } : {}),
+			...(tinyScopeEvidence ? { tinyScopeEvidence } : {}),
 			...(solutionDocument ? { solutionDocument } : {}),
 			...(planningDocuments ? { planningDocuments } : {}),
 			...(workerRunId ? { workerRunId } : {}),

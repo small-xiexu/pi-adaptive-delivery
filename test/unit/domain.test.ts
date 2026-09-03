@@ -131,6 +131,22 @@ test("standard and high-risk implementation routes reserve source writes for one
 	assert.equal(policy.subagentAccess, "controlled-writer");
 });
 
+test("projects Tiny exact scope into the parent writer policy", () => {
+	const policy = resolveDeliveryPolicy(
+		{ state: "IMPLEMENTING" },
+		{
+			approvalsValid: true,
+			writerLeaseHeld: true,
+			writerLeaseOwner: "parent",
+			reworkApproved: false,
+			implementationWriter: "parent",
+			tinyWritablePaths: ["src/label.ts", "src/label.test.ts"],
+		},
+	);
+	assert.equal(policy.sourceWrite, true);
+	assert.deepEqual(policy.writablePaths, ["src/label.ts", "src/label.test.ts"]);
+});
+
 test("keeps writer states read-only when authorization or lease is missing", () => {
 	for (const state of ["IMPLEMENTING", "REWORKING"] as const) {
 		const policy = resolveDeliveryPolicy({ state }, BASE_CONTEXT);

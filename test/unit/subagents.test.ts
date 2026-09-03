@@ -10,6 +10,7 @@ import type { SubagentLaunchContract } from "pi-subagents/preflight";
 import {
 	SubagentBoundary,
 	pathIsInside,
+	validatePublicPreflightStability,
 	validateReadOnlyContract,
 	validateWorkerContract,
 } from "../../extensions/delivery-gate/src/subagents.ts";
@@ -19,9 +20,9 @@ function contract(overrides: Record<string, unknown> = {}): SubagentLaunchContra
 		version: 2,
 		runId: "run-1",
 		agent: {
-			name: "scout",
+			name: "oracle",
 			source: "builtin",
-			filePath: "<builtin:scout>",
+			filePath: "<builtin:oracle>",
 			definitionProjectionVersion: 1,
 			definitionDigest: "digest",
 			shadowedCandidates: [],
@@ -97,7 +98,7 @@ test("applies and disposes session-scoped capability ceilings", () => {
 
 	boundary.applyAccess("readonly");
 	const readonly = resolveCurrentSubagentCapabilityCeiling(sessionId);
-	assert.deepEqual(readonly?.allowedAgents, ["oracle", "reviewer", "scout"]);
+	assert.deepEqual(readonly?.allowedAgents, ["oracle", "reviewer"]);
 	assert.equal(readonly?.denyExtensions, true);
 	assert.equal(readonly?.allowedTools?.includes("bash"), false);
 	assert.equal(readonly?.allowedTools?.includes("read"), true);
@@ -116,6 +117,29 @@ test("recognizes canonical path containment", () => {
 	assert.equal(pathIsInside("/repo", "/outside"), false);
 });
 
+test("keeps the public security projection stable while allowing candidate exclusions", () => {
+	const initial = contract({
+		modelCandidates: ["provider/primary:high", "provider/fallback:high"],
+	});
+	assert.deepEqual(
+		validatePublicPreflightStability(initial, contract({ modelCandidates: ["provider/fallback:high"] })),
+		{ ok: true },
+	);
+	assert.equal(
+		validatePublicPreflightStability(initial, contract({
+			modelCandidates: ["provider/primary:high", "provider/new:high"],
+		})).ok,
+		false,
+	);
+	assert.equal(
+		validatePublicPreflightStability(initial, contract({
+			modelCandidates: initial.modelCandidates,
+			tools: { ...initial.tools, effectiveAllowlist: ["read", "write"] },
+		})).ok,
+		false,
+	);
+});
+
 test("accepts only builtin fresh contracts with approved tools", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-contract-root-"));
 	const managed = await mkdtemp(path.join(os.tmpdir(), "adaptive-contract-managed-"));
@@ -124,7 +148,7 @@ test("accepts only builtin fresh contracts with approved tools", async () => {
 		roots: { cwd: root, artifactsDir: managed, outputPath: output },
 	});
 
-	assert.deepEqual(await validateReadOnlyContract(safe, "scout", root), { ok: true });
+	assert.deepEqual(await validateReadOnlyContract(safe, "oracle", root), { ok: true });
 
 	for (const unsafe of [
 		contract({ ...safe, agent: { ...safe.agent, source: "project" } }),
@@ -135,7 +159,7 @@ test("accepts only builtin fresh contracts with approved tools", async () => {
 		contract({ ...safe, tools: { ...safe.tools, capabilityAudit: { extensionsDenied: false } } }),
 		contract({ ...safe, tools: { ...safe.tools, effectiveMcpTools: ["mcp_write"] } }),
 	]) {
-		assert.equal((await validateReadOnlyContract(unsafe, "scout", root)).ok, false);
+		assert.equal((await validateReadOnlyContract(unsafe, "oracle", root)).ok, false);
 	}
 });
 
@@ -154,7 +178,7 @@ test("rejects project, arbitrary external, and symlink-escaped output paths", as
 	];
 
 	for (const value of cases) {
-		assert.equal((await validateReadOnlyContract(value, "scout", root)).ok, false);
+		assert.equal((await validateReadOnlyContract(value, "oracle", root)).ok, false);
 	}
 });
 
@@ -224,11 +248,12 @@ test("validates RPC ping and structured delegation response", async () => {
 		boundary.applyAccess("readonly");
 		installPingResponder(events);
 		const task = "Inspect code";
-		const initialContract = await boundary.preflight("scout", task, ctx, repo);
-		const terminalContract = await boundary.preflight("scout", task, ctx, repo, "child-run");
-		assert.notEqual(initialContract.launchContractDigest, terminalContract.launchContractDigest);
-		assert.match(initialContract.roots.outputPath ?? "", /outputs[/\\]preflight[/\\]context\.md$/);
-		assert.match(terminalContract.roots.outputPath ?? "", /outputs[/\\]child-run[/\\]context\.md$/);
+		const initialContract = await boundary.preflight("oracle", task, ctx, repo);
+		const terminalContract = await boundary.preflight("oracle", task, ctx, repo, "child-run");
+		assert.equal(initialContract.launchContractDigest, terminalContract.launchContractDigest);
+		assert.equal(initialContract.roots.outputPath, undefined);
+		assert.equal(terminalContract.roots.outputPath, undefined);
+		const runtimeDigest = "b".repeat(64);
 
 		events.on("prompt-template:subagent:request", (payload: any) => {
 			events.emit("prompt-template:subagent:response", {
@@ -237,16 +262,20 @@ test("validates RPC ping and structured delegation response", async () => {
 				nodeId: payload.nodeId,
 				status: "completed",
 				runId: "child-run",
-				launchContractDigest: terminalContract.launchContractDigest,
+				agent: "oracle",
+				model: terminalContract.modelCandidates[0],
+				thinking: terminalContract.thinking,
+				launchContractDigest: runtimeDigest,
 				result: { kind: "text", text: "read-only result" },
 			});
 		});
 
-		const result = await boundary.delegate("scout", task, ctx, initialContract, repo);
+		const result = await boundary.delegate("oracle", task, ctx, initialContract, repo);
 		assert.deepEqual(result, {
 			text: "read-only result",
 			runId: "child-run",
-			launchContractDigest: terminalContract.launchContractDigest,
+			launchContractDigest: runtimeDigest,
+			preflightLaunchContractDigest: initialContract.launchContractDigest,
 		});
 	} finally {
 		boundary.dispose();
@@ -260,6 +289,13 @@ test("requires exact run and launch proof for a controlled worker terminal respo
 	installPingResponder(successHarness.events);
 	const boundary = new SubagentBoundary(successHarness.pi);
 	const runIds: string[] = [];
+	const workerContract = contract({
+		agent: { ...contract().agent, name: "worker", filePath: "<builtin:worker>" },
+		modelCandidates: ["adaptive-test/worker-model:high"],
+		thinking: "high",
+		launchContractDigest: "a".repeat(64),
+	});
+	const runtimeDigest = "b".repeat(64);
 	successHarness.events.on("prompt-template:subagent:request", (payload: any) => {
 		successHarness.events.emit("prompt-template:subagent:update", {
 			requestId: payload.requestId,
@@ -274,19 +310,24 @@ test("requires exact run and launch proof for a controlled worker terminal respo
 			nodeId: payload.nodeId,
 			status: "completed",
 			runId: "worker-run",
-			launchContractDigest: "launch-digest",
+			agent: "worker",
+			model: workerContract.modelCandidates[0],
+			thinking: workerContract.thinking,
+			launchContractDigest: runtimeDigest,
 			result: { kind: "text", text: "implemented" },
 		});
 	});
 	const result = await boundary.delegateWorker(
 		"Implement approved scope",
 		{ cwd: "/repo", sessionManager: { getSessionId: () => "session" } } as any,
-		"launch-digest",
+		workerContract,
 		{ onRunId: (runId) => runIds.push(runId) },
 	);
 	assert.equal(result.status, "completed");
 	assert.equal(result.runId, "worker-run");
 	assert.equal(result.text, "implemented");
+	assert.equal(result.launchContractDigest, runtimeDigest);
+	assert.equal(result.preflightLaunchContractDigest, workerContract.launchContractDigest);
 	assert.deepEqual(runIds, ["worker-run"]);
 
 	const missingProofHarness = createEventPi();
@@ -299,6 +340,9 @@ test("requires exact run and launch proof for a controlled worker terminal respo
 			nodeId: payload.nodeId,
 			status: "failed",
 			runId: "worker-run",
+			agent: "worker",
+			model: workerContract.modelCandidates[0],
+			thinking: workerContract.thinking,
 			error: "worker failed",
 		});
 	});
@@ -306,9 +350,9 @@ test("requires exact run and launch proof for a controlled worker terminal respo
 		missingProofBoundary.delegateWorker(
 			"Implement approved scope",
 			{ cwd: "/repo", sessionManager: { getSessionId: () => "session" } } as any,
-			"launch-digest",
+			workerContract,
 		),
-		/launch contract digest is missing or changed/,
+		/runtime launch contract digest is missing or malformed/,
 	);
 });
 
@@ -329,7 +373,7 @@ test("fails closed for duplicate or failed delegation responses", async () => {
 
 		await assert.rejects(
 			boundary.delegate(
-				"scout",
+				"oracle",
 				"Inspect",
 				{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
 				contract(),
@@ -356,7 +400,7 @@ test("rejects a completed read-only response without the preflight digest", asyn
 	});
 	await assert.rejects(
 		boundary.delegate(
-			"scout",
+			"oracle",
 			"Inspect",
 			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
 			contract({ launchContractDigest: "a".repeat(64) }),
@@ -374,7 +418,7 @@ test("aborts and times out delegation with an exact cancellation identity", asyn
 	controller.abort();
 	await assert.rejects(
 		abortedBoundary.delegate(
-			"scout",
+			"oracle",
 			"Inspect",
 			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
 			contract(),
@@ -393,7 +437,7 @@ test("aborts and times out delegation with an exact cancellation identity", asyn
 	const timeoutBoundary = new SubagentBoundary(timeoutHarness.pi);
 	await assert.rejects(
 		timeoutBoundary.delegate(
-			"scout",
+			"oracle",
 			"Inspect",
 			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
 			contract(),

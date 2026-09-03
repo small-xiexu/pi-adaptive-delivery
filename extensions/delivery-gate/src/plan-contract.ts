@@ -90,7 +90,7 @@ export function parsePlanningDocumentsValue(value: unknown): PlanningDocumentsCo
 	return { requirementName, solutionPath, planPath, selectionSource: input.selectionSource };
 }
 
-function parseValidation(value: unknown): ValidationCommand[] | undefined {
+export function parseValidationCommands(value: unknown): ValidationCommand[] | undefined {
 	if (!Array.isArray(value) || value.length === 0 || value.length > 12) return undefined;
 	const seen = new Set<string>();
 	const commands: ValidationCommand[] = [];
@@ -184,7 +184,7 @@ export function parsePlanContractValue(value: unknown): ApprovedPlanContract | u
 	) {
 		return undefined;
 	}
-	const validation = parseValidation(input.validation);
+	const validation = parseValidationCommands(input.validation);
 	const documents = parsePlanningDocumentsValue(input.documents);
 	const progressTargets = parseProgressTargets(input.progressTargets);
 	const progressChecks = parseProgressChecks(input.progressChecks);

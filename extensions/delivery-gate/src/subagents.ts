@@ -17,6 +17,7 @@ import {
 	type SubagentDelegationRequest,
 	type SubagentDelegationResponse,
 	type SubagentDelegationStatus,
+	type SubagentDelegationTerminalResponse,
 	type SubagentDelegationUpdate,
 } from "pi-subagents/delegation";
 import {
@@ -32,8 +33,9 @@ const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
 
 export const PI_SUBAGENTS_RUNTIME_VERSION = "0.64.0";
 
-export const READONLY_DELEGATE_ROLES = ["scout", "oracle", "reviewer"] as const;
+export const READONLY_DELEGATE_ROLES = ["oracle"] as const;
 export type ReadonlyDelegateRole = (typeof READONLY_DELEGATE_ROLES)[number];
+type SafeReadOnlyRole = ReadonlyDelegateRole | "reviewer";
 
 const READONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
 const WORKER_TOOLS = ["read", "grep", "find", "ls", "edit", "write"] as const;
@@ -42,7 +44,7 @@ const MUTATION_TOOLS = new Set(["bash", "edit", "write", "subagent", "bg_wait"])
 function ceilingForAccess(accessMode: SubagentAccess): SubagentCapabilityCeiling {
 	switch (accessMode) {
 		case "readonly":
-			return { allowedAgents: READONLY_DELEGATE_ROLES, allowedTools: READONLY_TOOLS, denyExtensions: true };
+			return { allowedAgents: ["oracle", "reviewer"], allowedTools: READONLY_TOOLS, denyExtensions: true };
 		case "validation":
 			return { allowedAgents: ["reviewer"], allowedTools: ["read", "grep", "find", "ls"], denyExtensions: true };
 		case "controlled-writer":
@@ -102,7 +104,7 @@ async function validateManagedOutput(contract: SubagentLaunchContract, gitRoot: 
 
 export async function validateReadOnlyContract(
 	contract: SubagentLaunchContract,
-	role: ReadonlyDelegateRole,
+	role: SafeReadOnlyRole,
 	gitRoot: string,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
 	if (contract.agent.name !== role || contract.agent.source !== "builtin") {
@@ -168,9 +170,75 @@ export interface WorkerDelegationResult {
 	status: Exclude<SubagentDelegationStatus, "invalid_request">;
 	runId: string;
 	launchContractDigest: string;
+	preflightLaunchContractDigest: string;
 	text?: string;
 	error?: string;
 	model?: string;
+}
+
+function terminalContractError(
+	response: SubagentDelegationTerminalResponse,
+	contract: SubagentLaunchContract,
+	expectedAgent: SafeReadOnlyRole | "worker",
+): string | undefined {
+	if (!response.launchContractDigest || !/^[a-f0-9]{64}$/.test(response.launchContractDigest)) {
+		return "Delegation terminal runtime launch contract digest is missing or malformed";
+	}
+	if (response.agent !== expectedAgent) {
+		return `Delegation terminal agent is missing or changed: ${String(response.agent)}`;
+	}
+	if (!response.model || !contract.modelCandidates.includes(response.model)) {
+		return `Delegation terminal model is missing or outside the preflight candidates: ${String(response.model)}`;
+	}
+	if (contract.thinking && response.thinking !== contract.thinking) {
+		return `Delegation terminal thinking level is missing or changed: ${String(response.thinking)}`;
+	}
+	return undefined;
+}
+
+function publicSecurityProjection(contract: SubagentLaunchContract): string {
+	return JSON.stringify({
+		agent: {
+			name: contract.agent.name,
+			source: contract.agent.source,
+			filePath: contract.agent.filePath,
+			definitionDigest: contract.agent.definitionDigest,
+		},
+		context: contract.context,
+		thinking: contract.thinking,
+		systemPromptMode: contract.systemPromptMode,
+		inheritProjectContext: contract.inheritProjectContext,
+		inheritGlobalContext: contract.inheritGlobalContext,
+		inheritSkills: contract.inheritSkills,
+		skills: contract.skills,
+		tools: {
+			effectiveAllowlist: contract.tools.effectiveAllowlist,
+			effectiveMcpTools: contract.tools.effectiveMcpTools,
+			extensionArgs: contract.tools.extensionArgs,
+			disableAmbientExtensions: contract.tools.disableAmbientExtensions,
+			fanoutAuthorized: contract.tools.fanoutAuthorized,
+			capabilityCeiling: contract.tools.capabilityCeiling,
+			extensionsDenied: contract.tools.capabilityAudit?.extensionsDenied,
+		},
+		roots: {
+			cwd: contract.roots.cwd,
+			outputPath: contract.roots.outputPath,
+		},
+		protocol: contract.protocol,
+	});
+}
+
+export function validatePublicPreflightStability(
+	initial: SubagentLaunchContract,
+	current: SubagentLaunchContract,
+): { ok: true } | { ok: false; reason: string } {
+	if (publicSecurityProjection(initial) !== publicSecurityProjection(current)) {
+		return { ok: false, reason: "Public preflight security projection changed during execution" };
+	}
+	if (current.modelCandidates.some((candidate) => !initial.modelCandidates.includes(candidate))) {
+		return { ok: false, reason: "Public preflight introduced a model candidate after execution started" };
+	}
+	return { ok: true };
 }
 
 export class SubagentBoundary {
@@ -262,7 +330,7 @@ export class SubagentBoundary {
 	}
 
 	async preflight(
-		role: ReadonlyDelegateRole,
+		role: SafeReadOnlyRole,
 		task: string,
 		ctx: ExtensionContext,
 		gitRoot: string,
@@ -275,7 +343,7 @@ export class SubagentBoundary {
 			task,
 			context: "fresh",
 			cwd: ctx.cwd,
-			thinking: role === "scout" ? "low" : "high",
+			thinking: "high",
 			artifacts: true,
 			...(runId ? { runId } : {}),
 			parentModel: ctx.model
@@ -327,7 +395,7 @@ export class SubagentBoundary {
 	async delegateWorker(
 		task: string,
 		ctx: ExtensionContext,
-		expectedLaunchContractDigest: string,
+		preflightContract: SubagentLaunchContract,
 		options: {
 			signal?: AbortSignal;
 			timeoutMs?: number;
@@ -338,7 +406,7 @@ export class SubagentBoundary {
 		await this.ping();
 		const requestId = randomUUID();
 		const ownerRunId = `adaptive-delivery-${ctx.sessionManager.getSessionId()}`;
-		const nodeId = `worker-${expectedLaunchContractDigest}-${requestId}`;
+		const nodeId = `worker-${preflightContract.launchContractDigest}-${requestId}`;
 		const request: SubagentDelegationRequest = {
 			requestId,
 			ownerRunId,
@@ -400,14 +468,16 @@ export class SubagentBoundary {
 					finish(new Error("Worker delegation terminal run id is missing or changed"));
 					return;
 				}
-				if (!response.launchContractDigest || response.launchContractDigest !== expectedLaunchContractDigest) {
-					finish(new Error("Worker delegation terminal launch contract digest is missing or changed"));
+				const contractError = terminalContractError(response, preflightContract, "worker");
+				if (contractError) {
+					finish(new Error(contractError));
 					return;
 				}
 				finish(undefined, {
 					status: response.status as WorkerDelegationResult["status"],
 					runId: response.runId,
-					launchContractDigest: response.launchContractDigest,
+					launchContractDigest: response.launchContractDigest!,
+					preflightLaunchContractDigest: preflightContract.launchContractDigest,
 					...(response.result?.kind === "text" ? { text: response.result.text } : {}),
 					...(response.error ? { error: response.error } : {}),
 					...(response.model ? { model: response.model } : {}),
@@ -427,14 +497,14 @@ export class SubagentBoundary {
 	}
 
 	async delegate(
-		role: ReadonlyDelegateRole,
+		role: SafeReadOnlyRole,
 		task: string,
 		ctx: ExtensionContext,
 		preflightContract: SubagentLaunchContract,
 		gitRoot: string,
 		signal?: AbortSignal,
 		timeoutMs = 120_000,
-	): Promise<{ text: string; runId: string; launchContractDigest: string }> {
+	): Promise<{ text: string; runId: string; launchContractDigest: string; preflightLaunchContractDigest: string }> {
 		await this.ping();
 		const requestId = randomUUID();
 		const ownerRunId = `adaptive-delivery-${ctx.sessionManager.getSessionId()}`;
@@ -447,7 +517,7 @@ export class SubagentBoundary {
 			task,
 			context: "fresh",
 			cwd: ctx.cwd,
-			thinking: role === "scout" ? "low" : "high",
+			thinking: "high",
 			artifacts: true,
 			result: { kind: "text" },
 		};
@@ -460,7 +530,7 @@ export class SubagentBoundary {
 				unsubscribe?.();
 				signal?.removeEventListener("abort", abort);
 			};
-			const finish = (error?: Error, value?: { text: string; runId: string; launchContractDigest: string }) => {
+			const finish = (error?: Error, value?: { text: string; runId: string; launchContractDigest: string; preflightLaunchContractDigest: string }) => {
 				if (settled) return;
 				settled = true;
 				cleanup();
@@ -488,23 +558,26 @@ export class SubagentBoundary {
 					finish(new Error("Read-only delegation terminal run id is missing"));
 					return;
 				}
-				if (!response.launchContractDigest) {
-					finish(new Error("Read-only delegation terminal launch contract digest is missing"));
+				const contractError = terminalContractError(response, preflightContract, role);
+				if (contractError) {
+					finish(new Error(contractError));
 					return;
 				}
 				const terminalText = response.result.text;
 				const terminalRunId = response.runId;
-				const terminalDigest = response.launchContractDigest;
+				const runtimeDigest = response.launchContractDigest!;
 				void this.preflight(role, task, ctx, gitRoot, terminalRunId).then(
 					(terminalContract) => {
-						if (terminalDigest !== terminalContract.launchContractDigest) {
-							finish(new Error("Read-only delegation terminal launch contract digest changed"));
+						const stable = validatePublicPreflightStability(preflightContract, terminalContract);
+						if (!stable.ok) {
+							finish(new Error(stable.reason));
 							return;
 						}
 						finish(undefined, {
 							text: terminalText,
 							runId: terminalRunId,
-							launchContractDigest: terminalDigest,
+							launchContractDigest: runtimeDigest,
+							preflightLaunchContractDigest: preflightContract.launchContractDigest,
 						});
 					},
 					(error) => finish(new Error(

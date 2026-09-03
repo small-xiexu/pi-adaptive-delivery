@@ -10,7 +10,7 @@ import { SubagentBoundary } from "../../extensions/delivery-gate/src/subagents.t
 
 const execFileAsync = promisify(execFile);
 
-test("preflights and rebinds the builtin scout contract to its terminal run id", async () => {
+test("preflights the builtin oracle contract with a stable terminal digest", async () => {
 	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-preflight-agent-"));
 	const repo = await mkdtemp(path.join(os.tmpdir(), "adaptive-preflight-repo-"));
 	await execFileAsync("git", ["init", "-q"], { cwd: repo });
@@ -55,7 +55,7 @@ test("preflights and rebinds the builtin scout contract to its terminal run id",
 		boundary.bindSession("preflight-session");
 		boundary.applyAccess("readonly");
 		const contract = await boundary.preflight(
-			"scout",
+			"oracle",
 			"Inspect the repository without modifying files.",
 			{
 				cwd: repo,
@@ -70,10 +70,10 @@ test("preflights and rebinds the builtin scout contract to its terminal run id",
 			repo,
 		);
 
-		assert.equal(contract.agent.name, "scout");
+		assert.equal(contract.agent.name, "oracle");
 		assert.equal(contract.agent.source, "builtin");
 		assert.equal(contract.context, "fresh");
-		assert.deepEqual(contract.modelCandidates, ["adaptive-test/adaptive-test-model:low"]);
+		assert.deepEqual(contract.modelCandidates, ["adaptive-test/adaptive-test-model:high"]);
 		assert.equal(contract.tools.effectiveAllowlist.includes("bash"), false);
 		assert.equal(contract.tools.effectiveAllowlist.includes("write"), false);
 		assert.equal(contract.tools.disableAmbientExtensions, true);
@@ -82,7 +82,7 @@ test("preflights and rebinds the builtin scout contract to its terminal run id",
 		assert.ok(contract.launchContractDigest);
 
 		const terminalContract = await boundary.preflight(
-			"scout",
+			"oracle",
 			"Inspect the repository without modifying files.",
 			{
 				cwd: repo,
@@ -97,9 +97,9 @@ test("preflights and rebinds the builtin scout contract to its terminal run id",
 			repo,
 			"terminal-run",
 		);
-		assert.notEqual(terminalContract.launchContractDigest, contract.launchContractDigest);
-		assert.match(contract.roots.outputPath ?? "", /outputs[/\\]preflight[/\\]context\.md$/);
-		assert.match(terminalContract.roots.outputPath ?? "", /outputs[/\\]terminal-run[/\\]context\.md$/);
+		assert.equal(terminalContract.launchContractDigest, contract.launchContractDigest);
+		assert.equal(contract.roots.outputPath, undefined);
+		assert.equal(terminalContract.roots.outputPath, undefined);
 		assert.deepEqual(terminalContract.tools.effectiveAllowlist, contract.tools.effectiveAllowlist);
 		assert.equal(terminalContract.tools.capabilityAudit?.extensionsDenied, true);
 		boundary.dispose();

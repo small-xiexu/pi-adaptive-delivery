@@ -1,19 +1,24 @@
 ---
 name: adaptive-delivery
-description: 使用技术方案、实施计划、用户授权、单 writer、真实验证和 fresh review，自适应编排 Pi 开发任务。用于 /delivery-shape、/delivery-plan、/delivery-run 或用户要求按 Adaptive Delivery 流程交付时。
+description: 使用风险分级 Delivery Contract、用户授权、单 writer、真实验证和按需 fresh review，自适应编排 Pi 修改任务。仅用于 /delivery-shape、/delivery-plan、/delivery-run；不用于纯问答、只读梳理、诊断或代码评审。
 ---
 
 # Adaptive Delivery
 
+## 适用入口
+
+只有用户明确输入 `/delivery-shape` 才能调用 `delivery_begin` 并从 `IDLE` 启动修改交付。纯问答、只读梳理、状态盘点、诊断和代码评审保持 `IDLE`，即使相关 Delivery 工具当前可见也不得调用 `delivery_begin`。自然语言只读请求后续转为修改时，先提示用户使用 `/delivery-shape <需求>`，不能在原只读回合自行启动流程。
+
 ## 不变量
 
-1. 所有修改型任务在实现前必须有技术方案和实施计划。
-2. 没有用户批准的实施计划，不得写入项目。
+1. 任何源码写入前都必须有职责完整、可解析并绑定当前 Session/workspace 的 Delivery Contract。
+2. 没有可验证的 TUI 用户修改授权，不得写入项目；Tiny 的授权来自 approved Tiny contract，其他路径来自 approved plan。
 3. 同一个 cwd/worktree 同时只有一个 writer。
 4. 只有 runtime 执行的 gate 是 verified evidence。
-5. review 必须绑定当前 candidate digest，并使用 fresh context。
+5. validation 必须绑定当前 candidate digest；要求 review 的路径还必须绑定 runtime 生成的 actual diff digest 并使用 fresh context。
 6. commit、push、PR、发布和部署需要独立授权。
-7. 技术方案和实施计划必须在源码实现前同步为目标项目中的需求级 Markdown。
+7. 只有达到 persistent planning threshold 的 Standard/High-Risk 才创建需求级技术方案和实施计划；Tiny 只保存 Session/runtime contract。
+8. 风险优先于代码量；Agent 不能自行扩大已批准 scope，无法证明时必须降权。
 
 ## 先用大白话对齐最终效果
 
@@ -44,21 +49,25 @@ description: 使用技术方案、实施计划、用户授权、单 writer、真
 3. 推荐理由。
 4. 不同选择会改变什么用户可见结果。
 
+面向用户输出时，推荐部分固定使用两行纯文本：第一行只写“推荐答案：”，第二行写具体推荐。不要给“推荐答案”标签添加 Markdown 加粗，也不要生成 `**推荐：**正文` 这类结束标记后直接连接中文的写法。
+
 用户回答“按推荐”时，只表示接受当前问题的推荐答案。把每个答案写入最终技术方案的业务规则、边界或验收标准；不要依赖聊天摘要代替方案正文，也不要重复询问已经确认的决定。
 
-极小需求默认零追问。只有同时满足以下条件才直接成案：最终效果明确、修改局部且可逆、验收方式直接、不涉及共享契约/数据/权限/费用，并且没有必须由用户决定的分支。此时直接输出精简但职责分开的技术方案和实施计划，走一次合并批准。
+极小需求默认零追问。只有同时满足以下条件才生成 Tiny contract：最终效果和非目标明确；不存在产品或架构决定；批准前能列出不超过八个 exact project-relative regular-file path；修改局部、仅限当前 Git workspace 且可逆；workspace baseline clean；不涉及共享/public API、schema、持久化格式、协议或共享配置契约；不涉及 auth、authorization、permission、tenant、secret、crypto、privacy、billing、payment、migration、删除、不可逆写、事务、并发一致性、生产、部署、发布或外部写；不改变 dependency、lockfile、package manager、compiler、toolchain 或 build architecture；至少有一条 runtime 可执行的本地确定性 focused validation。任一条件不能证明时升级 Standard/High-Risk，不能用代码行数覆盖风险。
+
+Tiny 回复只需用大白话说明“将修改什么、明确不修改什么、成功效果和验证”，并包含唯一严格 `adaptive-delivery-tiny` v1 fence；不创建 solution/plan marker、planning documents 或 progress target。提示用户执行 `/delivery-approve-plan` 做一次 TUI 合并批准。批准后若 scope 扩大，立即调用 `delivery_invalidate(target=SHAPING)`：停止写入、释放 lease、保留 partial diff、清除旧 Tiny 授权和证据，再按 Standard/High-Risk 重新方案并批准。
 
 极小需求若仍有一个高影响歧义，只问该问题，回答后立即成案。实现偏好、命名、纯代码细节、未来扩展和能从仓库查明的事项不得触发或延长追问。所有高影响歧义关闭后立即停止并输出完整方案。
 
 方案追问面向用户确认产品和范围；oracle 面向高风险技术取舍。两者不能互相替代。方案批准后发现新决策必须 `/delivery-revise`，不能继续追问后静默改变方向。
 
-普通 SHAPING/PLANNING 取证由父 Pi 直接使用 `read`、`grep`、`find`、`ls`，不得为了并行或提速调用 scout。只有高风险技术取舍确实需要独立挑战时调用一次固定只读 oracle；runtime owner、preflight 或终态证明失败后不得重试同一委派，父 Pi 应继续只读取证或明确报告阻塞，避免重复费用。
+普通 SHAPING/PLANNING 取证由父 Pi 直接使用 `read`、`grep`、`find`、`ls`。公开只读委派只提供高风险 `oracle`，不向模型暴露 scout 或 reviewer；reviewer 仅由 plan 预检和 validation 后的固定审查入口使用。runtime owner、preflight 或终态证明失败后不得重试同一委派，父 Pi 应继续只读取证或明确报告阻塞，避免重复费用。
 
 ## 技术方案图表
 
 图表用于减少理解成本，不作为装饰，也不能替代文字规则、失败表现和验收标准：
 
-- 极小、单步骤且没有状态或跨模块交互的需求不强制画图。
+- Tiny 和极小单步骤需求不强制画图。
 - 中大型任务存在多步骤流程、跨组件调用、状态变化、模块关系或数据流时，选择最有帮助的 1 至 3 张图。
 - 高风险任务必须使用适用图表画清关键路径、状态变化或信任边界。
 - 只使用六类受支持 Mermaid：`flowchart`/`graph`、`sequenceDiagram`、`stateDiagram-v2`、`classDiagram`、`erDiagram`、`xychart-beta`。
@@ -67,7 +76,9 @@ description: 使用技术方案、实施计划、用户授权、单 writer、真
 
 Mermaid fence 必须保留在 solution 正文中，成为原始批准消息和落盘技术方案的一部分。Delivery Gate 自动从 assistant 原始消息生成 TUI-only 图表：支持图片协议时显示本地 PNG，否则显示 Unicode 字符图。父 Pi 不调用 shell、外部服务或额外渲染工具，也不把图表展示 entry 当作批准或 candidate 事实。
 
-## 规划文档路径
+## Persistent 规划文档路径
+
+本节只适用于 Standard/High-Risk。Planning contract 与 project documentation 是不同事实：所有修改都有 Session/runtime Delivery Contract，但 Tiny 不产生项目级规划 Markdown。
 
 先读取并服从用户明确要求、目标项目最近的 `AGENTS.md` 与文档索引、用户全局规则；Package 默认只补空白。已有总技术方案或总实施计划默认是只读背景，不因为存在就自动追加。除非规则明确要求复用，否则使用同一需求短名称创建：
 
@@ -80,7 +91,7 @@ docs/<需求短名称>-实施计划.md
 
 solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源，确认后立即 create-only 写入技术方案，但仍保持只读。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 复验技术方案摘要并只 create-only 写入实施计划；两份文档成功并记录摘要后才进入 `IMPLEMENTING`。实施计划批准前执行 `/delivery-revise` 时保留方案路径和同步摘要，重新批准只允许更新仍与该摘要一致的 regular file；人工改动或 symlink 漂移必须拒绝覆盖。Session entry 仍是批准主体，文件不能反向授予权限。
 
-显示 plan 批准对话前，Extension 必须用 pi-subagents 公开 preflight 证明 builtin reviewer 至少有一个可用 model candidate，且只读工具、`denyExtensions`、output 和 cwd 边界成立。preflight 不启动 child 或调用 Provider。无可用 reviewer/fallback 时保持待批准和只读，先让用户修复模型配置；不得先实现再等验证资源。
+显示 Standard/High-Risk plan 批准对话前，Extension 必须用 pi-subagents 公开 preflight 证明 builtin reviewer 至少有一个可用 model candidate，且只读工具、`denyExtensions`、output 和 cwd 边界成立。preflight 不启动 child 或调用 Provider。无可用 reviewer/fallback 时保持待批准和只读，先让用户修复模型配置；不得先实现再等验证资源。Tiny 不 preflight reviewer。
 
 这些 marker 和 JSON fence 只属于内部协议；Extension 在 TUI 显示和规划文档落盘时隐藏它们。父会话仍需输出完整协议供原始 Session 解析，但面向用户的正文不能要求用户阅读或解释内部 JSON。
 
@@ -88,11 +99,11 @@ solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标�
 
 ## 自适应路由
 
-- 小型、低风险、低不确定性：父 Pi 是唯一 writer，直接实现后 focused validation。
-- 中大型或中等风险：父 Pi 只编排，单 foreground worker 是唯一实现者，再运行 runtime gate + fresh reviewer。
-- 高风险或高不确定性：方案阶段增加只读 oracle，父 Pi 只编排，单 foreground worker 实现并增加多角度 reviewer。
+- `TINY`：严格低风险、exact scope、clean baseline；一次 TUI approval；无项目规划文档、worker、reviewer 和 progress sync；父 Pi 是唯一 writer；保留 lease、scope enforcement、candidate freeze 和 focused runtime validation。
+- `STANDARD`：persistent solution/plan、批准链、受控实现、runtime validation 和 actual-diff-bound fresh reviewer。为兼容 plan v2，既有 `small/low/low -> single` 内部路由仍可由父 Pi 实现，其余使用唯一 foreground worker。
+- `HIGH_RISK`：方案阶段增加只读 oracle、两阶段显式批准、persistent docs、唯一 worker、严格 validation 和更强 fresh review。
 
-风险优先于代码量。认证、授权、密钥、迁移、删除、费用和生产操作始终按高风险处理。
+风险优先于代码量。认证、授权、权限、租户隔离、密钥、隐私、密码学、迁移、删除、事务/并发正确性、费用、支付、生产、部署、发布和不可逆外部写始终按高风险处理。共享契约或 dependency/toolchain 变化至少 Standard。
 
 ## 方案与计划
 
@@ -106,7 +117,7 @@ solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标�
 
 - 审批前只能调用 `delivery_delegate_readonly`。
 - writer 只能处理当前批准里程碑，不得启动子 Agent。
-- reviewer 只读、fresh context，只报告有源码、测试、复现或契约证据的发现。
+- reviewer 只读、fresh context，只报告有 runtime 提供的 actual candidate diff、源码、测试、复现或契约证据的发现；结果必须回绑 candidate/diff digest。
 - oracle 只用于重大方向和取舍，不作最终决定。
 
 ## 实现、审查与收敛
@@ -119,11 +130,12 @@ Delivery 工具按状态动态开放。任何时候不确定当前阶段时，�
 - 后续阶段工具提前不可见不是运行时故障，不得以此为由撤销批准或删除规划文档。
 - 当前阶段必需工具确实缺失时可以 `delivery_invalidate(target=BLOCKED)` 暂停；该动作只释放 writer 并保留批准链、规划文档、candidate 和 evidence。恢复权限仍必须由 TUI 用户执行 `/delivery-resume`。
 - 只有需求、范围、架构或计划真的失效时，才使用 `SHAPING` 或 `PLANNING` 目标撤销相应批准。
-- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 plan contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。
+- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 Delivery Contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。
 - validation terminal checkpoint 保存绑定 candidate 的批次 ID 和逐命令摘要。命令无法启动、工具中断或 terminal checkpoint 缺失按 infrastructure failure；真实非零退出或超时只证明批准命令未通过。父会话必须再区分候选代码、验证环境和已批准计划，只有代码问题调用 `delivery_begin_rework`，计划错误使用 `/delivery-revise`。
 
 ```text
-single: 父 Pi 实现 -> delivery_submit_candidate
+tiny: 父 Pi exact-scope 实现 -> delivery_submit_candidate -> delivery_validate -> delivery_finalize
+plan-v2 single: 父 Pi 实现 -> delivery_submit_candidate
 standard/high-risk: 唯一 worker 实现 -> terminal proof -> 自动冻结 candidate
   -> delivery_validate
   -> 同一 candidate 的集中 review wave
@@ -161,4 +173,4 @@ Extension checkpoint 是运行时恢复事实；项目自己的计划、Issue �
 
 ## 最终交付
 
-最终报告包含：改动文件、candidate digest、命令与结果、accepted P0/P1 的关闭证据、closure review 结果、项目进度同步状态、残余风险、用户验收状态，以及 commit/push/PR/publish/deploy 是否执行。
+最终报告包含：交付等级、改动文件、candidate digest、命令与结果、适用时 accepted P0/P1 的关闭证据和 closure review、适用时项目进度同步状态、残余风险、用户验收状态，以及 commit/push/PR/publish/deploy 是否执行。

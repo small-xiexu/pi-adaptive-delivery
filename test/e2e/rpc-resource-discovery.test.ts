@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -49,6 +51,53 @@ function isolatedRpcEnvironment(
 		PI_OFFLINE: "1",
 		PI_ADAPTIVE_DELIVERY_STATE_DIR: path.join(agentDir, "adaptive-delivery"),
 		...overrides,
+	};
+}
+
+async function startLocalOpenAiServer(): Promise<{ baseUrl: string; close(): Promise<void> }> {
+	const server = createServer((request, response) => {
+		if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+			response.writeHead(404).end();
+			return;
+		}
+		request.resume();
+		request.on("end", () => {
+			response.writeHead(200, {
+				"content-type": "text/event-stream",
+				"cache-control": "no-cache",
+				connection: "keep-alive",
+			});
+			const created = Math.floor(Date.now() / 1000);
+			response.write(`data: ${JSON.stringify({
+				id: "chatcmpl-adaptive-local",
+				object: "chat.completion.chunk",
+				created,
+				model: "fake-model",
+				choices: [{ index: 0, delta: { role: "assistant", content: "Fake read-only delegate completed." }, finish_reason: null }],
+			})}\n\n`);
+			response.write(`data: ${JSON.stringify({
+				id: "chatcmpl-adaptive-local",
+				object: "chat.completion.chunk",
+				created,
+				model: "fake-model",
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			})}\n\n`);
+			response.end("data: [DONE]\n\n");
+		});
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => {
+			server.off("error", reject);
+			resolve();
+		});
+	});
+	const address = server.address() as AddressInfo;
+	return {
+		baseUrl: `http://127.0.0.1:${address.port}/v1`,
+		close: () => new Promise<void>((resolve, reject) => {
+			server.close((error) => error ? reject(error) : resolve());
+		}),
 	};
 }
 
@@ -354,6 +403,96 @@ test("real Pi RPC runs the shaping tool lifecycle through a local fake provider"
 		);
 	} finally {
 		harness.stop();
+	}
+});
+
+test("real Pi RPC keeps a natural-language read-only request in IDLE", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-readonly-repo-"));
+	execFileSync("git", ["init", "-q"], { cwd });
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-readonly-agent-"));
+	const harness = new RpcHarness(cwd, agentDir, { fakeProvider: true });
+	try {
+		const response = await harness.send("prompt", { message: "梳理当前项目还有哪些任务没有完成" });
+		assert.equal(response.success, true);
+		await harness.waitFor((record) => record.type === "agent_settled", 15_000);
+		assert.equal(
+			harness.records.some(
+				(record: any) => record.type === "tool_execution_end" && record.toolName === "delivery_begin" && record.isError === true,
+			),
+			true,
+		);
+		await harness.send("prompt", { message: "/delivery-status" });
+		assert.equal(
+			harness.records.some(
+				(record: any) =>
+					record.type === "extension_ui_request" &&
+					record.method === "notify" &&
+					typeof record.message === "string" &&
+					record.message.includes("空闲 [IDLE]"),
+			),
+			true,
+		);
+	} finally {
+		harness.stop();
+	}
+});
+
+test("real Pi RPC validates one oracle delegation with public and runtime evidence", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-oracle-repo-"));
+	execFileSync("git", ["init", "-q"], { cwd });
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-oracle-agent-"));
+	const localProvider = await startLocalOpenAiServer();
+	writeFileSync(path.join(agentDir, "models.json"), `${JSON.stringify({
+		providers: {
+			"adaptive-local": {
+				baseUrl: localProvider.baseUrl,
+				api: "openai-completions",
+				apiKey: "local-test-key",
+				compat: {
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: false,
+					supportsUsageInStreaming: false,
+				},
+				models: [{
+					id: "fake-model",
+					name: "Local Fake Model",
+					reasoning: true,
+					input: ["text"],
+					contextWindow: 100000,
+					maxTokens: 4096,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				}],
+			},
+		},
+	}, null, 2)}\n`);
+	writeFileSync(path.join(agentDir, "settings.json"), `${JSON.stringify({
+		subagents: {
+			agentOverrides: {
+				oracle: { model: "adaptive-local/fake-model" },
+			},
+		},
+	}, null, 2)}\n`);
+	const harness = new RpcHarness(cwd, agentDir, {
+		fakeProvider: true,
+		env: { PI_ADAPTIVE_READONLY_DELEGATION_PROBE: "1" },
+	});
+	try {
+		const response = await harness.send("prompt", { message: "/delivery-shape Review a bounded high-risk decision" }, 30_000);
+		assert.equal(response.success, true);
+		await harness.waitFor((record) => record.type === "agent_settled", 30_000);
+		assert.equal(
+			harness.records.some(
+				(record: any) =>
+					record.type === "tool_execution_end" &&
+					record.toolName === "delivery_delegate_readonly" &&
+					record.isError === false,
+			),
+			true,
+			JSON.stringify(harness.records.slice(-30)),
+		);
+	} finally {
+		harness.stop();
+		await localProvider.close();
 	}
 });
 

@@ -9,11 +9,14 @@ import { digestApprovalContent } from "./approvals.ts";
 import { pathIsInside } from "./subagents.ts";
 import { resolveWorkspaceIdentity, type WorkspaceIdentity } from "./workspace.ts";
 
-export const CANDIDATE_MANIFEST_VERSION = 1 as const;
+export const CANDIDATE_MANIFEST_VERSION = 2 as const;
+
+export type CandidateFileMode = "100644" | "100755" | "120000";
 
 export interface CandidateFileDigest {
 	path: string;
 	type: "file" | "symlink";
+	mode: CandidateFileMode;
 	size: number;
 	digest: string;
 }
@@ -88,10 +91,16 @@ async function fileDigest(gitRoot: string, relativePath: string): Promise<Candid
 	const stats = await lstat(absolute);
 	if (stats.isSymbolicLink()) {
 		const target = await readlink(absolute);
-		return { path: relativePath, type: "symlink", size: Buffer.byteLength(target), digest: sha256(target) };
+		return { path: relativePath, type: "symlink", mode: "120000", size: Buffer.byteLength(target), digest: sha256(target) };
 	}
 	if (!stats.isFile()) throw new Error(`Unsupported untracked candidate path type: ${relativePath}`);
-	return { path: relativePath, type: "file", size: stats.size, digest: await hashRegularFile(absolute) };
+	return {
+		path: relativePath,
+		type: "file",
+		mode: (stats.mode & 0o111) === 0 ? "100644" : "100755",
+		size: stats.size,
+		digest: await hashRegularFile(absolute),
+	};
 }
 
 async function canonicalProgressPaths(identity: WorkspaceIdentity, paths: readonly string[]): Promise<string[]> {

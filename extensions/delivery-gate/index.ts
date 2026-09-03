@@ -15,6 +15,10 @@ import {
 	type ApprovalRecord,
 } from "./src/approvals.ts";
 import { createCandidateSnapshot, snapshotProgressArtifact } from "./src/candidate.ts";
+import {
+	createCandidateReviewPacket,
+	parseStructuredReviewResult,
+} from "./src/review-contract.ts";
 import { renderDiagramEntry } from "./src/diagram-view.ts";
 import {
 	DIAGRAM_ENTRY_CUSTOM_TYPE,
@@ -64,9 +68,21 @@ import {
 	type PlanningDocumentEvidence,
 } from "./src/planning-documents.ts";
 import {
+	parseTinyContractFromContent,
+	stripTinyDeliveryProtocol,
+	type TinyDeliveryContract,
+} from "./src/tiny-contract.ts";
+import {
+	assertTinyAuthorizationCurrent,
+	assertTinyWritePath,
+	captureTinyApprovalBaseline,
+	freezeTinyCandidate,
+} from "./src/tiny-scope.ts";
+import {
 	READONLY_DELEGATE_ROLES,
 	PI_SUBAGENTS_RUNTIME_VERSION,
 	SubagentBoundary,
+	validatePublicPreflightStability,
 	type ReadonlyDelegateRole,
 } from "./src/subagents.ts";
 import {
@@ -100,6 +116,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	let state = createInitialRuntimeState();
 	let currentContext: ExtensionContext | undefined;
 	let leaseValid = false;
+	let deliveryBeginArmed = false;
 	const activeMutationTools = new Map<string, string>();
 	const pendingDiagramEntries: DiagramEntryData[] = [];
 	let activeDeliveryBarrier: { toolCallId: string; toolName: string } | undefined;
@@ -116,7 +133,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 
 	pi.registerMarkdownTransformer((markdown, context) =>
 		context.messageType === "assistant"
-			? transformMermaidForDisplay(stripAdaptiveDeliveryProtocol(markdown))
+			? transformMermaidForDisplay(stripTinyDeliveryProtocol(stripAdaptiveDeliveryProtocol(markdown)))
 			: markdown,
 	);
 	pi.registerEntryRenderer<DiagramEntryData>(DIAGRAM_ENTRY_CUSTOM_TYPE, (entry, { expanded }, theme) =>
@@ -224,12 +241,21 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	}
 
 	function plannedImplementationWriter(): "parent" | "worker" | undefined {
+		if (state.tinyContract) return "parent";
 		if (!state.planContract) return undefined;
 		return selectDeliveryRoute(state.planContract) === "single" ? "parent" : "worker";
 	}
 
 	function implementationWriter(): "parent" | "worker" {
 		return plannedImplementationWriter() ?? "parent";
+	}
+
+	function isTinyDelivery(): boolean {
+		return Boolean(state.tinyContract);
+	}
+
+	function approvedValidationCommands() {
+		return state.tinyContract?.validation ?? state.planContract?.validation ?? [];
 	}
 
 	function runtimePhaseGuidance(): string {
@@ -241,7 +267,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			case "REWORKING":
 				return implementationWriter() === "worker"
 					? "当前由唯一 worker 执行已批准实现；父 Pi 不得修改源码。调用 delivery_delegate_worker，worker 成功结束后会自动冻结候选并进入验证。"
-					: "当前是 small/low/low 直接实现路径；父 Pi 完成后调用 delivery_submit_candidate。验证与审查工具会在候选提交后的下一轮出现。";
+					: isTinyDelivery()
+						? "当前是 Tiny 路径；父 Pi 只能修改批准的 exact scope，完成后调用 delivery_submit_candidate。"
+						: "当前是 small/low/low 直接实现路径；父 Pi 完成后调用 delivery_submit_candidate。验证与审查工具会在候选提交后的下一轮出现。";
 			case "VALIDATING":
 				if (state.validationStatus === "pending") {
 					return "固定验证工具尚未写入终态；不要重复启动。若 Pi 已 reload 或上次工具被中断，先确认没有遗留命令，再由 TUI 用户恢复并重试同一候选。";
@@ -256,6 +284,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					return "验证和审查证据已就绪；确认仍绑定当前候选后调用 delivery_finalize。";
 				}
 				if (state.validationStatus === "passed") {
+					if (isTinyDelivery()) return "固定验证已通过；确认候选和 scope 证据仍有效后调用 delivery_finalize。";
 					return "固定验证已通过；下一步使用 delivery_review_candidate 审查同一候选。";
 				}
 				return "候选已冻结；下一步使用 delivery_validate。验证通过后再使用 delivery_review_candidate。";
@@ -361,6 +390,18 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				return `Planning documents cannot be proven: ${error instanceof Error ? error.message : String(error)}`;
 			}
 		}
+		if (state.tinyContract && state.tinyBaseline && state.approvals?.combined) {
+			try {
+				await assertTinyAuthorizationCurrent({
+					cwd: ctx.cwd,
+					contract: state.tinyContract,
+					baseline: state.tinyBaseline,
+					approval: state.approvals.combined,
+				});
+			} catch (error) {
+				return `Tiny baseline or exact scope cannot be proven: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
 		return undefined;
 	}
 
@@ -376,6 +417,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 
 	async function restore(ctx: ExtensionContext): Promise<void> {
 		currentContext = ctx;
+		deliveryBeginArmed = false;
 		subagents.bindSession(ctx.sessionManager.getSessionId());
 		const restored = restoreRuntimeState(ctx.sessionManager.getBranch());
 		state = restored.state;
@@ -450,6 +492,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			writerLeaseOwner: leaseValid ? "parent" : null,
 			reworkApproved: state.reworkApproved === true,
 			implementationWriter: implementationWriter(),
+			tinyWritablePaths: state.tinyContract?.changeScope,
 		};
 	}
 
@@ -586,6 +629,87 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 	}
 
+	async function approveTiny(
+		ctx: ExtensionCommandContext,
+		record: ApprovalRecord,
+		contract: TinyDeliveryContract,
+		event: DeliveryEvent,
+	): Promise<void> {
+		if (event.type !== "APPROVE_COMBINED") {
+			ctx.ui.notify("Tiny 只能使用一次合并批准。", "error");
+			return;
+		}
+		const confirmed = await requireTuiUserConfirmation(ctx, {
+			title: "确认 Tiny Delivery",
+			message: [
+				`批准当前 assistant 条目 ${record.entryId}？`,
+				`SHA-256: ${record.contentDigest}`,
+				`将修改：${contract.changeScope.join("、")}`,
+				`不会修改：${contract.nonGoals.join("；")}`,
+				`验证：${contract.validation.map((command) => command.command).join("；")}`,
+			].join("\n"),
+		});
+		if (!confirmed) {
+			ctx.ui.notify("未授予权限。", "warning");
+			return;
+		}
+
+		let approvalSnapshot = state.snapshot;
+		if (approvalSnapshot.state === "SHAPING") {
+			const submitted = transitionDelivery(approvalSnapshot, { type: "SUBMIT_COMBINED" });
+			if (!submitted.ok) throw new Error(submitted.reason);
+			approvalSnapshot = submitted.snapshot;
+		}
+		const transition = transitionDelivery(approvalSnapshot, event);
+		if (!transition.ok) {
+			ctx.ui.notify(formatRuntimeText(transition.reason) ?? "Tiny 状态转换失败", "error");
+			return;
+		}
+
+		let baseline;
+		try {
+			baseline = await captureTinyApprovalBaseline({ cwd: ctx.cwd, contract, approval: record });
+		} catch (error) {
+			ctx.ui.notify(
+				`Tiny baseline 无法证明，必须升级 Standard：${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+		state = checkpointRuntimeState(state, {
+			approvals: { combined: record },
+			tinyContract: contract,
+			tinyBaseline: baseline,
+			tinyScopeEvidence: undefined,
+			proposedDocuments: undefined,
+			planContract: undefined,
+			solutionDocument: undefined,
+			planningDocuments: undefined,
+			workerRunId: undefined,
+			workerStatus: undefined,
+			workerLaunchContractDigest: undefined,
+			candidateDigest: undefined,
+			validationRunId: undefined,
+			validationStatus: undefined,
+			validationFailureKind: undefined,
+			validationEvidence: undefined,
+			reviewEvidence: undefined,
+			reworkApproved: false,
+			finalEvidence: undefined,
+			checkpoint: {
+				summary: `Tiny contract approved with exact scope: ${contract.changeScope.join(", ")}`,
+				nextReadyAction: "Implement only the approved Tiny paths, then freeze the candidate",
+			},
+		});
+		if (!(await ensureParentWriterLease(ctx))) return;
+		if (!commitSnapshot(transition.snapshot, ctx, true)) return;
+		queueAutomaticContinuation(
+			ctx,
+			"/delivery-run",
+			`Tiny Delivery 已批准。exact scope：${contract.changeScope.join("、")}。正在开始实现...`,
+		);
+	}
+
 	async function approve(
 		ctx: ExtensionCommandContext,
 		kind: ApprovalKind,
@@ -602,7 +726,16 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		const target = await createCurrentApproval(kind, ctx);
 		if (!target) return;
 		const { record } = target;
+		const tinyContract = kind === "combined" ? parseTinyContractFromContent(target.content) : undefined;
 		const planContract = kind === "solution" ? undefined : parsePlanContractFromContent(target.content);
+		if (tinyContract && planContract) {
+			ctx.ui.notify("当前 assistant 条目同时包含 Tiny 和 Standard 契约，无法确定授权边界。", "error");
+			return;
+		}
+		if (tinyContract) {
+			await approveTiny(ctx, record, tinyContract, event);
+			return;
+		}
 		if (kind !== "solution" && !planContract) {
 			ctx.ui.notify("实施计划缺少唯一有效的 adaptive-delivery-plan 契约。", "error");
 			return;
@@ -890,6 +1023,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				: "未运行";
 			const lines = [
 				`状态：${formatDeliveryState(state.snapshot.state)}`,
+				`交付等级：${isTinyDelivery() ? "TINY" : state.planContract && selectDeliveryRoute(state.planContract) === "high-risk" ? "HIGH_RISK" : state.planContract ? "STANDARD" : "待确定"}`,
 				`子 Agent runtime：${subagentRuntime}`,
 				`恢复状态：${state.snapshot.resumeState ? formatDeliveryState(state.snapshot.resumeState) : "无"}`,
 				`开发方式：${plannedImplementationWriter() === "worker" ? "唯一 worker" : plannedImplementationWriter() === "parent" ? "父 Pi 直接实现" : "待实施计划决定"}`,
@@ -898,15 +1032,15 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				`候选版本：${state.candidateDigest ? `${state.candidateDigest}（${formatEvidenceValidity(candidateValidity)}）` : "不可证明"}`,
 				`验证：${state.validationStatus ? `${formatValidationStatus(state.validationStatus)}（${formatEvidenceValidity(evidenceValidity)}）${state.validationFailureKind === "infrastructure" ? "（本机执行未完成）" : state.validationFailureKind === "candidate" ? "（批准命令未通过）" : state.validationStatus === "failed" ? "（失败类型不可证明）" : ""}` : "不可证明"}${state.validationRunId ? `（批次 ID：${state.validationRunId}）` : ""}`,
 				`验证命令：${state.validationEvidence ? `\n${formatValidationRuns(state.validationEvidence.commands).join("\n")}` : "无终态证据"}`,
-				`审查：${state.reviewEvidence ? `${formatReviewVerdict(state.reviewEvidence.verdict)}（${formatEvidenceValidity(reviewValidity)}）` : "不可证明"}`,
+				`审查：${state.reviewEvidence ? `${formatReviewVerdict(state.reviewEvidence.verdict)}（${formatEvidenceValidity(reviewValidity)}）` : isTinyDelivery() ? "Tiny 默认省略" : "不可证明"}`,
 				`规划文档：${state.planningDocuments
 					? `${state.planningDocuments.requirementName}（${state.planningDocuments.solutionPath}，${state.planningDocuments.planPath}；已同步）`
 					: state.solutionDocument
 						? `${state.solutionDocument.requirementName}（${state.solutionDocument.solutionPath}；技术方案已同步，${state.solutionDocument.planPath}；实施计划待同步）`
 					: state.proposedDocuments
 						? `${state.proposedDocuments.requirementName}（${state.proposedDocuments.solutionPath}，${state.proposedDocuments.planPath}；待同步）`
-						: "不可证明"}`,
-				`进度同步：${progressStatus}`,
+						: isTinyDelivery() ? "Tiny 使用 Session/runtime contract，不创建需求级文档" : "不可证明"}`,
+				`进度同步：${isTinyDelivery() ? "Tiny 不启用" : progressStatus}`,
 				...(state.blockingReason ? [`阻塞原因：${formatRuntimeText(state.blockingReason)}`] : []),
 				...(state.recoveryCondition ? [`恢复条件：${formatRuntimeText(state.recoveryCondition)}`] : []),
 				...(checkpointSummary ? [`断点：${formatRuntimeText(checkpointSummary)}`] : []),
@@ -958,6 +1092,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					? state.proposedDocuments
 					: undefined,
 				planContract: undefined,
+				tinyContract: undefined,
+				tinyBaseline: undefined,
+				tinyScopeEvidence: undefined,
 				planningDocuments: undefined,
 				workerRunId: undefined,
 				workerStatus: undefined,
@@ -1115,6 +1252,11 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				content: [{ type: "text", text: lines.join("\n") }],
 					details: {
 					state: state.snapshot.state,
+					profile: isTinyDelivery()
+						? "tiny"
+						: state.planContract && selectDeliveryRoute(state.planContract) === "high-risk"
+							? "high-risk"
+							: state.planContract ? "standard" : undefined,
 					resumeState: state.snapshot.resumeState,
 					activeTools,
 					nextReadyAction: state.checkpoint?.nextReadyAction,
@@ -1153,11 +1295,15 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delivery_begin",
 		label: "开始交付流程",
-		description: "从 IDLE 进入只读方案梳理阶段。只能收紧为 Adaptive Delivery 流程，不能授予写权限。",
+		description: "仅在用户明确输入 /delivery-shape 后，从 IDLE 进入只读方案梳理阶段。普通问答、只读梳理、诊断或评审不得调用；该工具不能授予写权限。",
 		parameters: Type.Object({
 			goal: Type.String({ minLength: 1, maxLength: 4000 }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!deliveryBeginArmed) {
+				throw new Error("delivery_begin requires a real /delivery-shape input from the user");
+			}
+			deliveryBeginArmed = false;
 			const transition = transitionDelivery(state.snapshot, { type: "START" });
 			if (!transition.ok) throw new Error(transition.reason);
 			state = checkpointRuntimeState(state, {
@@ -1180,7 +1326,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delivery_delegate_readonly",
 		label: "只读子 Agent 委派",
-		description: "仅在高风险架构顾问或明确需要独立只读视角时调用受限 native Pi 子 Agent。普通方案梳理由父 Pi 直接使用 read/grep/find/ls；终态证明错误不得重试同一任务。",
+		description: "仅在高风险技术取舍确实需要架构顾问时调用受限 builtin oracle。普通方案梳理由父 Pi 直接使用 read/grep/find/ls，不得启动 scout；终态证明错误不得重试同一任务。",
 		parameters: Type.Object({
 			role: StringEnum(READONLY_DELEGATE_ROLES),
 			task: Type.String({ minLength: 1, maxLength: 20000 }),
@@ -1197,7 +1343,8 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				details: {
 					role,
 					runId: result.runId,
-					launchContractDigest: contract.launchContractDigest,
+					launchContractDigest: result.launchContractDigest,
+					preflightLaunchContractDigest: result.preflightLaunchContractDigest,
 				},
 			};
 		},
@@ -1242,7 +1389,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			let workerCheckpointFailed = false;
 			let result;
 			try {
-				result = await subagents.delegateWorker(task, ctx, contract.launchContractDigest, {
+				result = await subagents.delegateWorker(task, ctx, contract, {
 					signal,
 					onRunId: (runId) => {
 						state = checkpointRuntimeState(state, {
@@ -1272,6 +1419,32 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					`Controlled worker terminal proof is unavailable: ${error instanceof Error ? error.message : String(error)}`,
 					sourceState,
 				);
+				persistCurrentState();
+				updateStatus(ctx);
+				throw error;
+			}
+			try {
+				const recheckedContract = await subagents.preflightWorker(task, ctx, identity.gitRoot);
+				const stable = validatePublicPreflightStability(contract, recheckedContract);
+				if (!stable.ok) throw new Error(stable.reason);
+			} catch (error) {
+				let released = false;
+				let releaseError: string | undefined;
+				try {
+					released = await releaseParentLeaseIfOwned();
+				} catch (releaseFailure) {
+					releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
+				}
+				setBlocked(
+					`Controlled worker public preflight cannot be revalidated: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; lease release failed: ${releaseError}` : ""}`,
+					sourceState,
+				);
+				state = checkpointRuntimeState(state, {
+					workerRunId: result.runId,
+					workerStatus: "failed",
+					workerLaunchContractDigest: result.launchContractDigest,
+					...(released ? { writerLease: undefined } : {}),
+				});
 				persistCurrentState();
 				updateStatus(ctx);
 				throw error;
@@ -1399,6 +1572,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					runId: result.runId,
 					model: result.model,
 					launchContractDigest: result.launchContractDigest,
+					preflightLaunchContractDigest: result.preflightLaunchContractDigest,
 					candidateDigest: candidate.digest,
 				},
 			};
@@ -1417,10 +1591,25 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (implementationWriter() !== "parent") {
 				throw new Error("This approved route requires the controlled worker to submit the candidate");
 			}
-			if (!state.planContract) throw new Error("Approved plan contract is missing");
+			if (!state.planContract && !state.tinyContract) throw new Error("Approved delivery contract is missing");
 			await requireAuthorization(ctx, "implementation");
 			if (activeMutationTools.size > 0) throw new Error("Cannot freeze candidate while mutation tools are active");
-			const candidate = await recomputeCandidate(ctx);
+			let candidate;
+			let tinyScopeEvidence;
+			if (state.tinyContract) {
+				if (!state.tinyBaseline || !state.approvals?.combined) throw new Error("Tiny approval baseline is missing");
+				const frozen = await freezeTinyCandidate({
+					cwd: ctx.cwd,
+					contract: state.tinyContract,
+					baseline: state.tinyBaseline,
+					approval: state.approvals.combined,
+					approvals: { combined: state.approvals.combined },
+				});
+				candidate = frozen.candidate;
+				tinyScopeEvidence = frozen.evidence;
+			} else {
+				candidate = await recomputeCandidate(ctx);
+			}
 			if (!(await releaseParentLeaseIfOwned())) {
 				setBlocked("Cannot submit candidate while writer lease ownership is unproven", state.snapshot.state);
 				persistCurrentState();
@@ -1434,6 +1623,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!transition.ok) throw new Error(transition.reason);
 			state = checkpointRuntimeState(state, {
 				candidateDigest: candidate.digest,
+				tinyScopeEvidence,
 				validationRunId: undefined,
 				validationStatus: undefined,
 				validationFailureKind: undefined,
@@ -1447,7 +1637,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				writerLease: undefined,
 				checkpoint: {
 					summary: `Candidate frozen: ${candidate.digest}`,
-					nextReadyAction: "Run fixed validation and fresh review",
+					nextReadyAction: isTinyDelivery() ? "Run focused fixed validation" : "Run fixed validation and fresh review",
 				},
 			});
 			if (!commitSnapshot(transition.snapshot, ctx, false)) {
@@ -1467,12 +1657,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, signal, onUpdate, ctx) {
 			if (state.snapshot.state !== "VALIDATING") throw new Error("Validation requires VALIDATING state");
-			if (!state.planContract) throw new Error("Approved plan contract is missing");
+			if (!state.planContract && !state.tinyContract) throw new Error("Approved delivery contract is missing");
 			await requireAuthorization(ctx, "implementation");
 			if (state.validationStatus === "pending") throw new Error("Validation is already pending for this candidate");
 			const candidateDigest = await requireCurrentCandidate(ctx);
-			const planContract = state.planContract;
-			const commandIds = planContract.validation.map((command) => command.id);
+			const validationCommands = approvedValidationCommands();
+			const commandIds = validationCommands.map((command) => command.id);
 			const startedAt = Date.now();
 			const runId = randomUUID();
 			onUpdate?.({
@@ -1495,7 +1685,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const result: ValidationBatchResult = await runApprovedValidation({
 				pi,
 				cwd: ctx.cwd,
-				commands: planContract.validation,
+				commands: validationCommands,
 				signal,
 				onProgress: (progress) => {
 					if (progress.phase === "completed" && progress.result) completedRuns.push(progress.result);
@@ -1544,7 +1734,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					validationEvidence: buildValidationEvidence(runId, candidateDigest, result),
 					checkpoint: {
 						summary: `Validation passed for ${candidateDigest}`,
-						nextReadyAction: "Run fresh review for the same candidate",
+						nextReadyAction: isTinyDelivery() ? "Finalize the same Tiny candidate" : "Run fresh review for the same candidate",
 					},
 				});
 				if (!persistCurrentState()) throw new Error("Validation passed but its terminal checkpoint could not be persisted");
@@ -1553,7 +1743,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					content: [{ type: "text", text: [
 						`固定验证已通过，且结果绑定当前候选版本：${candidateDigest}`,
 						...formatValidationRuns(result.runs),
-						"下一步进行同一候选版本的独立审查。",
+						isTinyDelivery() ? "下一步完成同一 Tiny 候选版本的交付。" : "下一步进行同一候选版本的独立审查。",
 					].join("\n") }],
 					details: { runId, candidateDigest, result },
 				};
@@ -1603,6 +1793,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (state.snapshot.state !== "VALIDATING") throw new Error("Review requires VALIDATING state");
+			if (isTinyDelivery()) throw new Error("Tiny Delivery does not use fresh review; upgrade to Standard when independent review is required");
 			await requireAuthorization(ctx, "implementation");
 			const candidateDigest = await requireCurrentCandidate(ctx);
 			if (
@@ -1614,28 +1805,31 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				throw new Error("Fresh review requires passed fixed validation evidence for the current candidate");
 			}
 			const identity = await resolveWorkspaceIdentity(ctx.cwd);
+			const reviewPacket = await createCandidateReviewPacket({
+				cwd: ctx.cwd,
+				candidateDigest,
+				progressPaths: state.planContract?.progressTargets,
+			});
+			await requireCurrentCandidate(ctx);
 			const task = [
 				"Review the current repository candidate without modifying project/source files.",
-				`Candidate digest: ${candidateDigest}`,
 				`Approved requirement and acceptance context:\n${approvedContextText(ctx) || "(no approved context text available)"}`,
 				params.focus ? `Review focus: ${params.focus}` : "Review correctness, regressions, tests, and unnecessary complexity.",
-				"Return concrete P0/P1/P2 findings with source proof and a merge verdict.",
+				"The runtime-generated packet below is the canonical actual candidate diff. Review this exact packet; do not infer changes from repository state alone.",
+				reviewPacket.text,
+				"Return exactly one fenced adaptive-delivery-review JSON object with version, candidateDigest, diffDigest, verdict, and findings. Each finding has severity, path, line, and summary. P0/P1 requires BLOCK; no P0/P1 permits OK or OK_WITH_NOTES.",
 			].join("\n");
 			const contract = await subagents.preflight("reviewer", task, ctx, identity.gitRoot);
 			const result = await subagents.delegate("reviewer", task, ctx, contract, identity.gitRoot, signal);
 			await requireCurrentCandidate(ctx);
-			const verdictMatches = [...result.text.matchAll(/^Merge verdict:\s*(BLOCK|OK WITH NOTES|OK)\s*$/gim)];
-			const verdict = verdictMatches.length === 1
-				? verdictMatches[0]![1]!.toUpperCase().replace(/ /g, "_") as
-				| "BLOCK"
-				| "OK"
-				| "OK_WITH_NOTES"
-				: undefined;
-			if (!verdict) throw new Error("Fresh reviewer did not return a recognized merge verdict");
+			const review = parseStructuredReviewResult(result.text, reviewPacket);
+			if (!review) throw new Error("Fresh reviewer did not return valid candidate/diff-bound review evidence");
 			state = checkpointRuntimeState(state, {
 				reviewEvidence: {
 					candidateDigest,
-					verdict,
+					candidateDiffDigest: reviewPacket.diffDigest,
+					reviewContractVersion: review.version,
+					verdict: review.verdict,
 					textDigest: digestApprovalContent(result.text),
 					...(result.runId ? { runId: result.runId } : {}),
 					completedAt: new Date().toISOString(),
@@ -1648,7 +1842,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!persistCurrentState()) throw new Error("Review completed but its evidence could not be persisted");
 			return {
 				content: [{ type: "text", text: result.text }],
-				details: { candidateDigest, runId: result.runId },
+				details: { candidateDigest, candidateDiffDigest: reviewPacket.diffDigest, runId: result.runId },
 			};
 		},
 	});
@@ -1698,7 +1892,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delivery_finalize",
 		label: "完成开发交付",
-		description: "在 validation passed、fresh review OK 且 candidate 未变化时进入已交付状态。",
+		description: "在当前 candidate 的固定 validation 通过，且所需 review/scope 证据有效时进入已交付状态。",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			if (state.snapshot.state !== "VALIDATING") throw new Error("Finalize requires VALIDATING state");
@@ -1706,7 +1900,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const candidateDigest = await requireCurrentCandidate(ctx);
 			if (state.validationStatus !== "passed") throw new Error("Validation evidence has not passed");
 			const validationEvidence = state.validationEvidence;
-			const approvedValidationIds = state.planContract?.validation.map((command) => command.id) ?? [];
+			const approvedValidationIds = approvedValidationCommands().map((command) => command.id);
 			if (
 				!validationEvidence ||
 				validationEvidence.candidateDigest !== candidateDigest ||
@@ -1717,10 +1911,26 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			) {
 				throw new Error("Validation command evidence is missing, stale, or does not match the approved plan");
 			}
-			if (!state.reviewEvidence || state.reviewEvidence.candidateDigest !== candidateDigest) {
-				throw new Error("Fresh review evidence is missing or stale");
+			if (isTinyDelivery()) {
+				if (
+					!state.tinyBaseline ||
+					!state.tinyScopeEvidence ||
+					state.tinyScopeEvidence.baselineDigest !== state.tinyBaseline.candidateDigest ||
+					state.tinyScopeEvidence.candidateDigest !== candidateDigest
+				) {
+					throw new Error("Tiny baseline or exact scope evidence is missing or stale");
+				}
+			} else {
+				if (
+					!state.reviewEvidence ||
+					state.reviewEvidence.candidateDigest !== candidateDigest ||
+					state.reviewEvidence.reviewContractVersion !== 1 ||
+					!state.reviewEvidence.candidateDiffDigest
+				) {
+					throw new Error("Fresh candidate/diff-bound review evidence is missing or stale");
+				}
+				if (state.reviewEvidence.verdict === "BLOCK") throw new Error("Fresh review still blocks delivery");
 			}
-			if (state.reviewEvidence.verdict === "BLOCK") throw new Error("Fresh review still blocks delivery");
 			const identity = await resolveWorkspaceIdentity(ctx.cwd);
 			const progressArtifacts = [];
 			for (const progressPath of state.planContract?.progressTargets ?? []) {
@@ -1764,6 +1974,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (state.snapshot.state !== "VALIDATING" && state.snapshot.state !== "BLOCKED") {
 				throw new Error("Progress sync is allowed only at VALIDATING or BLOCKED writer-free boundaries");
 			}
+			if (state.tinyContract) throw new Error("Tiny Delivery has no project progress target; upgrade to Standard when progress sync is required");
 			if (!state.planContract) throw new Error("Approved plan contract is missing");
 			await requireAuthorization(ctx, "implementation");
 			const planContract = state.planContract;
@@ -1929,6 +2140,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 						: undefined,
 					writerLease: undefined,
 					planContract: undefined,
+					tinyContract: undefined,
+					tinyBaseline: undefined,
+					tinyScopeEvidence: undefined,
 					planningDocuments: undefined,
 					workerRunId: undefined,
 					workerStatus: undefined,
@@ -1963,7 +2177,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		activeMutationTools.delete(event.toolCallId);
 		if (activeDeliveryBarrier?.toolCallId === event.toolCallId) activeDeliveryBarrier = undefined;
 	});
-	pi.on("tool_call", async (event, _ctx) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (SERIALIZED_DELIVERY_TOOLS.has(event.toolName)) {
 			if (activeMutationTools.size > 0) {
 				return { block: true, reason: `${event.toolName} cannot run in a tool batch that already contains a writer` };
@@ -1988,10 +2202,28 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!runtimePolicy.sourceWrite || !leaseValid) {
 				return { block: true, reason: "Current delivery state or writer lease does not allow source writes" };
 			}
+			if (state.tinyContract) {
+				try {
+					const identity = await resolveWorkspaceIdentity(ctx.cwd);
+					await assertTinyWritePath({
+						cwd: ctx.cwd,
+						gitRoot: identity.gitRoot,
+						changeScope: state.tinyContract.changeScope,
+						toolPath: (event.input as Record<string, unknown> | undefined)?.path,
+					});
+				} catch (error) {
+					return { block: true, reason: error instanceof Error ? error.message : String(error) };
+				}
+			}
 		}
 		if (event.toolName === "bash" || event.toolName === "subagent") {
 			return { block: true, reason: `Raw ${event.toolName} is not allowed by Adaptive Delivery` };
 		}
+	});
+	pi.on("input", async (event) => {
+		deliveryBeginArmed =
+			event.source !== "extension" &&
+			/^\/delivery-shape(?:\s|$)/.test(event.text.trimStart());
 	});
 
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
@@ -2006,6 +2238,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		pendingDiagramEntries.push(entry);
 	});
 	pi.on("agent_end", async (_event, ctx) => {
+		deliveryBeginArmed = false;
 		const entries = pendingDiagramEntries.splice(0);
 		for (const entry of entries) {
 			try {
@@ -2030,6 +2263,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
 	pi.on("session_shutdown", async (_event, ctx) => {
 		currentContext = undefined;
+		deliveryBeginArmed = false;
 		pendingDiagramEntries.length = 0;
 		policy.forceReadOnly();
 		subagents.dispose();

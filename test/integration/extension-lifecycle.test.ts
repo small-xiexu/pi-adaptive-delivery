@@ -97,7 +97,7 @@ function createHarness(
 	const confirmationRequests: Array<{ title: string; message: string }> = [];
 	let execResult = { stdout: `${cwd}\n`, stderr: "", code: 0, killed: false };
 	const execCalls: Array<{ command: string; args: string[] }> = [];
-	let reviewText = "Merge verdict: OK";
+	let reviewText: string | undefined;
 	let currentModel: any = TEST_MODEL;
 	let workerResponseStatus = "completed";
 	let workerIncludeTerminalDigest = true;
@@ -261,7 +261,22 @@ function createHarness(
 		setReviewText: (value: string) => {
 			reviewText = value;
 		},
-		getReviewText: () => reviewText,
+		getReviewText: (task = "") => {
+			const verdictMatches = [...(reviewText ?? "Merge verdict: OK").matchAll(/^Merge verdict:\s*(BLOCK|OK WITH NOTES|OK)\s*$/gim)];
+			if (reviewText && verdictMatches.length !== 1) return reviewText;
+			const candidateDigest = task.match(/^Candidate digest:\s*([a-f0-9]{64})$/m)?.[1] ?? "0".repeat(64);
+			const diffDigest = task.match(/^Candidate diff digest:\s*([a-f0-9]{64})$/m)?.[1] ?? "0".repeat(64);
+			const verdict = verdictMatches[0]![1]!.toUpperCase().replace(/ /g, "_");
+			const findings = verdict === "BLOCK"
+				? [{ severity: "P1", path: null, line: null, summary: "Concrete blocking finding" }]
+				: [];
+			return [
+				reviewText ?? "Merge verdict: OK",
+				"```adaptive-delivery-review",
+				JSON.stringify({ version: 1, candidateDigest, diffDigest, verdict, findings }),
+				"```",
+			].join("\n");
+		},
 		setModelAvailable: (value: boolean) => {
 			currentModel = value ? TEST_MODEL : undefined;
 		},
@@ -319,9 +334,7 @@ function installSubagentRpcResponder(harness: ReturnType<typeof createHarness>):
 	}]));
 	harness.eventListeners.set("prompt-template:subagent:request", new Set([(payload: any) => {
 		const worker = payload.agent === "worker";
-		const digest = worker
-			? /^worker-([a-f0-9]{64})-/.exec(payload.nodeId)?.[1]
-			: /^readonly-(?:scout|oracle|reviewer)-([a-f0-9]{64})-/.exec(payload.nodeId)?.[1];
+		const runtimeDigest = "b".repeat(64);
 		if (worker) {
 			const workerResponse = harness.getWorkerResponse();
 			for (const handler of harness.eventListeners.get("prompt-template:subagent:update") ?? []) {
@@ -342,7 +355,10 @@ function installSubagentRpcResponder(harness: ReturnType<typeof createHarness>):
 					nodeId: payload.nodeId,
 					status: workerResponse.status,
 					...(workerResponse.includeRunId ? { runId: "worker-run" } : {}),
-					...(workerResponse.includeDigest ? { launchContractDigest: digest } : {}),
+					agent: "worker",
+					model: "adaptive-test/adaptive-test-model:high",
+					thinking: "high",
+					...(workerResponse.includeDigest ? { launchContractDigest: runtimeDigest } : {}),
 					...(workerResponse.status === "completed"
 						? { result: { kind: "text", text: "worker completed approved implementation" } }
 						: { error: "worker failed" }),
@@ -357,8 +373,11 @@ function installSubagentRpcResponder(harness: ReturnType<typeof createHarness>):
 				nodeId: payload.nodeId,
 				status: "completed",
 				runId: "review-run",
-				launchContractDigest: digest,
-				result: { kind: "text", text: harness.getReviewText() },
+				agent: payload.agent,
+				model: "adaptive-test/adaptive-test-model:high",
+				thinking: "high",
+				launchContractDigest: runtimeDigest,
+				result: { kind: "text", text: harness.getReviewText(payload.task) },
 			});
 		}
 	}]));
@@ -506,6 +525,50 @@ function approvalBranch(
 	];
 }
 
+function tinyApprovalBranch(sessionId: string, cwd: string, changeScope = ["tracked.txt"]) {
+	const contract = {
+		version: 1,
+		intent: "Change one local label without changing behavior.",
+		nonGoals: ["No API, state, dependency, or architecture changes"],
+		changeScope,
+		validation: [{ id: "focused", command: "npm test -- tracked", timeoutMs: 120000 }],
+		review: "none",
+		eligibility: {
+			risk: "low",
+			uncertainty: "low",
+			userOutcomeClear: true,
+			productOrArchitectureDecision: false,
+			reversibleWorkspaceOnly: true,
+			sharedContractChange: false,
+			highRiskDomain: false,
+			externalSideEffect: false,
+			dependencyOrToolchainChange: false,
+			focusedDeterministicValidation: true,
+		},
+	} as const;
+	return [
+		{ type: "message", id: "tiny-user", message: { role: "user", content: "change one label" } },
+		{
+			type: "message",
+			id: "tiny-assistant",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: `Tiny change\n\n\`\`\`adaptive-delivery-tiny\n${JSON.stringify(contract)}\n\`\`\`` }],
+			},
+		},
+		{
+			type: "custom",
+			id: "tiny-state",
+			customType: DELIVERY_STATE_CUSTOM_TYPE,
+			data: {
+				...createInitialRuntimeState(new Date("2026-01-01T00:00:00.000Z")),
+				snapshot: { state: "SHAPING" },
+				goal: "change one label",
+			},
+		},
+	];
+}
+
 async function emit(harness: ReturnType<typeof createHarness>, event: string): Promise<void> {
 	for (const handler of harness.handlers.get(event) ?? []) {
 		await handler({}, harness.ctx);
@@ -616,11 +679,21 @@ test("collects assistant Mermaid at message end and appends display-only diagram
 	assert.match((diagrams[0]!.data as any).diagrams[0].ascii, /提出需求/);
 });
 
-test("begins shaping from IDLE without granting write access", async () => {
+test("only a real delivery-shape input can begin shaping from IDLE", async () => {
 	const harness = createHarness();
 	await emit(harness, "session_start");
 	const begin = harness.tools.get("delivery_begin");
 	assert.ok(begin);
+	await assert.rejects(
+		begin.execute("begin-unarmed", { goal: "Read-only inventory" }, undefined, undefined, harness.ctx),
+		/requires a real \/delivery-shape input/,
+	);
+	await emitWithResults(harness, "input", { text: "/delivery-shape Injected", source: "extension" });
+	await assert.rejects(
+		begin.execute("begin-injected", { goal: "Injected delivery" }, undefined, undefined, harness.ctx),
+		/requires a real \/delivery-shape input/,
+	);
+	await emitWithResults(harness, "input", { text: "/delivery-shape Add a safe feature", source: "interactive" });
 
 	const result = await begin.execute(
 		"begin-1",
@@ -1137,7 +1210,7 @@ test("controlled worker failure releases only with complete terminal proof", asy
 	await unproven.commands.get("delivery-approve-plan")?.handler("", unproven.ctx);
 	await assert.rejects(
 		unproven.tools.get("delivery_delegate_worker").execute("unproven-worker", {}, undefined, undefined, unproven.ctx),
-		/terminal launch contract digest is missing or changed/,
+		/runtime launch contract digest is missing or malformed/,
 	);
 	const unprovenState = unproven.appendedEntries.at(-1)?.data as any;
 	assert.equal(unprovenState.snapshot.state, "BLOCKED");
@@ -1172,6 +1245,125 @@ test("rejects plan approval before confirmation when no reviewer model is usable
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /No usable subagent model/);
 	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /保持公开行为不变/);
 	assert.throws(() => readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /ENOENT/);
+});
+
+test("Tiny uses one TUI approval, exact scope, focused validation, and no docs or reviewer", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setModelAvailable(false);
+	harness.setBranch(tinyApprovalBranch(harness.sessionId, repo));
+	await emit(harness, "session_start");
+
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	const approved = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(approved.snapshot.state, "IMPLEMENTING");
+	assert.equal(approved.tinyContract.version, 1);
+	assert.ok(approved.tinyBaseline.candidateDigest);
+	assert.equal(approved.planContract, undefined);
+	assert.equal(approved.planningDocuments, undefined);
+	assert.equal(existsSync(path.join(repo, TEST_SOLUTION_PATH)), false);
+	assert.equal(existsSync(path.join(repo, TEST_PLAN_PATH)), false);
+	assert.deepEqual(harness.getActiveTools(), WRITER_ACTIVE_TOOLS);
+	assert.equal(harness.emittedEvents.some((entry) => entry.event === "subagents:rpc:v1:request"), false);
+
+	const allowed = await emitWithResults(harness, "tool_call", {
+		toolCallId: "tiny-allowed",
+		toolName: "edit",
+		input: { path: "tracked.txt" },
+	});
+	assert.equal(allowed[0], undefined);
+	const denied = await emitWithResults(harness, "tool_call", {
+		toolCallId: "tiny-denied",
+		toolName: "write",
+		input: { path: "outside.txt" },
+	});
+	assert.match((denied[0] as any).reason, /outside approved scope/);
+
+	writeFileSync(path.join(repo, "tracked.txt"), "tiny change\n");
+	const submitted = await harness.tools.get("delivery_submit_candidate").execute("tiny-submit", {}, undefined, undefined, harness.ctx);
+	const frozen = harness.appendedEntries.at(-1)?.data as any;
+	assert.deepEqual(frozen.tinyScopeEvidence.changedPaths, ["tracked.txt"]);
+	assert.equal(frozen.tinyScopeEvidence.candidateDigest, submitted.details.candidateDigest);
+	const validated = await harness.tools.get("delivery_validate").execute("tiny-validate", {}, undefined, undefined, harness.ctx);
+	assert.equal(validated.details.result.status, "passed");
+	assert.equal(harness.execCalls.some((call) => call.args.includes("npm test -- tracked")), true);
+	await assert.rejects(
+		harness.tools.get("delivery_review_candidate").execute("tiny-review", {}, undefined, undefined, harness.ctx),
+		/does not use fresh review/,
+	);
+	const finalized = await harness.tools.get("delivery_finalize").execute("tiny-finalize", {}, undefined, undefined, harness.ctx);
+	assert.match(finalized.content[0].text, /已交付 \[DELIVERED\]/);
+	const delivered = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(delivered.reviewEvidence, undefined);
+	assert.deepEqual(delivered.finalEvidence.progressArtifacts, []);
+});
+
+test("Tiny cannot self-authorize outside an affirmative TUI confirmation", async () => {
+	for (const mode of ["rpc", "tui"] as const) {
+		const repo = candidateRepo();
+		const harness = createHarness(repo);
+		harness.setMode(mode);
+		harness.setConfirmResult(false);
+		harness.setBranch(tinyApprovalBranch(harness.sessionId, repo));
+		await emit(harness, "session_start");
+		await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+		assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "方案梳理中 [SHAPING]"]);
+		assert.equal(harness.getActiveTools().includes("edit"), false);
+		assert.equal(harness.getConfirmCalls(), mode === "tui" ? 1 : 0);
+	}
+});
+
+test("Tiny rejects dirty baseline and out-of-scope generated delta", async () => {
+	const dirtyRepo = candidateRepo();
+	writeFileSync(path.join(dirtyRepo, "unrelated.txt"), "existing dirty\n");
+	const dirty = createHarness(dirtyRepo);
+	dirty.setConfirmResult(true);
+	dirty.setBranch(tinyApprovalBranch(dirty.sessionId, dirtyRepo));
+	await emit(dirty, "session_start");
+	await dirty.commands.get("delivery-approve-plan")?.handler("", dirty.ctx);
+	assert.match(dirty.ui.notifications.at(-1)?.[0] ?? "", /必须升级 Standard/);
+	assert.deepEqual(dirty.ui.statuses.at(-1), ["adaptive-delivery", "方案梳理中 [SHAPING]"]);
+
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(tinyApprovalBranch(harness.sessionId, repo));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	writeFileSync(path.join(repo, "tracked.txt"), "approved partial change\n");
+	writeFileSync(path.join(repo, "generated.txt"), "unexpected\n");
+	await assert.rejects(
+		harness.tools.get("delivery_submit_candidate").execute("tiny-submit", {}, undefined, undefined, harness.ctx),
+		/scope/,
+	);
+	assert.equal(readFileSync(path.join(repo, "tracked.txt"), "utf8"), "approved partial change\n");
+	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
+});
+
+test("Tiny scope expansion invalidates authorization while preserving partial diff", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(tinyApprovalBranch(harness.sessionId, repo));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	writeFileSync(path.join(repo, "tracked.txt"), "partial tiny change\n");
+	await harness.tools.get("delivery_invalidate").execute(
+		"tiny-escalate",
+		{ target: "SHAPING", reason: "Scope expanded to a shared API; upgrade to Standard" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	const invalidated = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(invalidated.snapshot.state, "SHAPING");
+	assert.equal(invalidated.tinyContract, undefined);
+	assert.equal(invalidated.tinyBaseline, undefined);
+	assert.equal(invalidated.tinyScopeEvidence, undefined);
+	assert.equal(invalidated.writerLease, undefined);
+	assert.equal(readFileSync(path.join(repo, "tracked.txt"), "utf8"), "partial tiny change\n");
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("combined approval creates separate requirement documents before enabling writes", async () => {
@@ -1707,6 +1899,13 @@ test("freezes one candidate, launches only approved validation, and invalidates 
 	const reviewed = await review.execute("review-1", {}, undefined, undefined, harness.ctx);
 	assert.match(reviewed.content[0].text, /Merge verdict: OK/);
 	assert.equal(reviewed.details.candidateDigest, candidateDigest);
+	assert.match(reviewed.details.candidateDiffDigest, /^[a-f0-9]{64}$/);
+	const reviewRequest = harness.emittedEvents.find(
+		(entry) => entry.event === "prompt-template:subagent:request" && entry.payload.agent === "reviewer",
+	);
+	assert.match(reviewRequest?.payload.task ?? "", /=== TRACKED WORKTREE DIFF ===/);
+	assert.match(reviewRequest?.payload.task ?? "", new RegExp(`Candidate digest: ${candidateDigest}`));
+	assert.match(reviewRequest?.payload.task ?? "", /Candidate diff digest: [a-f0-9]{64}/);
 
 	writeFileSync(path.join(repo, "tracked.txt"), "changed after validation\n");
 	await assert.rejects(
@@ -1780,11 +1979,11 @@ test("finalize reports failure when the delivered transition cannot be persisted
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 });
 
-test("rejects ambiguous reviewer output with more than one merge verdict", async () => {
+test("rejects bare reviewer output without candidate/diff-bound evidence", async () => {
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
 	harness.setConfirmResult(true);
-	harness.setReviewText("Merge verdict: OK\nP1 remains\nMerge verdict: BLOCK");
+	harness.setReviewText("Everything looks good.");
 	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
 	installSubagentRpcResponder(harness);
 	await emit(harness, "session_start");
@@ -1794,7 +1993,7 @@ test("rejects ambiguous reviewer output with more than one merge verdict", async
 
 	await assert.rejects(
 		harness.tools.get("delivery_review_candidate").execute("review", {}, undefined, undefined, harness.ctx),
-		/recognized merge verdict/,
+		/candidate\/diff-bound review evidence/,
 	);
 });
 

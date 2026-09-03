@@ -1,6 +1,6 @@
 # Pi Adaptive Delivery
 
-一个安装到 [Pi](https://pi.dev) 的开发交付 Package。它先和你对齐“最终要做成什么样”，得到明确批准后再写代码，并自动完成验证、独立审查和交付收口。
+一个安装到 [Pi](https://pi.dev) 的开发交付 Package。它先和你对齐“最终要做成什么样”，得到明确批准后再写代码，并按风险完成真实验证、必要的独立审查和交付收口。
 
 你只需要说明需求、检查方案并做必要批准，不需要自己组织多个 Agent、复制审查提示词或记住后续命令。
 
@@ -8,7 +8,7 @@
 
 ## 最终效果
 
-一次正常任务会按下面的顺序完成：
+Standard/High-Risk 任务按下面的顺序完成：
 
 ```text
 你用一句话提出需求
@@ -27,6 +27,16 @@
 ```
 
 Package 不会自动 commit、push、创建 PR、发布 npm、部署或操作生产环境。这些动作始终需要单独授权。
+
+真正的 Tiny 修改使用更短但仍由 runtime 强制的路径：
+
+```text
+读取必要事实 -> 精确 scope + focused validation 摘要 -> 一次 TUI 批准
+  -> clean baseline -> parent single writer + lease -> exact-scope 实现
+  -> candidate freeze -> runtime validation -> DELIVERED
+```
+
+Tiny 不创建需求级技术方案/实施计划 Markdown，不启动 worker/reviewer，也不做 progress sync；authorization、exact scope、baseline、lease、candidate digest、validation evidence binding 和 stale detection 不会省略。
 
 ## 安装
 
@@ -88,6 +98,8 @@ pi
 /delivery-shape 修复订单重复扣款，并补充对应测试。
 ```
 
+只有明确输入 `/delivery-shape` 才会启动交付状态。普通问答、项目梳理、状态盘点、诊断和代码评审保持 `IDLE`，不会因为模型误判而调用 `delivery_begin`。
+
 对于已经有计划的项目，也可以写：
 
 ```text
@@ -104,7 +116,7 @@ Package 已把“方案追问”内置到 `adaptive-delivery`，不依赖额外�
 按推荐
 ```
 
-所有关键选择确认后，Package 会立即停止提问并生成技术方案。极小、局部、可逆、验收明确且没有用户决策分支的需求默认不追问，直接给出精简方案和计划。
+所有关键选择确认后，Package 会立即停止提问并生成方案。满足严格低风险、exact-scope、clean-baseline 和确定性 focused validation 条件的 Tiny 默认不追问，只给出简短 Delivery Contract；任一条件不能证明就升级 Standard/High-Risk。
 
 需要主动把方案问透时，可以直接在需求后补一句：
 
@@ -146,9 +158,9 @@ Package 会在对话区显示批准摘要，立即把已批准技术方案写入
 
 随后 Package 会创建实施计划文档并开始实现，不需要再输入 `/delivery-run`。
 
-### 小型低风险任务
+### Tiny 任务
 
-技术方案和实施计划会在同一回复中分别展示。确认两部分都正确后只需执行：
+Package 会显示 exact change scope、明确非目标和 focused validation。确认后只需执行：
 
 ```text
 /delivery-approve-plan
@@ -179,6 +191,8 @@ Package 会在对话区显示批准摘要，立即把已批准技术方案写入
 
 ## 需求级规划文档
 
+Planning contract 不等于 project documentation。Tiny 的 contract 保存在当前 Session/runtime state，不创建需求级规划 Markdown；本节其余规则只适用于 Standard/High-Risk。
+
 Package 先服从当前用户要求、目标项目最近的 `AGENTS.md` 与文档路由、用户全局规则；Package 默认只在前面没有约定时补空白。
 
 已有总技术方案或总计划默认只作为背景事实，不因为文件存在就继续堆入每个新需求。没有其他规则时创建：
@@ -197,7 +211,7 @@ docs/避免重复扣款-实施计划.md
 
 需求短名称描述稳定的用户目标，不使用日期、`final-v2`、代码行号或可能变化的实现细节。
 
-路径会在技术方案批准时冻结，实施计划不能静默改名。标准任务批准 solution 后，Extension 先以 create-only 方式创建技术方案；批准 plan 后只创建实施计划。小型合并批准仍一次创建两个 Markdown：
+路径会在技术方案批准时冻结，实施计划不能静默改名。Standard/High-Risk 批准 solution 后，Extension 先以 create-only 方式创建技术方案；批准 plan 后只创建实施计划：
 
 - 不覆盖已有同名文件。
 - 拒绝绝对路径、`..`、symlink、非 Markdown 和同一目标。
@@ -214,13 +228,13 @@ TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract
 
 1. 复验已批准技术方案文档并创建实施计划文档。
 2. 获取当前 Git worktree 的唯一 writer lease。
-3. 小型低风险任务由父 Pi 直接实现；其他任务由一个受控 foreground worker 实现，父 Pi 只编排。
+3. Tiny 由父 Pi 在 exact scope 内直接实现；Standard/High-Risk 默认由一个受控 foreground worker 实现，兼容的 plan-v2 `single` 路径仍保留父 Pi 实现。
 4. 冻结包含 HEAD、staged、tracked、untracked、submodule 和批准记录的 candidate digest。
 5. 由 Delivery Gate 通过 Pi 的公开命令 API 顺序执行批准的验证命令。
-6. 使用 fresh reviewer 检查同一个 candidate。
+6. Standard/High-Risk 使用 fresh reviewer 检查 runtime 提供的同一 candidate actual diff，并把结果绑定 candidate/diff digest；Tiny 默认省略。
 7. 把 accepted P0/P1 转成可验证关闭义务并批量返工。
 8. 复验后只做一次 closure review。
-9. 在 writer-free 边界同步唯一进度台账。
+9. Standard/High-Risk 在 writer-free 边界同步唯一进度台账；Tiny 不注册 progress target。
 10. 全部证据仍对应当前 candidate 时进入 `DELIVERED`。
 
 P2、推测性意见和与当前修改无关的历史问题只进入最终 notes，不会无限触发 review/fix。
@@ -279,7 +293,7 @@ TUI 会明确显示应手工运行的命令：
 /delivery-resume
 ```
 
-resume 会重新校验批准、cwd、Git root、规划文档、lease、candidate 和 evidence；不能证明时继续保持只读。
+resume 会重新校验批准、cwd、Git root、适用的规划文档或 Tiny baseline/scope、lease、candidate 和 evidence；不能证明时继续保持只读。
 
 临时 `BLOCKED` 会保留已经批准的方案、计划、两份规划文档、candidate 和已有验证证据，只释放当前 writer lease；因此解决运行时问题后通常可以直接 resume，不需要重新批准，也不会因为 create-only 文档已经存在而卡住。只有需求、范围、架构或计划确实要重做时，才使用 `/delivery-revise` 撤销相应批准。
 
@@ -353,7 +367,7 @@ Package 内部固定携带并加载 `pi-subagents 0.64.0` 作为唯一子 Agent 
 
 Package 使用稳定角色：
 
-- `scout`：只读代码侦察
+- `scout`：bundled runtime 的通用角色；当前 Adaptive Delivery 流程不向模型暴露，普通取证由父 Pi 直接完成
 - `oracle`：高风险方案挑战
 - `worker`：standard/high-risk 的唯一写入者；父 Pi 在这些路径只编排
 - `reviewer`：fresh-context 独立审查
@@ -416,6 +430,8 @@ pi remove -l git:github.com/small-xiexu/pi-adaptive-delivery
 
 - `adaptive-delivery-documents` v1：需求短名称、solution/plan 路径和选择来源
 - `adaptive-delivery-plan` v2：文档身份、风险分类、验证命令和 progress target/check
+- `adaptive-delivery-tiny` v1：Tiny intent、non-goals、exact scope、validation 和风险否决声明
+- `adaptive-delivery-review` v1：绑定 candidate/diff digest 的 reviewer verdict 和 findings
 - Delivery runtime state v1
 - Candidate manifest v1
 - Writer lease v1

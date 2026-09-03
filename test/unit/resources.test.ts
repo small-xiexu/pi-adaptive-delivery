@@ -19,6 +19,17 @@ function parseFrontmatter(source: string): FrontmatterResult {
 	return { frontmatter, body: match[2]! };
 }
 
+test("shaping resources require a markdown-safe recommendation format", async () => {
+	const [prompt, skill] = await Promise.all([
+		readFile(new URL("../../prompts/delivery-shape.md", import.meta.url), "utf8"),
+		readFile(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url), "utf8"),
+	]);
+	assert.match(prompt, /推荐部分固定使用两行纯文本/);
+	assert.match(prompt, /不要给该标签添加 Markdown 加粗/);
+	assert.match(skill, /第一行只写“推荐答案：”，第二行写具体推荐/);
+	assert.match(skill, /不要给“推荐答案”标签添加 Markdown 加粗/);
+});
+
 test("ships Adaptive Delivery resources and the bundled multi-agent entry points", async () => {
 	const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
 	for (const resource of [
@@ -94,7 +105,9 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	);
 	assert.equal(skill.frontmatter.name, "adaptive-delivery");
 	assert.ok(skill.frontmatter.description);
-	assert.match(skill.body, /所有修改型任务/);
+	assert.match(skill.body, /任何源码写入前.*Delivery Contract/);
+	assert.match(skill.body, /只有用户明确输入 `\/delivery-shape` 才能调用 `delivery_begin`/);
+	assert.match(skill.body, /纯问答、只读梳理、状态盘点、诊断和代码评审保持 `IDLE`/);
 	assert.match(skill.body, /同一个 cwd\/worktree 同时只有一个 writer/);
 	assert.match(skill.body, /先用大白话对齐最终效果/);
 	assert.match(skill.body, /方案追问是本 Skill 内置行为/);
@@ -103,7 +116,8 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /所有高影响歧义关闭后立即停止/);
 	assert.match(skill.body, /方案追问面向用户确认产品和范围；oracle 面向高风险技术取舍/);
 	assert.match(skill.body, /普通 SHAPING\/PLANNING 取证由父 Pi 直接使用/);
-	assert.match(skill.body, /不得为了并行或提速调用 scout/);
+	assert.match(skill.body, /公开只读委派只提供高风险 `oracle`/);
+	assert.match(skill.body, /不向模型暴露 scout 或 reviewer/);
 	assert.match(skill.body, /## 技术方案图表/);
 	assert.match(skill.body, /只使用六类受支持 Mermaid/);
 	assert.match(skill.body, /支持图片协议时显示本地 PNG，否则显示 Unicode 字符图/);
@@ -138,6 +152,7 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /## 最终效果/);
 	assert.match(source, /## 第一次使用/);
 	assert.match(source, /\/delivery-shape 继续 P6\.1/);
+	assert.match(source, /普通问答、项目梳理、状态盘点、诊断和代码评审保持 `IDLE`/);
 	assert.match(source, /Package 会在对话区显示批准摘要，立即把已批准技术方案写入项目/);
 	assert.match(source, /当前版本不会合并或覆盖无法证明来源的需求文档/);
 	assert.match(source, /确认 resume.*Package 会自动继续当前阶段/);
@@ -145,7 +160,7 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /父 Pi 看不到 `edit\/write`/);
 	assert.match(source, /固定验证本身不再启动 reviewer 或依赖模型/);
 	assert.match(source, /Package 已把“方案追问”内置/);
-	assert.match(source, /极小、局部、可逆、验收明确且没有用户决策分支的需求默认不追问/);
+	assert.match(source, /满足严格低风险.*Tiny 默认不追问.*升级 Standard\/High-Risk/);
 	assert.match(source, /### 技术方案图表/);
 	assert.match(source, /当前保证六类图/);
 	assert.match(source, /复杂流程不会全部塞进一张大图/);
