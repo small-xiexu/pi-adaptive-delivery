@@ -30,6 +30,8 @@ const RPC_PROTOCOL_VERSION = 1 as const;
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
 
+export const PI_SUBAGENTS_RUNTIME_VERSION = "0.64.0";
+
 export const READONLY_DELEGATE_ROLES = ["scout", "oracle", "reviewer"] as const;
 export type ReadonlyDelegateRole = (typeof READONLY_DELEGATE_ROLES)[number];
 
@@ -210,10 +212,14 @@ export class SubagentBoundary {
 		const requestId = randomUUID();
 		return new Promise((resolve, reject) => {
 			let settled = false;
+			let replyCount = 0;
+			let acceptedData: Record<string, unknown> | undefined;
+			let settleTimer: NodeJS.Timeout | undefined;
 			const finish = (error?: Error, value?: Record<string, unknown>) => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
+				if (settleTimer) clearTimeout(settleTimer);
 				unsubscribe?.();
 				if (error) reject(error);
 				else resolve(value ?? {});
@@ -236,7 +242,13 @@ export class SubagentBoundary {
 					finish(new Error("Incompatible pi-subagents RPC owner"));
 					return;
 				}
-				finish(undefined, data);
+				replyCount += 1;
+				if (replyCount > 1) {
+					finish(new Error("检测到多个 pi-subagents runtime owner；请只保留 Adaptive Delivery bundled runtime"));
+					return;
+				}
+				acceptedData = data;
+				settleTimer = setTimeout(() => finish(undefined, acceptedData), 50);
 			});
 			const timer = setTimeout(() => finish(new Error("pi-subagents RPC owner did not answer ping")), timeoutMs);
 			this.pi.events.emit(RPC_REQUEST_EVENT, {
@@ -254,13 +266,18 @@ export class SubagentBoundary {
 		task: string,
 		ctx: ExtensionContext,
 		gitRoot: string,
+		runId?: string,
 	): Promise<SubagentLaunchContract> {
 		if (!this.sessionId) throw new Error("Subagent boundary is not bound to a session");
+		await this.ping();
 		const result = await resolveSubagentLaunchContract({
 			agent: role,
 			task,
 			context: "fresh",
 			cwd: ctx.cwd,
+			thinking: role === "scout" ? "low" : "high",
+			artifacts: true,
+			...(runId ? { runId } : {}),
 			parentModel: ctx.model
 				? { provider: ctx.model.provider, id: ctx.model.id }
 				: undefined,
@@ -284,6 +301,7 @@ export class SubagentBoundary {
 		gitRoot: string,
 	): Promise<SubagentLaunchContract> {
 		if (!this.sessionId) throw new Error("Subagent boundary is not bound to a session");
+		await this.ping();
 		const result = await resolveSubagentLaunchContract({
 			agent: "worker",
 			task,
@@ -412,14 +430,15 @@ export class SubagentBoundary {
 		role: ReadonlyDelegateRole,
 		task: string,
 		ctx: ExtensionContext,
-		expectedLaunchContractDigest: string,
+		preflightContract: SubagentLaunchContract,
+		gitRoot: string,
 		signal?: AbortSignal,
 		timeoutMs = 120_000,
-	): Promise<{ text: string; runId?: string; launchContractDigest?: string }> {
+	): Promise<{ text: string; runId: string; launchContractDigest: string }> {
 		await this.ping();
 		const requestId = randomUUID();
 		const ownerRunId = `adaptive-delivery-${ctx.sessionManager.getSessionId()}`;
-		const nodeId = `readonly-${role}-${expectedLaunchContractDigest}-${requestId}`;
+		const nodeId = `readonly-${role}-${preflightContract.launchContractDigest}-${requestId}`;
 		const request: SubagentDelegationRequest = {
 			requestId,
 			ownerRunId,
@@ -435,17 +454,19 @@ export class SubagentBoundary {
 
 		return new Promise((resolve, reject) => {
 			let settled = false;
+			let terminalReceived = false;
 			const cleanup = () => {
 				clearTimeout(timer);
 				unsubscribe?.();
 				signal?.removeEventListener("abort", abort);
 			};
-			const finish = (error?: Error, value?: { text: string; runId?: string; launchContractDigest?: string }) => {
+			const finish = (error?: Error, value?: { text: string; runId: string; launchContractDigest: string }) => {
 				if (settled) return;
 				settled = true;
 				cleanup();
 				if (error) reject(error);
-				else resolve(value ?? { text: "" });
+				else if (value) resolve(value);
+				else reject(new Error("Read-only delegation finished without a terminal result"));
 			};
 			const abort = () => {
 				this.pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId, ownerRunId, nodeId });
@@ -454,19 +475,42 @@ export class SubagentBoundary {
 			const unsubscribe = this.pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => {
 				const response = payload as SubagentDelegationResponse;
 				if (response.requestId !== requestId || response.ownerRunId !== ownerRunId || response.nodeId !== nodeId) return;
+				if (terminalReceived) {
+					finish(new Error("Read-only delegation returned duplicate terminal responses"));
+					return;
+				}
+				terminalReceived = true;
 				if (response.status !== "completed" || response.result?.kind !== "text") {
 					finish(new Error(response.error ?? `Read-only delegation failed: ${response.status}`));
 					return;
 				}
-				if (!response.launchContractDigest || response.launchContractDigest !== expectedLaunchContractDigest) {
-					finish(new Error("Read-only delegation terminal launch contract digest is missing or changed"));
+				if (!response.runId) {
+					finish(new Error("Read-only delegation terminal run id is missing"));
 					return;
 				}
-				finish(undefined, {
-					text: response.result.text,
-					...(response.runId ? { runId: response.runId } : {}),
-					...(response.launchContractDigest ? { launchContractDigest: response.launchContractDigest } : {}),
-				});
+				if (!response.launchContractDigest) {
+					finish(new Error("Read-only delegation terminal launch contract digest is missing"));
+					return;
+				}
+				const terminalText = response.result.text;
+				const terminalRunId = response.runId;
+				const terminalDigest = response.launchContractDigest;
+				void this.preflight(role, task, ctx, gitRoot, terminalRunId).then(
+					(terminalContract) => {
+						if (terminalDigest !== terminalContract.launchContractDigest) {
+							finish(new Error("Read-only delegation terminal launch contract digest changed"));
+							return;
+						}
+						finish(undefined, {
+							text: terminalText,
+							runId: terminalRunId,
+							launchContractDigest: terminalDigest,
+						});
+					},
+					(error) => finish(new Error(
+						`Read-only delegation terminal contract cannot be proven: ${error instanceof Error ? error.message : String(error)}`,
+					)),
+				);
 			});
 			const timer = setTimeout(() => {
 				this.pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId, ownerRunId, nodeId });

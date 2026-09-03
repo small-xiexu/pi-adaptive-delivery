@@ -8,6 +8,8 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { DIAGRAM_ENTRY_CUSTOM_TYPE } from "../../extensions/delivery-gate/src/diagrams.ts";
+import { SubagentBoundary } from "../../extensions/delivery-gate/src/subagents.ts";
 import { runApprovedValidation } from "../../extensions/delivery-gate/src/validation.ts";
 
 function baseMessage(model: Model<any>): AssistantMessage {
@@ -61,7 +63,19 @@ function fakeStream(
 			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
 			output.stopReason = "toolUse";
 		} else {
-			const text = "Fake provider completed shaping startup.";
+			const text = process.env.PI_ADAPTIVE_DIAGRAM_PROBE === "1"
+				? [
+					"# 技术方案",
+					"",
+					"```mermaid",
+					"sequenceDiagram",
+					"  actor U as 用户",
+					"  participant P as 父 Pi",
+					"  U->>P: 提出需求",
+					"  P-->>U: 技术方案",
+					"```",
+				].join("\n")
+				: "Fake provider completed shaping startup.";
 			output.content.push({ type: "text", text });
 			stream.push({ type: "text_start", contentIndex: 0, partial: output });
 			stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
@@ -94,6 +108,8 @@ export default function fakeProvider(pi: ExtensionAPI): void {
 		streamSimple: fakeStream,
 	});
 
+	registerDiagramProbe(pi);
+	registerSubagentOwnerProbe(pi);
 	if (process.env.PI_ADAPTIVE_VALIDATION_PROBE !== "1") return;
 	pi.registerCommand("adaptive-validation-probe", {
 		description: "Run the local validation-runtime E2E probe",
@@ -103,15 +119,55 @@ export default function fakeProvider(pi: ExtensionAPI): void {
 					pi,
 					cwd: ctx.cwd,
 					commands: [{
-					id: "runtime-probe",
-					command: "node -e \"process.stdout.write('validation-runtime-ok')\"",
-					timeoutMs: 30_000,
+						id: "runtime-probe",
+						command: "node -e \"process.stdout.write('validation-runtime-ok')\"",
+						timeoutMs: 30_000,
 					}],
 				});
 				ctx.ui.notify(JSON.stringify({ result }), result.status === "passed" ? "info" : "error");
 			} catch (error) {
 				ctx.ui.notify(`validation-probe-error:${error instanceof Error ? error.message : String(error)}`, "error");
 			}
+		},
+	});
+}
+
+function registerSubagentOwnerProbe(pi: ExtensionAPI): void {
+	if (process.env.PI_ADAPTIVE_SUBAGENT_OWNER_PROBE !== "1") return;
+	pi.registerCommand("adaptive-subagent-owner-probe", {
+		description: "Inspect the bundled subagent runtime owner",
+		handler: async (_args, ctx) => {
+			try {
+				const boundary = new SubagentBoundary(pi);
+				await boundary.ping(1_000);
+				const owners = pi.getAllTools()
+					.filter((tool) => tool.name === "subagent")
+					.map((tool) => tool.sourceInfo.path);
+				ctx.ui.notify(JSON.stringify({ owners }), owners.length === 1 ? "info" : "error");
+			} catch (error) {
+				ctx.ui.notify(`subagent-owner-probe-error:${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		},
+	});
+}
+
+export function registerDiagramProbe(pi: ExtensionAPI): void {
+	if (process.env.PI_ADAPTIVE_DIAGRAM_PROBE !== "1") return;
+	pi.registerCommand("adaptive-diagram-probe-status", {
+		description: "Inspect the local diagram-rendering E2E state",
+		handler: async (_args, ctx) => {
+			const branch = ctx.sessionManager.getBranch();
+			const diagram = branch.find(
+				(entry: any) => entry?.type === "custom" && entry.customType === DIAGRAM_ENTRY_CUSTOM_TYPE,
+			) as any;
+			const rawMermaid = branch.some(
+				(entry: any) => entry?.type === "message" && entry.message?.role === "assistant" && JSON.stringify(entry.message.content).includes("sequenceDiagram"),
+			);
+			ctx.ui.notify(JSON.stringify({
+				rawMermaid,
+				diagramKind: diagram?.data?.diagrams?.[0]?.kind,
+				customType: diagram?.customType,
+			}), diagram && rawMermaid ? "info" : "error");
 		},
 	});
 }

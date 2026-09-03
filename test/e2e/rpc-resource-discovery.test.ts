@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -23,8 +24,11 @@ class RpcHarness {
 	private readonly pending = new Map<string, { resolve(value: RpcRecord): void; reject(error: Error): void }>();
 	private stderr = "";
 
-	constructor(cwd: string, agentDir: string, options: { fakeProvider?: boolean; deliveryGate?: boolean; env?: Record<string, string> } = {}) {
+	constructor(cwd: string, agentDir: string, options: { fakeProvider?: boolean; deliveryGate?: boolean; packageManifest?: boolean; env?: Record<string, string> } = {}) {
 		const root = process.cwd();
+		if (options.packageManifest) {
+			writeFileSync(path.join(agentDir, "settings.json"), `${JSON.stringify({ packages: [root] }, null, 2)}\n`);
+		}
 		const fakeProviderArgs = options.fakeProvider
 			? [
 					"--extension",
@@ -33,9 +37,27 @@ class RpcHarness {
 					"adaptive-fake/fake-model",
 					]
 				: [];
-		const deliveryGateArgs = options.deliveryGate === false
+		const deliveryGateArgs = options.deliveryGate === false || options.packageManifest
 			? []
 			: ["--extension", path.join(root, "extensions/delivery-gate/index.ts")];
+		const packageResourceArgs = options.packageManifest
+			? []
+			: [
+					"--no-extensions",
+					"--extension",
+					path.join(root, "node_modules/pi-subagents/index.ts"),
+					...deliveryGateArgs,
+					"--no-skills",
+					"--skill",
+					path.join(root, "skills/adaptive-delivery/SKILL.md"),
+					"--no-prompt-templates",
+					"--prompt-template",
+					path.join(root, "prompts/delivery-shape.md"),
+					"--prompt-template",
+					path.join(root, "prompts/delivery-plan.md"),
+					"--prompt-template",
+					path.join(root, "prompts/delivery-run.md"),
+				]
 		this.process = spawn(
 			process.env.PI_BINARY || "pi",
 			[
@@ -45,21 +67,8 @@ class RpcHarness {
 				"--offline",
 				"--no-context-files",
 				"--no-themes",
-				"--no-extensions",
-					"--extension",
-					path.join(root, "node_modules/pi-subagents/index.ts"),
-					...deliveryGateArgs,
+				...packageResourceArgs,
 				...fakeProviderArgs,
-				"--no-skills",
-				"--skill",
-				path.join(root, "skills/adaptive-delivery/SKILL.md"),
-				"--no-prompt-templates",
-				"--prompt-template",
-				path.join(root, "prompts/delivery-shape.md"),
-				"--prompt-template",
-				path.join(root, "prompts/delivery-plan.md"),
-				"--prompt-template",
-				path.join(root, "prompts/delivery-run.md"),
 			],
 			{
 				cwd,
@@ -201,6 +210,41 @@ test("real Pi RPC discovers package resources without a model call", async () =>
 	}
 });
 
+test("real Pi RPC loads exactly one bundled pi-subagents runtime owner", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-owner-repo-"));
+	execFileSync("git", ["init", "-q"], { cwd });
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-owner-agent-"));
+	const harness = new RpcHarness(cwd, agentDir, {
+		fakeProvider: true,
+		packageManifest: true,
+		env: { PI_ADAPTIVE_SUBAGENT_OWNER_PROBE: "1" },
+	});
+	try {
+		const commandsResponse = await harness.send("get_commands");
+		assert.equal(commandsResponse.success, true);
+		const commandNames = new Set((commandsResponse.data.commands as Array<{ name: string }>).map((command) => command.name));
+		for (const expected of ["parallel-review", "review-loop", "skill:pi-subagents", "skill:council-mode"]) {
+			assert.equal(commandNames.has(expected), true, expected);
+		}
+		const response = await harness.send("prompt", { message: "/adaptive-subagent-owner-probe" });
+		assert.equal(response.success, true);
+		const notification = await harness.waitFor(
+			(record) =>
+				record.type === "extension_ui_request" &&
+				record.method === "notify" &&
+				typeof (record as any).message === "string" &&
+				((record as any).message.includes('"owners"') || (record as any).message.startsWith("subagent-owner-probe-error:")),
+			10_000,
+		);
+		assert.equal((notification as any).message.startsWith("subagent-owner-probe-error:"), false, (notification as any).message);
+		const payload = JSON.parse((notification as any).message);
+		assert.equal(payload.owners.length, 1);
+		assert.match(payload.owners[0], /node_modules[/\\]pi-subagents[/\\]index\.ts$/);
+	} finally {
+		harness.stop();
+	}
+});
+
 test("real Pi RPC runs the shaping tool lifecycle through a local fake provider", async () => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-fake-repo-"));
 	execFileSync("git", ["init", "-q"], { cwd });
@@ -257,6 +301,39 @@ test("real Pi RPC runs the shaping tool lifecycle through a local fake provider"
 			),
 			true,
 		);
+	} finally {
+		harness.stop();
+	}
+});
+
+test("real Pi RPC preserves Mermaid source and appends a display-only diagram entry", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-diagram-repo-"));
+	execFileSync("git", ["init", "-q"], { cwd });
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-diagram-agent-"));
+	const harness = new RpcHarness(cwd, agentDir, {
+		fakeProvider: true,
+		env: { PI_ADAPTIVE_DIAGRAM_PROBE: "1" },
+	});
+	try {
+		const response = await harness.send("prompt", { message: "/delivery-shape Explain the flow" });
+		assert.equal(response.success, true);
+		await harness.waitFor((record) => record.type === "agent_settled", 15000);
+		const status = await harness.send("prompt", { message: "/adaptive-diagram-probe-status" });
+		assert.equal(status.success, true);
+		const notification = await harness.waitFor(
+			(record: any) =>
+				record.type === "extension_ui_request" &&
+				record.method === "notify" &&
+				typeof record.message === "string" &&
+				record.message.includes("pi-adaptive-delivery.diagrams"),
+			10000,
+		);
+		const result = JSON.parse((notification as any).message);
+		assert.deepEqual(result, {
+			rawMermaid: true,
+			diagramKind: "sequence",
+			customType: "pi-adaptive-delivery.diagrams",
+		});
 	} finally {
 		harness.stop();
 	}

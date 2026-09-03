@@ -15,6 +15,13 @@ import {
 	type ApprovalRecord,
 } from "./src/approvals.ts";
 import { createCandidateSnapshot, snapshotProgressArtifact } from "./src/candidate.ts";
+import { renderDiagramEntry } from "./src/diagram-view.ts";
+import {
+	DIAGRAM_ENTRY_CUSTOM_TYPE,
+	extractMermaidDiagrams,
+	transformMermaidForDisplay,
+	type DiagramEntryData,
+} from "./src/diagrams.ts";
 import {
 	validateAuthorizationBundle,
 	type AuthorizationRequirement,
@@ -54,6 +61,7 @@ import {
 } from "./src/planning-documents.ts";
 import {
 	READONLY_DELEGATE_ROLES,
+	PI_SUBAGENTS_RUNTIME_VERSION,
 	SubagentBoundary,
 	type ReadonlyDelegateRole,
 } from "./src/subagents.ts";
@@ -89,6 +97,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	let currentContext: ExtensionContext | undefined;
 	let leaseValid = false;
 	const activeMutationTools = new Map<string, string>();
+	const pendingDiagramEntries: DiagramEntryData[] = [];
 	let activeDeliveryBarrier: { toolCallId: string; toolName: string } | undefined;
 	const leaseStateRoot = process.env.PI_ADAPTIVE_DELIVERY_STATE_DIR?.trim()
 		? path.resolve(process.env.PI_ADAPTIVE_DELIVERY_STATE_DIR)
@@ -102,7 +111,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	}, { baselineKey: leaseStateRoot });
 
 	pi.registerMarkdownTransformer((markdown, context) =>
-		context.messageType === "assistant" ? stripAdaptiveDeliveryProtocol(markdown) : markdown,
+		context.messageType === "assistant"
+			? transformMermaidForDisplay(stripAdaptiveDeliveryProtocol(markdown))
+			: markdown,
+	);
+	pi.registerEntryRenderer<DiagramEntryData>(DIAGRAM_ENTRY_CUSTOM_TYPE, (entry, { expanded }, theme) =>
+		renderDiagramEntry(entry.data, expanded, theme),
 	);
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -740,6 +754,13 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerCommand("delivery-status", {
 		description: "显示 Adaptive Delivery 当前状态",
 		handler: async (_args, ctx) => {
+			let subagentRuntime = `bundled pi-subagents ${PI_SUBAGENTS_RUNTIME_VERSION}（不可证明）`;
+			try {
+				await subagents.ping();
+				subagentRuntime = `bundled pi-subagents ${PI_SUBAGENTS_RUNTIME_VERSION}（唯一 owner）`;
+			} catch (error) {
+				subagentRuntime = `bundled pi-subagents ${PI_SUBAGENTS_RUNTIME_VERSION}（不可证明：${error instanceof Error ? error.message : String(error)}）`;
+			}
 			let writerOwner = "无";
 			if (state.writerLease) {
 				try {
@@ -772,6 +793,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const nextReadyAction = planningApproved ? "Generate the implementation plan" : state.checkpoint?.nextReadyAction;
 			const lines = [
 				`状态：${formatDeliveryState(state.snapshot.state)}`,
+				`子 Agent runtime：${subagentRuntime}`,
 				`恢复状态：${state.snapshot.resumeState ? formatDeliveryState(state.snapshot.resumeState) : "无"}`,
 				`开发方式：${plannedImplementationWriter() === "worker" ? "唯一 worker" : plannedImplementationWriter() === "parent" ? "父 Pi 直接实现" : "待实施计划决定"}`,
 				`开发执行者：${state.workerStatus ? `${formatWorkerStatus(state.workerStatus)}${state.workerRunId ? `（运行 ID：${state.workerRunId}）` : ""}` : "未启动"}`,
@@ -1050,7 +1072,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delivery_delegate_readonly",
 		label: "只读子 Agent 委派",
-		description: "在 Adaptive Delivery 只读阶段调用受限的 native Pi 子 Agent。不能写入项目、运行 gate 或指定 output。",
+		description: "仅在高风险架构顾问或明确需要独立只读视角时调用受限 native Pi 子 Agent。普通方案梳理由父 Pi 直接使用 read/grep/find/ls；终态证明错误不得重试同一任务。",
 		parameters: Type.Object({
 			role: StringEnum(READONLY_DELEGATE_ROLES),
 			task: Type.String({ minLength: 1, maxLength: 20000 }),
@@ -1061,7 +1083,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const identity = await resolveWorkspaceIdentity(ctx.cwd);
 			const task = params.focus ? `${params.task}\n\n只读关注点：${params.focus}` : params.task;
 			const contract = await subagents.preflight(role, task, ctx, identity.gitRoot);
-			const result = await subagents.delegate(role, task, ctx, contract.launchContractDigest, signal);
+			const result = await subagents.delegate(role, task, ctx, contract, identity.gitRoot, signal);
 			return {
 				content: [{ type: "text", text: result.text }],
 				details: {
@@ -1492,7 +1514,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				"Return concrete P0/P1/P2 findings with source proof and a merge verdict.",
 			].join("\n");
 			const contract = await subagents.preflight("reviewer", task, ctx, identity.gitRoot);
-			const result = await subagents.delegate("reviewer", task, ctx, contract.launchContractDigest, signal);
+			const result = await subagents.delegate("reviewer", task, ctx, contract, identity.gitRoot, signal);
 			await requireCurrentCandidate(ctx);
 			const verdictMatches = [...result.text.matchAll(/^Merge verdict:\s*(BLOCK|OK WITH NOTES|OK)\s*$/gim)];
 			const verdict = verdictMatches.length === 1
@@ -1863,6 +1885,26 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
+	pi.on("agent_start", async () => {
+		pendingDiagramEntries.length = 0;
+	});
+	pi.on("message_end", async (event) => {
+		if (event.message.role !== "assistant") return;
+		if (event.message.stopReason === "error" || event.message.stopReason === "aborted") return;
+		const entry = extractMermaidDiagrams(textFromMessageContent(event.message.content));
+		if (!entry || pendingDiagramEntries.some((candidate) => candidate.messageDigest === entry.messageDigest)) return;
+		pendingDiagramEntries.push(entry);
+	});
+	pi.on("agent_end", async (_event, ctx) => {
+		const entries = pendingDiagramEntries.splice(0);
+		for (const entry of entries) {
+			try {
+				pi.appendEntry(DIAGRAM_ENTRY_CUSTOM_TYPE, entry);
+			} catch (error) {
+				ctx.ui.notify(`图表展示记录保存失败，Mermaid 源码仍已保留：${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
+		}
+	});
 	pi.on("session_before_tree", async (_event, _ctx) => {
 		const result = policy.forceReadOnly();
 		if (!result.ok) return { cancel: true };
@@ -1878,6 +1920,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
 	pi.on("session_shutdown", async (_event, ctx) => {
 		currentContext = undefined;
+		pendingDiagramEntries.length = 0;
 		policy.forceReadOnly();
 		subagents.dispose();
 		ctx.ui.setStatus(STATUS_KEY, undefined);

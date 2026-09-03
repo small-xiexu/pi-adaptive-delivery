@@ -19,10 +19,10 @@ function parseFrontmatter(source: string): FrontmatterResult {
 	return { frontmatter, body: match[2]! };
 }
 
-test("ships three discoverable prompt templates and one skill", async () => {
+test("ships Adaptive Delivery resources and the bundled multi-agent entry points", async () => {
 	const manifest = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
 	for (const resource of [
-		manifest.pi.extensions[0],
+		...manifest.pi.extensions,
 		"./prompts/delivery-shape.md",
 		"./prompts/delivery-plan.md",
 		"./prompts/delivery-run.md",
@@ -30,6 +30,11 @@ test("ships three discoverable prompt templates and one skill", async () => {
 	]) {
 		await access(new URL(`../../${resource.replace(/^\.\//, "")}`, import.meta.url));
 	}
+	assert.equal(manifest.dependencies["beautiful-mermaid"], "1.1.3");
+	assert.equal(manifest.dependencies["@resvg/resvg-js"], "2.6.2");
+	assert.equal(manifest.dependencies["@mermaid-js/mermaid-cli"], undefined);
+	assert.equal(manifest.dependencies.puppeteer, undefined);
+	assert.equal(manifest.dependencies["pi-subagents"], "0.64.0");
 });
 
 test("prompt templates have descriptions and preserve phase boundaries", async () => {
@@ -52,7 +57,15 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 	assert.match(prompts[0]!.body, /每次只问一个问题/);
 	assert.match(prompts[0]!.body, /极小.*默认零追问/);
 	assert.match(prompts[0]!.body, /用户可以只回答“按推荐”/);
+	assert.match(prompts[0]!.body, /普通项目取证由父 Pi 直接使用/);
+	assert.match(prompts[0]!.body, /不得重试同一任务/);
 	assert.doesNotMatch(prompts[0]!.body, /一次列出所有问题|同时列出问题清单/);
+	assert.match(prompts[0]!.body, /中大型任务.*1 至 3 张图/);
+	assert.match(prompts[0]!.body, /高风险任务必须用适用图表/);
+	assert.match(prompts[0]!.body, /复杂流程按.*阶段拆图/);
+	assert.match(prompts[0]!.body, /流程\/状态图通常不超过约 10 个主要节点/);
+	assert.match(prompts[0]!.body, /sequenceDiagram.*stateDiagram-v2.*classDiagram.*erDiagram.*xychart-beta/s);
+	assert.match(prompts[0]!.body, /不要调用 Bash、外部服务或额外工具生成图片/);
 	assert.match(prompts[1]!.body, /本阶段禁止项目写入/);
 	assert.match(prompts[1]!.body, /adaptive-delivery:plan:start/);
 	assert.match(prompts[1]!.body, /"version": 2/);
@@ -85,6 +98,13 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /极小需求默认零追问/);
 	assert.match(skill.body, /所有高影响歧义关闭后立即停止/);
 	assert.match(skill.body, /方案追问面向用户确认产品和范围；oracle 面向高风险技术取舍/);
+	assert.match(skill.body, /普通 SHAPING\/PLANNING 取证由父 Pi 直接使用/);
+	assert.match(skill.body, /不得为了并行或提速调用 scout/);
+	assert.match(skill.body, /## 技术方案图表/);
+	assert.match(skill.body, /只使用六类受支持 Mermaid/);
+	assert.match(skill.body, /支持图片协议时显示本地 PNG，否则显示 Unicode 字符图/);
+	assert.match(skill.body, /每张图只回答一个主要问题/);
+	assert.match(skill.body, /复杂流程按阶段或职责拆成 2 至 3 张图/);
 	assert.match(skill.body, /可验证关闭义务/);
 	assert.match(skill.body, /一次 closure review/);
 	assert.match(skill.body, /同一最小复现仍失败/);
@@ -119,6 +139,10 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /固定验证本身不再启动 reviewer 或依赖模型/);
 	assert.match(source, /Package 已把“方案追问”内置/);
 	assert.match(source, /极小、局部、可逆、验收明确且没有用户决策分支的需求默认不追问/);
+	assert.match(source, /### 技术方案图表/);
+	assert.match(source, /当前保证六类图/);
+	assert.match(source, /复杂流程不会全部塞进一张大图/);
+	assert.match(source, /不使用 `mmdc`\/Chromium，不上传源码/);
 	assert.match(source, /defaultTtlMs.*300000/s);
 	assert.match(source, /## 常见恢复/);
 	assert.ok(source.indexOf("## 第一次使用") < source.indexOf("## 维护者参考"));

@@ -10,7 +10,7 @@ import { SubagentBoundary } from "../../extensions/delivery-gate/src/subagents.t
 
 const execFileAsync = promisify(execFile);
 
-test("preflights the builtin scout through the bundled public API", async () => {
+test("preflights and rebinds the builtin scout contract to its terminal run id", async () => {
 	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-preflight-agent-"));
 	const repo = await mkdtemp(path.join(os.tmpdir(), "adaptive-preflight-repo-"));
 	await execFileAsync("git", ["init", "-q"], { cwd: repo });
@@ -30,7 +30,28 @@ test("preflights the builtin scout through the bundled public API", async () => 
 			contextWindow: 100000,
 			maxTokens: 4096,
 		};
-		const boundary = new SubagentBoundary({ events: { on: () => () => {}, emit: () => {} } } as any);
+		const listeners = new Map<string, Set<(payload: unknown) => void>>();
+		const events = {
+			on(event: string, handler: (payload: unknown) => void) {
+				const handlers = listeners.get(event) ?? new Set();
+				handlers.add(handler);
+				listeners.set(event, handlers);
+				return () => handlers.delete(handler);
+			},
+			emit(event: string, payload: any) {
+				for (const handler of listeners.get(event) ?? []) handler(payload);
+			},
+		};
+		events.on("subagents:rpc:v1:request", (payload: any) => {
+			if (payload.method !== "ping") return;
+			events.emit(`subagents:rpc:v1:reply:${payload.requestId}`, {
+				version: 1,
+				requestId: payload.requestId,
+				success: true,
+				data: { version: 1, methods: ["ping"] },
+			});
+		});
+		const boundary = new SubagentBoundary({ events } as any);
 		boundary.bindSession("preflight-session");
 		boundary.applyAccess("readonly");
 		const contract = await boundary.preflight(
@@ -59,6 +80,28 @@ test("preflights the builtin scout through the bundled public API", async () => 
 		assert.equal(contract.tools.capabilityAudit?.extensionsDenied, true);
 		assert.deepEqual(contract.tools.effectiveMcpTools, []);
 		assert.ok(contract.launchContractDigest);
+
+		const terminalContract = await boundary.preflight(
+			"scout",
+			"Inspect the repository without modifying files.",
+			{
+				cwd: repo,
+				model,
+				thinkingLevel: "low",
+				modelRegistry: { getAvailable: () => [model] },
+				sessionManager: {
+					getSessionFile: () => undefined,
+					getLeafId: () => undefined,
+				},
+			} as any,
+			repo,
+			"terminal-run",
+		);
+		assert.notEqual(terminalContract.launchContractDigest, contract.launchContractDigest);
+		assert.match(contract.roots.outputPath ?? "", /outputs[/\\]preflight[/\\]context\.md$/);
+		assert.match(terminalContract.roots.outputPath ?? "", /outputs[/\\]terminal-run[/\\]context\.md$/);
+		assert.deepEqual(terminalContract.tools.effectiveAllowlist, contract.tools.effectiveAllowlist);
+		assert.equal(terminalContract.tools.capabilityAudit?.extensionsDenied, true);
 		boundary.dispose();
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

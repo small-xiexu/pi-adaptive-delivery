@@ -51,7 +51,7 @@ function contract(overrides: Record<string, unknown> = {}): SubagentLaunchContra
 			capabilityAudit: { extensionsDenied: true },
 		},
 		roots: { cwd: "/repo" },
-		protocol: { lifecycleArtifactVersion: 1, packageVersion: "0.62.0" },
+		protocol: { lifecycleArtifactVersion: 1, packageVersion: "0.64.0" },
 		diagnostics: [],
 		launchContractDigest: "launch-digest",
 		digest: "contract-digest",
@@ -189,38 +189,70 @@ test("accepts only the builtin fresh worker with the bounded mutation tools", as
 });
 
 test("validates RPC ping and structured delegation response", async () => {
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-delegation-agent-"));
+	const repo = await mkdtemp(path.join(os.tmpdir(), "adaptive-delegation-repo-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	const { pi, events } = createEventPi();
 	const boundary = new SubagentBoundary(pi);
-	boundary.bindSession(`session-${crypto.randomUUID()}`);
+	const sessionId = `session-${crypto.randomUUID()}`;
+	const model = {
+		id: "adaptive-test-model",
+		name: "Adaptive Test Model",
+		provider: "adaptive-test",
+		api: "openai-responses",
+		baseUrl: "http://127.0.0.1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 100000,
+		maxTokens: 4096,
+	};
+	const ctx = {
+		cwd: repo,
+		model,
+		modelRegistry: { getAvailable: () => [model] },
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getSessionFile: () => undefined,
+			getLeafId: () => undefined,
+		},
+	} as any;
 
-	installPingResponder(events);
-	events.on("prompt-template:subagent:request", (payload: any) => {
-		events.emit("prompt-template:subagent:response", {
-			requestId: payload.requestId,
-			ownerRunId: payload.ownerRunId,
-			nodeId: payload.nodeId,
-			status: "completed",
-			runId: "child-run",
-			launchContractDigest: "launch-digest",
-			result: { kind: "text", text: "read-only result" },
+	try {
+		boundary.bindSession(sessionId);
+		boundary.applyAccess("readonly");
+		installPingResponder(events);
+		const task = "Inspect code";
+		const initialContract = await boundary.preflight("scout", task, ctx, repo);
+		const terminalContract = await boundary.preflight("scout", task, ctx, repo, "child-run");
+		assert.notEqual(initialContract.launchContractDigest, terminalContract.launchContractDigest);
+		assert.match(initialContract.roots.outputPath ?? "", /outputs[/\\]preflight[/\\]context\.md$/);
+		assert.match(terminalContract.roots.outputPath ?? "", /outputs[/\\]child-run[/\\]context\.md$/);
+
+		events.on("prompt-template:subagent:request", (payload: any) => {
+			events.emit("prompt-template:subagent:response", {
+				requestId: payload.requestId,
+				ownerRunId: payload.ownerRunId,
+				nodeId: payload.nodeId,
+				status: "completed",
+				runId: "child-run",
+				launchContractDigest: terminalContract.launchContractDigest,
+				result: { kind: "text", text: "read-only result" },
+			});
 		});
-	});
 
-	const result = await boundary.delegate(
-		"scout",
-		"Inspect code",
-		{
-			cwd: process.cwd(),
-			sessionManager: { getSessionId: () => "session-1" },
-		} as any,
-		"launch-digest",
-	);
-	assert.deepEqual(result, {
-		text: "read-only result",
-		runId: "child-run",
-		launchContractDigest: "launch-digest",
-	});
-	boundary.dispose();
+		const result = await boundary.delegate("scout", task, ctx, initialContract, repo);
+		assert.deepEqual(result, {
+			text: "read-only result",
+			runId: "child-run",
+			launchContractDigest: terminalContract.launchContractDigest,
+		});
+	} finally {
+		boundary.dispose();
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	}
 });
 
 test("requires exact run and launch proof for a controlled worker terminal response", async () => {
@@ -300,7 +332,8 @@ test("fails closed for duplicate or failed delegation responses", async () => {
 				"scout",
 				"Inspect",
 				{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-				"launch-digest",
+				contract(),
+				process.cwd(),
 			),
 			new RegExp(`${status} error`),
 		);
@@ -317,6 +350,7 @@ test("rejects a completed read-only response without the preflight digest", asyn
 			ownerRunId: payload.ownerRunId,
 			nodeId: payload.nodeId,
 			status: "completed",
+			runId: "child-run",
 			result: { kind: "text", text: "unsafe result" },
 		});
 	});
@@ -325,9 +359,10 @@ test("rejects a completed read-only response without the preflight digest", asyn
 			"scout",
 			"Inspect",
 			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-			"a".repeat(64),
+			contract({ launchContractDigest: "a".repeat(64) }),
+			process.cwd(),
 		),
-		/digest is missing or changed/,
+		/digest is missing/,
 	);
 });
 
@@ -342,7 +377,8 @@ test("aborts and times out delegation with an exact cancellation identity", asyn
 			"scout",
 			"Inspect",
 			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-			"launch-digest",
+			contract(),
+			process.cwd(),
 			controller.signal,
 		),
 		/aborted/,
@@ -360,7 +396,8 @@ test("aborts and times out delegation with an exact cancellation identity", asyn
 			"scout",
 			"Inspect",
 			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-			"launch-digest",
+			contract(),
+			process.cwd(),
 			undefined,
 			5,
 		),
@@ -376,4 +413,21 @@ test("ping fails closed when no runtime owner answers", async () => {
 	const { pi } = createEventPi();
 	const boundary = new SubagentBoundary(pi);
 	await assert.rejects(boundary.ping(5), /did not answer/);
+});
+
+test("ping fails before delegation when multiple runtime owners answer", async () => {
+	const { pi, events } = createEventPi();
+	const boundary = new SubagentBoundary(pi);
+	events.on("subagents:rpc:v1:request", (payload: any) => {
+		if (payload.method !== "ping") return;
+		for (let index = 0; index < 2; index += 1) {
+			events.emit(`subagents:rpc:v1:reply:${payload.requestId}`, {
+				version: 1,
+				requestId: payload.requestId,
+				success: true,
+				data: { version: 1, methods: ["ping"] },
+			});
+		}
+	});
+	await assert.rejects(boundary.ping(100), /多个 pi-subagents runtime owner/);
 });

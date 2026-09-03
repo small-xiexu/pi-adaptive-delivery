@@ -27,8 +27,12 @@ test("extracts exactly one marked solution and plan document", () => {
 			"<!-- adaptive-delivery:solution:start -->",
 			"# Canvas写路径拆分技术方案",
 			"```ts",
-			"const value = true;",
-			"```",
+				"const value = true;",
+				"```",
+				"```mermaid",
+				"sequenceDiagram",
+				"  用户->>父Pi: 批准技术方案",
+				"```",
 			"```adaptive-delivery-documents",
 			'{"version":1}',
 			"```",
@@ -40,6 +44,7 @@ test("extracts exactly one marked solution and plan document", () => {
 	}];
 	const solution = extractPlanningDocumentContent(content, "solution") ?? "";
 	assert.match(solution, /const value = true/);
+	assert.match(solution, /```mermaid\nsequenceDiagram/);
 	assert.doesNotMatch(solution, /adaptive-delivery-documents|"version"/);
 	assert.match(extractPlanningDocumentContent(content, "plan") ?? "", /实施计划/);
 	assert.equal(extractPlanningDocumentContent(`${content[0]!.text}\n${content[0]!.text}`, "solution"), undefined);
@@ -65,11 +70,12 @@ test("hides complete and streaming protocol blocks without changing ordinary Mar
 
 test("creates two requirement-named Markdown documents and records evidence", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-planning-docs-"));
-	const solutionContent = "# Canvas写路径拆分技术方案\n\n保持 API 行为不变。\n";
+	const solutionContent = "# Canvas写路径拆分技术方案\n\n保持 API 行为不变。\n\n```mermaid\nflowchart LR\n  A[旧路径] --> B[新边界]\n```\n";
 	const planContent = "# Canvas写路径拆分实施计划\n\n运行聚焦测试。\n";
 	const evidence = await writePlanningDocuments({ gitRoot: root, documents, solutionContent, planContent });
 
 	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), solutionContent);
+	assert.match(await readFile(path.join(root, documents.solutionPath), "utf8"), /```mermaid\nflowchart LR/);
 	assert.equal(await readFile(path.join(root, documents.planPath), "utf8"), planContent);
 	assert.deepEqual(parsePlanningDocumentEvidence(evidence), evidence);
 	await assertPlanningDocumentsExist(root, evidence);

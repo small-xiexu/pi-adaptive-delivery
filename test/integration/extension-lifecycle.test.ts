@@ -10,6 +10,7 @@ import { resolveCurrentSubagentCapabilityCeiling } from "pi-subagents/capability
 
 import deliveryGate from "../../extensions/delivery-gate/index.ts";
 import { digestApprovalContent } from "../../extensions/delivery-gate/src/approvals.ts";
+import { DIAGRAM_ENTRY_CUSTOM_TYPE } from "../../extensions/delivery-gate/src/diagrams.ts";
 import { digestPlanningDocumentContent } from "../../extensions/delivery-gate/src/planning-documents.ts";
 import {
 	DELIVERY_STATE_CUSTOM_TYPE,
@@ -82,6 +83,7 @@ function createHarness(
 	const eventListeners = new Map<string, Set<(payload: unknown) => void>>();
 	const emittedEvents: Array<{ event: string; payload: any }> = [];
 	const markdownTransformers: Array<(markdown: string, context: { messageType: string }) => string> = [];
+	const entryRenderers = new Map<string, Handler>();
 	const sentMessages: Array<{ message: any; options?: any }> = [];
 	const sentUserMessages: Array<{ content: any; options?: any }> = [];
 	let activeTools = [...(options.initialActiveTools ?? ["read", "grep", "find", "ls", "edit", "write", "bash", "subagent", "bg_wait"])];
@@ -149,6 +151,9 @@ function createHarness(
 		registerMarkdownTransformer: (transformer: (markdown: string, context: { messageType: string }) => string) => {
 			markdownTransformers.push(transformer);
 		},
+		registerEntryRenderer: (customType: string, renderer: Handler) => {
+			entryRenderers.set(customType, renderer);
+		},
 		exec: async (command: string, args: string[]) => {
 			execCalls.push({ command, args: [...args] });
 			return { ...execResult };
@@ -202,6 +207,17 @@ function createHarness(
 		if (previousStateDir === undefined) delete process.env.PI_ADAPTIVE_DELIVERY_STATE_DIR;
 		else process.env.PI_ADAPTIVE_DELIVERY_STATE_DIR = previousStateDir;
 	}
+	eventListeners.set("subagents:rpc:v1:request", new Set([(payload: any) => {
+		if (payload.method !== "ping") return;
+		for (const handler of eventListeners.get(`subagents:rpc:v1:reply:${payload.requestId}`) ?? []) {
+			handler({
+				version: 1,
+				requestId: payload.requestId,
+				success: true,
+				data: { version: 1, methods: ["ping"], capabilities: { asyncSpawn: true } },
+			});
+		}
+	}]));
 
 	return {
 		handlers,
@@ -217,6 +233,7 @@ function createHarness(
 		eventListeners,
 		emittedEvents,
 		markdownTransformers,
+		entryRenderers,
 		getActiveTools: () => [...activeTools],
 		setActiveTools: (names: string[]) => {
 			setActiveToolsCalls += 1;
@@ -512,6 +529,7 @@ test("restores IDLE as read-only and exposes Chinese status", async () => {
 	await harness.commands.get("delivery-status")?.handler("", harness.ctx);
 	const statusText = harness.ui.notifications.at(-1)?.[0] ?? "";
 	assert.match(statusText, /状态：空闲 \[IDLE\]/);
+	assert.match(statusText, /子 Agent runtime：bundled pi-subagents 0\.64\.0（唯一 owner）/);
 	assert.match(statusText, /恢复状态：无/);
 	assert.match(statusText, /开发方式：待实施计划决定/);
 	assert.match(statusText, /写入者：无/);
@@ -547,6 +565,40 @@ test("registers a display-only transformer that hides internal protocol from ass
 	const transformed = harness.markdownTransformers[0]!(markdown, { messageType: "assistant" });
 	assert.equal(transformed, "# 用户可见技术方案");
 	assert.equal(harness.markdownTransformers[0]!(markdown, { messageType: "user" }), markdown);
+});
+
+test("collects assistant Mermaid at message end and appends display-only diagrams after agent end", async () => {
+	const harness = createHarness();
+	const markdown = [
+		"# 技术方案",
+		"",
+		"```mermaid",
+		"sequenceDiagram",
+		"  actor U as 用户",
+		"  participant P as 父 Pi",
+		"  U->>P: 提出需求",
+		"```",
+	].join("\n");
+	const transformed = harness.markdownTransformers[0]!(markdown, { messageType: "assistant" });
+	assert.doesNotMatch(transformed, /sequenceDiagram/);
+	assert.match(transformed, /时序图 1 已在下方渲染/);
+	assert.equal(harness.entryRenderers.has(DIAGRAM_ENTRY_CUSTOM_TYPE), true);
+
+	await emit(harness, "agent_start");
+	await emitWithResults(harness, "message_end", {
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: markdown }],
+			stopReason: "stop",
+		},
+	});
+	assert.equal(harness.appendedEntries.some((entry) => entry.customType === DIAGRAM_ENTRY_CUSTOM_TYPE), false);
+	await emit(harness, "agent_end");
+
+	const diagrams = harness.appendedEntries.filter((entry) => entry.customType === DIAGRAM_ENTRY_CUSTOM_TYPE);
+	assert.equal(diagrams.length, 1);
+	assert.equal((diagrams[0]!.data as any).diagrams[0].kind, "sequence");
+	assert.match((diagrams[0]!.data as any).diagrams[0].ascii, /提出需求/);
 });
 
 test("begins shaping from IDLE without granting write access", async () => {

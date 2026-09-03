@@ -29,6 +29,8 @@ Package 不会自动 commit、push、创建 PR、发布 npm、部署或操作生
 
 ## 安装
 
+安装前先运行 `pi list`。本 Package 已内置并加载唯一的 `pi-subagents` runtime；若用户或项目设置中已经单独启用了 `npm:pi-subagents`，应先移除该独立 Package，再安装 Adaptive Delivery。两份 runtime 同时存在时，Package 会在启动 child 前明确阻止，不会继续产生子 Agent 费用。
+
 ### 推荐：只安装到一个项目
 
 进入目标 Git 项目：
@@ -36,23 +38,22 @@ Package 不会自动 commit、push、创建 PR、发布 npm、部署或操作生
 ```bash
 cd /path/to/your-project
 
-pi install -l npm:pi-subagents
 pi install -l git:github.com/small-xiexu/pi-adaptive-delivery
 ```
 
 本地开发 Package 时使用绝对路径：
 
 ```bash
-pi install -l npm:pi-subagents
 pi install -l /absolute/path/to/pi-adaptive-delivery
 ```
 
 项目级安装会创建 `.pi/settings.json`，只影响当前项目。`.pi/npm/.gitignore` 用于避免提交下载的 npm 依赖。
 
+如果 `pi-subagents` 已作为全局 Package 启用，项目级过滤不能保证卸载 project-trust 阶段已经启动的全局 Extension。此时应先在隔离的 `PI_CODING_AGENT_DIR` 测试，或把全局独立 `pi-subagents` 迁移为全局 Adaptive Delivery，不能让两个 owner 共存。
+
 ### 安装到所有 Pi 项目
 
 ```bash
-pi install npm:pi-subagents
 pi install git:github.com/small-xiexu/pi-adaptive-delivery
 ```
 
@@ -111,6 +112,20 @@ Package 已把“方案追问”内置到 `adaptive-delivery`，不依赖额外�
 ```
 
 实现偏好、命名、未来扩展以及能从代码和文档查明的内容不会拿来反复询问你。
+
+### 技术方案图表
+
+技术方案遇到多步骤流程、跨模块调用、状态变化、模块关系、数据流或高风险信任边界时，会按需生成 Mermaid 流程图、时序图或状态图等。极小单步骤需求不会为了形式强制画图；中大型任务通常使用最有帮助的 1 至 3 张，高风险任务必须画清适用的关键路径。
+
+复杂流程不会全部塞进一张大图。Package 会让父 Pi 按阶段拆成 2 至 3 张图，每张只说明一个主要问题，并使用简短节点文字，避免 TUI 为了显示完整画布把文字缩得过小。图片可以占用可滚动的终端高度，不要求同屏看完整张图。
+
+你不需要执行额外命令。Package 会保留技术方案中的标准 Mermaid 源码，并在 assistant 回合结束后自动展示：
+
+- Kitty、iTerm2、Ghostty、WezTerm、Warp：显示本地生成的高密度 PNG，使用当前终端全部可用宽度并保持原始比例；长图通过终端滚动查看。
+- 不支持图片协议的终端：显示 Unicode 字符图。
+- 不支持的图形或渲染失败：显示中文原因和原始源码。
+
+当前保证六类图：流程图、时序图、状态图、类图、ER 图和 XY 图。渲染完全在本机内存中完成，不使用 `mmdc`/Chromium，不上传源码，也不写入目标 Git 工作区。原始 Mermaid 仍会写入需求技术方案 Markdown，因此 GitHub 或支持 Mermaid 的 IDE 也可以继续渲染。
 
 ## 你需要做的批准
 
@@ -312,7 +327,7 @@ approve、resume 和 force-release 只接受真实 TUI 用户确认。RPC、JSON
 
 - Pi `0.84.4`
 - Node.js `>=22.19.0`
-- `pi-subagents 0.62.0`
+- bundled `pi-subagents 0.64.0`
 - macOS
 - 受信任的单 Git 仓库或 managed worktree
 
@@ -333,7 +348,7 @@ Package 和 Extension 以当前用户权限运行。writer lease 只约束加载
 
 ## Agent 与模型
 
-`pi-subagents` 必须作为独立 Pi Package 安装并启用；本 Package bundled 的副本只提供公开 TypeScript API，不重复注册 Extension、Prompt、Skill 或 Agent runtime。
+Package 内部固定携带并加载 `pi-subagents 0.64.0` 作为唯一子 Agent runtime owner，并暴露同版本的 builtin Agents、Skill 和 Prompt。不要再单独安装或启用另一份 `pi-subagents`；检测到多个 owner 时，Package 会在启动 child 前失败并提示清理，不产生子 Agent 费用。
 
 Package 使用稳定角色：
 
@@ -364,9 +379,9 @@ Package 不硬编码 Provider 或模型。角色模型由用户级 `subagents.ag
 }
 ```
 
-Package 会在实施计划批准前做只读 preflight；没有任何可用 reviewer candidate 时不会创建文档、获取 writer lease 或进入实现，因为后续 fresh review 无法完成。固定验证本身不再启动 reviewer 或依赖模型：`delivery_validate` 只执行已批准命令，并在当前工具卡显示当前命令、退出码和耗时。命令失败只表示批准验证未通过；父 Pi 必须再判断原因是候选代码、验证环境还是计划错误，不能一律修改源码。
+普通方案梳理由父 Pi 直接使用只读工具完成，不为提速启动 scout。Package 会在实施计划批准前做只读 preflight；没有任何可用 reviewer candidate 时不会创建文档、获取 writer lease 或进入实现，因为后续 fresh review 无法完成。固定验证本身不再启动 reviewer 或依赖模型：`delivery_validate` 只执行已批准命令，并在当前工具卡显示当前命令、退出码和耗时。命令失败只表示批准验证未通过；父 Pi 必须再判断原因是候选代码、验证环境还是计划错误，不能一律修改源码。
 
-模型临时排除由独立的 `pi-subagents` runtime 管理。其默认 TTL 可在 `~/.pi/agent/extensions/subagent/config.json` 调整，例如把单次瞬时错误的冷却设为 5 分钟：
+模型临时排除由 bundled `pi-subagents` runtime 管理。其默认 TTL 可在 `~/.pi/agent/extensions/subagent/config.json` 调整，例如把单次瞬时错误的冷却设为 5 分钟：
 
 ```json
 {
@@ -385,11 +400,12 @@ Package 会在实施计划批准前做只读 preflight；没有任何可用 revi
 项目级安装先进入对应项目，再使用 `pi list` 确认精确 source，然后执行：
 
 ```bash
-pi remove -l npm:pi-subagents
 pi remove -l git:github.com/small-xiexu/pi-adaptive-delivery
 ```
 
-本地路径安装应把第二条 source 换成原绝对路径。全局安装去掉 `-l`。
+本地路径安装使用 `pi list` 找到原绝对路径 source 后移除。全局安装去掉 `-l`。
+
+卸载 Adaptive Delivery 后如需继续单独使用 `pi-subagents`，再显式安装所需的固定版本；不要在 Adaptive Delivery 仍启用时并行安装。
 
 卸载不会自动删除 Session custom entries、已经创建的需求文档或可能保留的 writer lease。卸载前先用 `/delivery-status` 确认没有活动 writer；未知 lease 应完成恢复或由用户确认 force-release。
 
