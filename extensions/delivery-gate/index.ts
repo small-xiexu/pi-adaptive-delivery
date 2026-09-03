@@ -881,6 +881,13 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					: "Technical solution approved"
 				: state.checkpoint?.summary;
 			const nextReadyAction = planningApproved ? "Generate the implementation plan" : state.checkpoint?.nextReadyAction;
+			const progressSummary = state.checkpoint?.summary;
+			const progressStatus = progressSummary && (
+				progressSummary.startsWith("progress-sync") ||
+				progressSummary.startsWith("Project progress synchronized:")
+			)
+				? formatRuntimeText(progressSummary)
+				: "未运行";
 			const lines = [
 				`状态：${formatDeliveryState(state.snapshot.state)}`,
 				`子 Agent runtime：${subagentRuntime}`,
@@ -899,7 +906,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					: state.proposedDocuments
 						? `${state.proposedDocuments.requirementName}（${state.proposedDocuments.solutionPath}，${state.proposedDocuments.planPath}；待同步）`
 						: "不可证明"}`,
-				`进度同步：${state.checkpoint?.summary?.startsWith("progress-sync") ? formatRuntimeText(state.checkpoint.summary) : "未运行"}`,
+				`进度同步：${progressStatus}`,
 				...(state.blockingReason ? [`阻塞原因：${formatRuntimeText(state.blockingReason)}`] : []),
 				...(state.recoveryCondition ? [`恢复条件：${formatRuntimeText(state.recoveryCondition)}`] : []),
 				...(checkpointSummary ? [`断点：${formatRuntimeText(checkpointSummary)}`] : []),

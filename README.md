@@ -380,7 +380,7 @@ Package 不硬编码 Provider 或模型。角色模型由用户级 `subagents.ag
 }
 ```
 
-普通方案梳理由父 Pi 直接使用只读工具完成，不为提速启动 scout。Package 会在实施计划批准前做只读 preflight；没有任何可用 reviewer candidate 时不会创建文档、获取 writer lease 或进入实现，因为后续 fresh review 无法完成。固定验证本身不再启动 reviewer 或依赖模型：`delivery_validate` 只执行已批准命令，并在当前工具卡显示当前命令、退出码和耗时。命令失败只表示批准验证未通过；父 Pi 必须再判断原因是候选代码、验证环境还是计划错误，不能一律修改源码。
+普通方案梳理由父 Pi 直接使用只读工具完成，不为提速启动 scout。Package 会在实施计划批准前做只读 preflight；没有任何可用 reviewer candidate 时，已经批准并同步的技术方案会保留，但不会创建实施计划、获取实施阶段 writer lease 或进入实现，因为后续 fresh review 无法完成。固定验证本身不再启动 reviewer 或依赖模型：`delivery_validate` 只执行已批准命令，并在当前工具卡显示当前命令、退出码和耗时。命令失败只表示批准验证未通过；父 Pi 必须再判断原因是候选代码、验证环境还是计划错误，不能一律修改源码。
 
 模型临时排除由 bundled `pi-subagents` runtime 管理。其默认 TTL 可在 `~/.pi/agent/extensions/subagent/config.json` 调整，例如把单次瞬时错误的冷却设为 5 分钟：
 

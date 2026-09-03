@@ -18,6 +18,40 @@ interface RpcRecord {
 	statusText?: string;
 }
 
+const INHERITED_RPC_ENV_KEYS = [
+	"PATH",
+	"HOME",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"SystemRoot",
+	"WINDIR",
+	"ComSpec",
+	"PATHEXT",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"TERM",
+] as const;
+
+function isolatedRpcEnvironment(
+	agentDir: string,
+	overrides: Record<string, string> = {},
+	inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const base: NodeJS.ProcessEnv = {};
+	for (const key of INHERITED_RPC_ENV_KEYS) {
+		if (inherited[key] !== undefined) base[key] = inherited[key];
+	}
+	return {
+		...base,
+		PI_CODING_AGENT_DIR: agentDir,
+		PI_OFFLINE: "1",
+		PI_ADAPTIVE_DELIVERY_STATE_DIR: path.join(agentDir, "adaptive-delivery"),
+		...overrides,
+	};
+}
+
 class RpcHarness {
 	readonly process: ChildProcessWithoutNullStreams;
 	readonly records: RpcRecord[] = [];
@@ -72,13 +106,7 @@ class RpcHarness {
 			],
 			{
 				cwd,
-				env: {
-					...process.env,
-					PI_CODING_AGENT_DIR: agentDir,
-						PI_OFFLINE: "1",
-						PI_ADAPTIVE_DELIVERY_STATE_DIR: path.join(agentDir, "adaptive-delivery"),
-						...options.env,
-				},
+				env: isolatedRpcEnvironment(agentDir, options.env),
 				stdio: ["pipe", "pipe", "pipe"],
 			},
 		);
@@ -169,6 +197,29 @@ class RpcHarness {
 		this.process.kill("SIGTERM");
 	}
 }
+
+test("real Pi RPC child environment excludes ambient provider credentials", () => {
+	const env = isolatedRpcEnvironment(
+		"/tmp/adaptive-rpc-agent",
+		{ PI_ADAPTIVE_TEST_PROBE: "enabled" },
+		{
+			PATH: "/usr/bin:/bin",
+			HOME: "/tmp/home",
+			OPENAI_API_KEY: "secret",
+			ANTHROPIC_API_KEY: "secret",
+			AWS_SECRET_ACCESS_KEY: "secret",
+			GITHUB_TOKEN: "secret",
+		},
+	);
+
+	assert.equal(env.PATH, "/usr/bin:/bin");
+	assert.equal(env.PI_OFFLINE, "1");
+	assert.equal(env.PI_ADAPTIVE_TEST_PROBE, "enabled");
+	assert.equal(env.OPENAI_API_KEY, undefined);
+	assert.equal(env.ANTHROPIC_API_KEY, undefined);
+	assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+	assert.equal(env.GITHUB_TOKEN, undefined);
+});
 
 test("real Pi RPC discovers package resources without a model call", async () => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-repo-"));

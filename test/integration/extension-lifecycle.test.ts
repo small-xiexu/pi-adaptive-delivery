@@ -2005,6 +2005,8 @@ test("syncs only the approved progress target at a writer-free boundary", async 
 	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: complete/);
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "验证中 [VALIDATING]"]);
 	assert.equal(harness.execCalls.some((call) => call.command === "git" && call.args.includes("--check")), true);
+	await harness.commands.get("delivery-status")?.handler("", harness.ctx);
+	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /进度同步：项目进度已同步：/);
 	await assert.rejects(
 		progress.execute(
 			"progress-escape",
