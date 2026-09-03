@@ -55,9 +55,13 @@ import {
 } from "./src/plan-contract.ts";
 import {
 	assertPlanningDocumentsExist,
+	assertSolutionDocumentCurrent,
 	extractPlanningDocumentContent,
 	stripAdaptiveDeliveryProtocol,
+	writePlanDocument,
 	writePlanningDocuments,
+	writeSolutionDocument,
+	type PlanningDocumentEvidence,
 } from "./src/planning-documents.ts";
 import {
 	READONLY_DELEGATE_ROLES,
@@ -343,6 +347,13 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			gitRoot: identity.gitRoot,
 		}, requirement);
 		if (!result.ok) return result.reason;
+		if (state.solutionDocument) {
+			try {
+				await assertSolutionDocumentCurrent(identity.gitRoot, state.solutionDocument);
+			} catch (error) {
+				return `Technical solution document cannot be proven: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
 		if (state.planningDocuments) {
 			try {
 				await assertPlanningDocumentsExist(identity.gitRoot, state.planningDocuments);
@@ -502,7 +513,10 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}), content: entry.message.content };
 	}
 
-	async function ensureParentWriterLease(ctx: ExtensionContext): Promise<boolean> {
+	async function ensureParentWriterLease(
+		ctx: ExtensionContext,
+		blockedResumeState: ResumeState = "IMPLEMENTING",
+	): Promise<boolean> {
 		if (state.writerLease && (await writerLeases.isCurrentOwner(state.writerLease))) {
 			leaseValid = true;
 			return true;
@@ -516,7 +530,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		if (!acquired.ok) {
 			setBlocked(
 				`${acquired.reason}${acquired.existing ? `；owner=${acquired.existing.owner.sessionId}` : ""}`,
-				"IMPLEMENTING",
+				blockedResumeState,
 			);
 			persistCurrentState();
 			updateStatus(ctx);
@@ -600,6 +614,22 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			ctx.ui.notify("当前方案缺少唯一有效的 adaptive-delivery-documents 契约。", "error");
 			return;
 		}
+		const solutionOnlyContent = kind === "solution"
+			? extractPlanningDocumentContent(target.content, "solution")
+			: undefined;
+		if (kind === "solution" && !solutionOnlyContent) {
+			ctx.ui.notify("技术方案缺少唯一有效的规划文档内容标记。", "error");
+			return;
+		}
+		if (
+			kind === "solution" &&
+			state.solutionDocument &&
+			(!state.proposedDocuments ||
+				digestApprovalContent(proposedDocuments) !== digestApprovalContent(state.proposedDocuments))
+		) {
+			ctx.ui.notify("修订后的技术方案必须继续使用已落盘的需求名称和文档路径。", "error");
+			return;
+		}
 		if (
 			planContract &&
 			digestApprovalContent(proposedDocuments) !== digestApprovalContent(planContract.documents)
@@ -661,19 +691,60 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			ctx.ui.notify(formatRuntimeText(transition.reason) ?? "交付状态转换失败", "error");
 			return;
 		}
-		state = checkpointRuntimeState(state, {
-			approvals: { ...state.approvals, [kind]: record },
-			proposedDocuments,
-			...(planContract ? { planContract } : {}),
-			...(kind === "solution"
-				? {
-						checkpoint: {
-							summary: "Technical solution approved",
-							nextReadyAction: "Generate the implementation plan",
-						},
-					}
-				: {}),
-		});
+		if (kind === "solution") {
+			const previousSolutionDocument = state.solutionDocument;
+			if (!(await ensureParentWriterLease(ctx, "SHAPING"))) return;
+			try {
+				const identity = await resolveWorkspaceIdentity(ctx.cwd);
+				const solutionDocument = await writeSolutionDocument({
+					gitRoot: identity.gitRoot,
+					documents: proposedDocuments,
+					solutionContent: solutionOnlyContent!,
+					...(previousSolutionDocument ? { previous: previousSolutionDocument } : {}),
+				});
+				state = checkpointRuntimeState(state, {
+					approvals: { ...state.approvals, solution: record },
+					proposedDocuments,
+					solutionDocument,
+					checkpoint: {
+						summary: `Technical solution synchronized: ${solutionDocument.solutionPath}`,
+						nextReadyAction: "Generate the implementation plan",
+					},
+				});
+			} catch (error) {
+				let releaseError: string | undefined;
+				try {
+					if (!(await releaseParentLeaseIfOwned())) releaseError = "writer lease ownership is unproven";
+				} catch (releaseFailure) {
+					releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
+				}
+				const reason = `Technical solution synchronization failed: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; ${releaseError}` : ""}`;
+				setBlocked(reason, "SHAPING");
+				persistCurrentState();
+				updateStatus(ctx);
+				ctx.ui.notify(formatRuntimeText(reason) ?? "技术方案文档同步失败", "error");
+				return;
+			}
+			try {
+				if (!(await releaseParentLeaseIfOwned())) {
+					setBlocked("Technical solution synchronized but writer lease ownership is unproven", "PLANNING");
+					persistCurrentState();
+					updateStatus(ctx);
+					return;
+				}
+			} catch (error) {
+				setBlocked(`Technical solution synchronized but writer lease release failed: ${error instanceof Error ? error.message : String(error)}`, "PLANNING");
+				persistCurrentState();
+				updateStatus(ctx);
+				return;
+			}
+		} else {
+			state = checkpointRuntimeState(state, {
+				approvals: { ...state.approvals, [kind]: record },
+				proposedDocuments,
+				...(planContract ? { planContract } : {}),
+			});
+		}
 		const widening = transition.snapshot.state === "IMPLEMENTING";
 		if (widening) {
 			if (!planContract || !planningDocumentContent) {
@@ -685,13 +756,28 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!(await ensureParentWriterLease(ctx))) return;
 			try {
 				const identity = await resolveWorkspaceIdentity(ctx.cwd);
-				const planningDocuments = await writePlanningDocuments({
-					gitRoot: identity.gitRoot,
-					documents: planContract.documents,
-					solutionContent: planningDocumentContent.solution,
-					planContent: planningDocumentContent.plan,
-				});
+				let planningDocuments: PlanningDocumentEvidence;
+				if (kind === "combined") {
+					planningDocuments = await writePlanningDocuments({
+						gitRoot: identity.gitRoot,
+						documents: planContract.documents,
+						solutionContent: planningDocumentContent.solution,
+						planContent: planningDocumentContent.plan,
+					});
+				} else {
+					if (!state.solutionDocument) {
+						throw new Error("Approved technical solution document evidence is missing");
+					}
+					planningDocuments = await writePlanDocument({
+						gitRoot: identity.gitRoot,
+						documents: planContract.documents,
+						solutionContent: planningDocumentContent.solution,
+						planContent: planningDocumentContent.plan,
+						solutionEvidence: state.solutionDocument,
+					});
+				}
 				state = checkpointRuntimeState(state, {
+					solutionDocument: undefined,
 					planningDocuments,
 					checkpoint: {
 						summary: `Planning documents synchronized for ${planningDocuments.requirementName}`,
@@ -740,7 +826,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			queueAutomaticContinuation(
 				ctx,
 				"/delivery-plan",
-				`技术方案已批准：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n正在生成实施计划...`,
+				`技术方案已批准并写入项目：${proposedDocuments.requirementName}\n技术方案：${proposedDocuments.solutionPath}\n实施计划：${proposedDocuments.planPath}\n正在生成实施计划...`,
 			);
 		} else {
 			queueAutomaticContinuation(
@@ -789,7 +875,11 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					: evidenceValidity
 				: "unproven";
 			const planningApproved = state.snapshot.state === "PLANNING" && Boolean(state.approvals?.solution);
-			const checkpointSummary = planningApproved ? "Technical solution approved" : state.checkpoint?.summary;
+			const checkpointSummary = planningApproved
+				? state.checkpoint?.summary?.startsWith("Technical solution synchronized:")
+					? state.checkpoint.summary
+					: "Technical solution approved"
+				: state.checkpoint?.summary;
 			const nextReadyAction = planningApproved ? "Generate the implementation plan" : state.checkpoint?.nextReadyAction;
 			const lines = [
 				`状态：${formatDeliveryState(state.snapshot.state)}`,
@@ -804,6 +894,8 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				`审查：${state.reviewEvidence ? `${formatReviewVerdict(state.reviewEvidence.verdict)}（${formatEvidenceValidity(reviewValidity)}）` : "不可证明"}`,
 				`规划文档：${state.planningDocuments
 					? `${state.planningDocuments.requirementName}（${state.planningDocuments.solutionPath}，${state.planningDocuments.planPath}；已同步）`
+					: state.solutionDocument
+						? `${state.solutionDocument.requirementName}（${state.solutionDocument.solutionPath}；技术方案已同步，${state.solutionDocument.planPath}；实施计划待同步）`
 					: state.proposedDocuments
 						? `${state.proposedDocuments.requirementName}（${state.proposedDocuments.solutionPath}，${state.proposedDocuments.planPath}；待同步）`
 						: "不可证明"}`,
@@ -855,7 +947,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			}
 			state = checkpointRuntimeState(state, {
 				approvals: event.type === "REVISE_PLAN" ? { solution: state.approvals?.solution } : {},
-				proposedDocuments: event.type === "REVISE_PLAN" ? state.proposedDocuments : undefined,
+				proposedDocuments: event.type === "REVISE_PLAN" || state.solutionDocument
+					? state.proposedDocuments
+					: undefined,
 				planContract: undefined,
 				planningDocuments: undefined,
 				workerRunId: undefined,
@@ -1012,7 +1106,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			];
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
-				details: {
+					details: {
 					state: state.snapshot.state,
 					resumeState: state.snapshot.resumeState,
 					activeTools,
@@ -1029,6 +1123,13 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					validationFailureKind: state.validationFailureKind,
 					validationEvidence: state.validationEvidence,
 					reviewVerdict: state.reviewEvidence?.verdict,
+					solutionDocument: state.solutionDocument
+						? {
+								requirementName: state.solutionDocument.requirementName,
+								solutionPath: state.solutionDocument.solutionPath,
+								planPath: state.solutionDocument.planPath,
+							}
+						: undefined,
 					planningDocuments: state.planningDocuments
 						? {
 								requirementName: state.planningDocuments.requirementName,
@@ -1816,7 +1917,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				state = checkpointRuntimeState(state, {
 					snapshot: { state: target },
 					approvals: target === "PLANNING" ? { solution: state.approvals?.solution } : {},
-					proposedDocuments: target === "PLANNING" ? state.proposedDocuments : undefined,
+					proposedDocuments: target === "PLANNING" || (target === "SHAPING" && state.solutionDocument)
+						? state.proposedDocuments
+						: undefined,
 					writerLease: undefined,
 					planContract: undefined,
 					planningDocuments: undefined,

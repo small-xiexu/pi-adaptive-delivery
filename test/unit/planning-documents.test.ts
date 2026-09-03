@@ -6,10 +6,14 @@ import test from "node:test";
 
 import {
 	assertPlanningDocumentsExist,
+	assertSolutionDocumentCurrent,
 	extractPlanningDocumentContent,
 	parsePlanningDocumentEvidence,
+	parseSolutionDocumentEvidence,
 	stripAdaptiveDeliveryProtocol,
+	writePlanDocument,
 	writePlanningDocuments,
+	writeSolutionDocument,
 } from "../../extensions/delivery-gate/src/planning-documents.ts";
 
 const documents = {
@@ -83,6 +87,77 @@ test("creates two requirement-named Markdown documents and records evidence", as
 		writePlanningDocuments({ gitRoot: root, documents, solutionContent, planContent }),
 		/will not be overwritten/,
 	);
+});
+
+test("writes the approved solution first and creates only the plan after its evidence is rechecked", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-first-"));
+	const solutionContent = "# Canvas写路径拆分技术方案\n\n保持公开行为不变。\n";
+	const planContent = "# Canvas写路径拆分实施计划\n\n运行固定验证。\n";
+	const solutionEvidence = await writeSolutionDocument({ gitRoot: root, documents, solutionContent });
+
+	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), solutionContent);
+	await assert.rejects(access(path.join(root, documents.planPath)));
+	assert.deepEqual(parseSolutionDocumentEvidence(solutionEvidence), solutionEvidence);
+	await assertSolutionDocumentCurrent(root, solutionEvidence);
+
+	const planningEvidence = await writePlanDocument({
+		gitRoot: root,
+		documents,
+		solutionContent,
+		planContent,
+		solutionEvidence,
+	});
+	assert.equal(await readFile(path.join(root, documents.planPath), "utf8"), planContent);
+	assert.equal(planningEvidence.solutionContentDigest, solutionEvidence.solutionContentDigest);
+	assert.deepEqual(parsePlanningDocumentEvidence(planningEvidence), planningEvidence);
+});
+
+test("revises only the unchanged package-written solution and rejects content or parent identity drift", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-revise-"));
+	const first = "# Canvas写路径拆分技术方案\n\n第一版。\n";
+	const second = "# Canvas写路径拆分技术方案\n\n第二版。\n";
+	const evidence = await writeSolutionDocument({ gitRoot: root, documents, solutionContent: first });
+	const revised = await writeSolutionDocument({
+		gitRoot: root,
+		documents,
+		solutionContent: second,
+		previous: evidence,
+	});
+	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), second);
+	await assertSolutionDocumentCurrent(root, revised);
+
+	await writeFile(path.join(root, documents.solutionPath), "人工修改\n");
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: root,
+			documents,
+			solutionContent: first,
+			previous: revised,
+		}),
+		/content changed and will not be overwritten/,
+	);
+	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), "人工修改\n");
+
+	const swapRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-swap-"));
+	const outside = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-swap-outside-"));
+	const swapEvidence = await writeSolutionDocument({ gitRoot: swapRoot, documents, solutionContent: first });
+	await mkdir(path.join(outside, "docs"));
+	const outsideTarget = path.join(outside, documents.solutionPath);
+	await writeFile(outsideTarget, first);
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: swapRoot,
+			documents,
+			solutionContent: second,
+			previous: swapEvidence,
+			afterResolveBeforeOpen: async () => {
+				await rename(path.join(swapRoot, "docs"), path.join(swapRoot, "docs-original"));
+				await symlink(path.join(outside, "docs"), path.join(swapRoot, "docs"));
+			},
+		}),
+		/identity changed/,
+	);
+	assert.equal(await readFile(outsideTarget, "utf8"), first);
 });
 
 test("rejects traversal, symlink parents, and a pre-existing second target without partial creation", async () => {

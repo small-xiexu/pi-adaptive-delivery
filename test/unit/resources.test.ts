@@ -66,7 +66,11 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 	assert.match(prompts[0]!.body, /流程\/状态图通常不超过约 10 个主要节点/);
 	assert.match(prompts[0]!.body, /sequenceDiagram.*stateDiagram-v2.*classDiagram.*erDiagram.*xychart-beta/s);
 	assert.match(prompts[0]!.body, /不要调用 Bash、外部服务或额外工具生成图片/);
+	assert.match(prompts[0]!.body, /确认后，Extension 会立即 create-only 写入技术方案文档/);
+	assert.match(prompts[0]!.body, /仍不开放源码写入/);
 	assert.match(prompts[1]!.body, /本阶段禁止项目写入/);
+	assert.match(prompts[1]!.body, /技术方案文档已经由 `\/delivery-approve-solution` 同步/);
+	assert.match(prompts[1]!.body, /只 create-only 写入实施计划/);
 	assert.match(prompts[1]!.body, /adaptive-delivery:plan:start/);
 	assert.match(prompts[1]!.body, /"version": 2/);
 	assert.match(prompts[1]!.body, /documents\.planPath/);
@@ -111,6 +115,9 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /规划文档路径/);
 	assert.match(skill.body, /docs\/<需求短名称>-技术方案\.md/);
 	assert.match(skill.body, /create-only/);
+	assert.match(skill.body, /确认后立即 create-only 写入技术方案/);
+	assert.match(skill.body, /批准 plan 后.*只 create-only 写入实施计划/);
+	assert.match(skill.body, /人工改动或 symlink 漂移必须拒绝覆盖/);
 	assert.match(skill.body, /自动展开 `\/delivery-plan`/);
 	assert.match(skill.body, /自动展开 `\/delivery-run`/);
 	assert.match(skill.body, /delivery_runtime_status/);
@@ -131,8 +138,8 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /## 最终效果/);
 	assert.match(source, /## 第一次使用/);
 	assert.match(source, /\/delivery-shape 继续 P6\.1/);
-	assert.match(source, /Package 会在对话区显示批准摘要，并自动生成实施计划/);
-	assert.match(source, /当前 v0\.1 不会合并或覆盖已经存在的需求文档/);
+	assert.match(source, /Package 会在对话区显示批准摘要，立即把已批准技术方案写入项目/);
+	assert.match(source, /当前版本不会合并或覆盖无法证明来源的需求文档/);
 	assert.match(source, /确认 resume.*Package 会自动继续当前阶段/);
 	assert.match(source, /worker 和 reviewer 配置至少一个 fallback/);
 	assert.match(source, /父 Pi 看不到 `edit\/write`/);
@@ -143,6 +150,8 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /当前保证六类图/);
 	assert.match(source, /复杂流程不会全部塞进一张大图/);
 	assert.match(source, /不使用 `mmdc`\/Chromium，不上传源码/);
+	assert.match(source, /批准 solution 后.*create-only.*技术方案/);
+	assert.match(source, /只有文件仍与 Package 上次写入内容完全一致/);
 	assert.match(source, /defaultTtlMs.*300000/s);
 	assert.match(source, /## 常见恢复/);
 	assert.ok(source.indexOf("## 第一次使用") < source.indexOf("## 维护者参考"));

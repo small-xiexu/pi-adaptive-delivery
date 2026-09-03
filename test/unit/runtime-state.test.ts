@@ -91,6 +91,23 @@ test("restores the latest state from the active branch entries", () => {
 	}, NOW);
 	assert.equal(runningWorker.ok, true);
 	assert.equal(runningWorker.state.workerStatus, "running");
+
+	const synchronizedSolution = parseRuntimeState({
+		version: 1,
+		snapshot: { state: "PLANNING" },
+		solutionDocument: {
+			version: 1,
+			requirementName: "Canvas写路径拆分",
+			solutionPath: "docs/Canvas写路径拆分-技术方案.md",
+			planPath: "docs/Canvas写路径拆分-实施计划.md",
+			selectionSource: "project",
+			solutionContentDigest: "c".repeat(64),
+			syncedAt: NOW.toISOString(),
+		},
+		updatedAt: NOW.toISOString(),
+	}, NOW);
+	assert.equal(synchronizedSolution.ok, true);
+	assert.equal(synchronizedSolution.state.solutionDocument?.solutionPath, "docs/Canvas写路径拆分-技术方案.md");
 });
 
 test("uses IDLE when the active branch has no delivery state", () => {
@@ -170,6 +187,7 @@ test("fails closed for malformed or unknown persisted state", () => {
 		{ version: 1, snapshot: { state: "IMPLEMENTING" }, workerStatus: "unknown", updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "IMPLEMENTING" }, workerLaunchContractDigest: "bad", updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "PLANNING" }, planningDocuments: { version: 1 }, updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "PLANNING" }, solutionDocument: { version: 1 }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "PLANNING" }, proposedDocuments: { requirementName: "x" }, updatedAt: NOW.toISOString() },
 	];
 

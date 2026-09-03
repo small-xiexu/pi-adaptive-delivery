@@ -59,6 +59,16 @@ export interface PlanningDocumentEvidence {
 	syncedAt: string;
 }
 
+export interface SolutionDocumentEvidence {
+	version: typeof PLANNING_DOCUMENT_EVIDENCE_VERSION;
+	requirementName: string;
+	solutionPath: string;
+	planPath: string;
+	selectionSource: DocumentSelectionSource;
+	solutionContentDigest: string;
+	syncedAt: string;
+}
+
 export function digestPlanningDocumentContent(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -148,6 +158,22 @@ async function ensureParentDirectories(root: string, relativeFile: string): Prom
 	return parents;
 }
 
+async function resolveExistingParentIdentities(root: string, relativeFile: string): Promise<ParentIdentity[]> {
+	const parentRelative = path.dirname(relativeFile);
+	if (parentRelative === ".") return [];
+	let current = root;
+	const parents: ParentIdentity[] = [];
+	for (const component of parentRelative.split(path.sep).filter(Boolean)) {
+		current = path.join(current, component);
+		const stats = await lstat(current);
+		if (stats.isSymbolicLink() || !stats.isDirectory()) {
+			throw new Error(`Planning document parent is not a regular directory: ${current}`);
+		}
+		parents.push({ path: current, dev: stats.dev, ino: stats.ino });
+	}
+	return parents;
+}
+
 async function assertParentIdentities(parents: readonly ParentIdentity[]): Promise<void> {
 	for (const expected of parents) {
 		const current = await lstat(expected.path);
@@ -198,6 +224,18 @@ async function openNewDocument(target: NewDocumentTarget): Promise<OpenedDocumen
 		if (opened) await removeOpenedDocument(opened);
 		throw error;
 	}
+}
+
+async function writeAllAtStart(handle: FileHandle, content: string): Promise<void> {
+	const data = Buffer.from(content, "utf8");
+	await handle.truncate(0);
+	let offset = 0;
+	while (offset < data.length) {
+		const result = await handle.write(data, offset, data.length - offset, offset);
+		if (result.bytesWritten <= 0) throw new Error("Planning document write made no progress");
+		offset += result.bytesWritten;
+	}
+	await handle.truncate(data.length);
 }
 
 async function removeOpenedDocument(opened: OpenedDocument): Promise<void> {
@@ -254,6 +292,192 @@ export async function writePlanningDocuments(input: {
 	} catch (error) {
 		await Promise.allSettled(opened.map((item) => item.handle.close()));
 		await Promise.allSettled(opened.map(removeOpenedDocument));
+		throw error;
+	}
+}
+
+function assertSolutionEvidenceContract(
+	documents: PlanningDocumentsContract,
+	evidence: SolutionDocumentEvidence,
+): void {
+	if (
+		evidence.requirementName !== documents.requirementName ||
+		evidence.solutionPath !== documents.solutionPath ||
+		evidence.planPath !== documents.planPath ||
+		evidence.selectionSource !== documents.selectionSource
+	) {
+		throw new Error("Technical solution evidence does not match the approved document contract");
+	}
+}
+
+async function readExistingDocument(
+	gitRoot: string,
+	relativePath: string,
+): Promise<{ target: NewDocumentTarget; identity: FileIdentity; content: string }> {
+	const root = await realpath(gitRoot);
+	const relative = validateRelativeMarkdownPath(relativePath);
+	const absolute = path.join(root, relative);
+	if (!pathIsInside(root, absolute) || absolute === root) throw new Error(`Planning document escapes Git root: ${relative}`);
+	const parents = await resolveExistingParentIdentities(root, relative);
+	const before = await lstat(absolute);
+	if (before.isSymbolicLink() || !before.isFile()) {
+		throw new Error(`Planning document is not a regular file: ${relative}`);
+	}
+	if (before.size > MAX_DOCUMENT_BYTES) throw new Error(`Planning document exceeds ${MAX_DOCUMENT_BYTES} bytes: ${relative}`);
+	const target = { root, relative, absolute, parents };
+	const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		const opened = { target, handle, identity: { dev: before.dev, ino: before.ino } };
+		const current = await handle.stat();
+		if (!current.isFile() || !sameIdentity(before, current)) {
+			throw new Error(`Planning document target identity changed: ${relative}`);
+		}
+		await assertParentIdentities(parents);
+		await assertOpenedTargetIdentity(opened);
+		const content = await handle.readFile("utf8");
+		await assertParentIdentities(parents);
+		await assertOpenedTargetIdentity(opened);
+		return { target, identity: opened.identity, content };
+	} finally {
+		await handle.close();
+	}
+}
+
+export async function assertSolutionDocumentCurrent(
+	gitRoot: string,
+	evidence: SolutionDocumentEvidence,
+): Promise<void> {
+	const existing = await readExistingDocument(gitRoot, evidence.solutionPath);
+	if (digestPlanningDocumentContent(existing.content) !== evidence.solutionContentDigest) {
+		throw new Error(`Technical solution document content changed: ${evidence.solutionPath}`);
+	}
+}
+
+export async function writeSolutionDocument(input: {
+	gitRoot: string;
+	documents: PlanningDocumentsContract;
+	solutionContent: string;
+	previous?: SolutionDocumentEvidence;
+	now?: Date;
+	afterResolveBeforeOpen?: () => Promise<void>;
+}): Promise<SolutionDocumentEvidence> {
+	if (!input.solutionContent.includes(input.documents.requirementName)) {
+		throw new Error("Technical solution document does not contain the approved requirement name");
+	}
+	if (Buffer.byteLength(input.solutionContent, "utf8") > MAX_DOCUMENT_BYTES) {
+		throw new Error("Technical solution document exceeds the size limit");
+	}
+	await resolveNewTarget(input.gitRoot, input.documents.planPath);
+
+	if (!input.previous) {
+		const target = await resolveNewTarget(input.gitRoot, input.documents.solutionPath);
+		await input.afterResolveBeforeOpen?.();
+		const opened = await openNewDocument(target);
+		try {
+			await writeAllAtStart(opened.handle, input.solutionContent);
+			await opened.handle.sync();
+			await assertParentIdentities(target.parents);
+			await assertOpenedTargetIdentity(opened);
+			await opened.handle.close();
+			return {
+				version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
+				requirementName: input.documents.requirementName,
+				solutionPath: target.relative,
+				planPath: input.documents.planPath,
+				selectionSource: input.documents.selectionSource,
+				solutionContentDigest: digestPlanningDocumentContent(input.solutionContent),
+				syncedAt: (input.now ?? new Date()).toISOString(),
+			};
+		} catch (error) {
+			await opened.handle.close().catch(() => {});
+			await removeOpenedDocument(opened);
+			throw error;
+		}
+	}
+
+	assertSolutionEvidenceContract(input.documents, input.previous);
+	const existing = await readExistingDocument(input.gitRoot, input.previous.solutionPath);
+	if (digestPlanningDocumentContent(existing.content) !== input.previous.solutionContentDigest) {
+		throw new Error(`Technical solution document content changed and will not be overwritten: ${input.previous.solutionPath}`);
+	}
+	await input.afterResolveBeforeOpen?.();
+	const handle = await open(existing.target.absolute, constants.O_RDWR | constants.O_NOFOLLOW);
+	let mutated = false;
+	try {
+		const opened = { target: existing.target, handle, identity: existing.identity };
+		const current = await handle.stat();
+		if (!current.isFile() || !sameIdentity(existing.identity, current)) {
+			throw new Error(`Planning document target identity changed: ${existing.target.relative}`);
+		}
+		await assertParentIdentities(existing.target.parents);
+		await assertOpenedTargetIdentity(opened);
+		const currentContent = await handle.readFile("utf8");
+		if (digestPlanningDocumentContent(currentContent) !== input.previous.solutionContentDigest) {
+			throw new Error(`Technical solution document content changed and will not be overwritten: ${input.previous.solutionPath}`);
+		}
+		await assertParentIdentities(existing.target.parents);
+		await assertOpenedTargetIdentity(opened);
+		mutated = true;
+		await writeAllAtStart(handle, input.solutionContent);
+		await handle.sync();
+		await assertParentIdentities(existing.target.parents);
+		await assertOpenedTargetIdentity(opened);
+		return {
+			...input.previous,
+			solutionContentDigest: digestPlanningDocumentContent(input.solutionContent),
+			syncedAt: (input.now ?? new Date()).toISOString(),
+		};
+	} catch (error) {
+		if (mutated) {
+			await writeAllAtStart(handle, existing.content).then(() => handle.sync()).catch(() => {});
+		}
+		throw error;
+	} finally {
+		await handle.close();
+	}
+}
+
+export async function writePlanDocument(input: {
+	gitRoot: string;
+	documents: PlanningDocumentsContract;
+	solutionContent: string;
+	planContent: string;
+	solutionEvidence: SolutionDocumentEvidence;
+	now?: Date;
+	afterResolveBeforeOpen?: () => Promise<void>;
+}): Promise<PlanningDocumentEvidence> {
+	assertSolutionEvidenceContract(input.documents, input.solutionEvidence);
+	if (digestPlanningDocumentContent(input.solutionContent) !== input.solutionEvidence.solutionContentDigest) {
+		throw new Error("Approved technical solution content does not match the synchronized document evidence");
+	}
+	await assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence);
+	if (!input.planContent.includes(input.documents.requirementName)) {
+		throw new Error("Implementation plan document does not contain the approved requirement name");
+	}
+	const planTarget = await resolveNewTarget(input.gitRoot, input.documents.planPath);
+	await input.afterResolveBeforeOpen?.();
+	await assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence);
+	const opened = await openNewDocument(planTarget);
+	try {
+		await writeAllAtStart(opened.handle, input.planContent);
+		await opened.handle.sync();
+		await assertParentIdentities(planTarget.parents);
+		await assertOpenedTargetIdentity(opened);
+		await assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence);
+		await opened.handle.close();
+		return {
+			version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
+			requirementName: input.documents.requirementName,
+			solutionPath: input.solutionEvidence.solutionPath,
+			planPath: planTarget.relative,
+			selectionSource: input.documents.selectionSource,
+			solutionContentDigest: input.solutionEvidence.solutionContentDigest,
+			planContentDigest: digestPlanningDocumentContent(input.planContent),
+			syncedAt: (input.now ?? new Date()).toISOString(),
+		};
+	} catch (error) {
+		await opened.handle.close().catch(() => {});
+		await removeOpenedDocument(opened);
 		throw error;
 	}
 }
@@ -318,6 +542,40 @@ export function parsePlanningDocumentEvidence(value: unknown): PlanningDocumentE
 			selectionSource: input.selectionSource as DocumentSelectionSource,
 			solutionContentDigest: input.solutionContentDigest,
 			planContentDigest: input.planContentDigest,
+			syncedAt: input.syncedAt,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+export function parseSolutionDocumentEvidence(value: unknown): SolutionDocumentEvidence | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const input = value as Record<string, unknown>;
+	if (
+		input.version !== PLANNING_DOCUMENT_EVIDENCE_VERSION ||
+		typeof input.requirementName !== "string" ||
+		!input.requirementName.trim() ||
+		typeof input.solutionPath !== "string" ||
+		typeof input.planPath !== "string" ||
+		typeof input.selectionSource !== "string" ||
+		!(DOCUMENT_SELECTION_SOURCES as readonly string[]).includes(input.selectionSource) ||
+		typeof input.solutionContentDigest !== "string" ||
+		!/^[a-f0-9]{64}$/.test(input.solutionContentDigest) ||
+		typeof input.syncedAt !== "string" ||
+		Number.isNaN(Date.parse(input.syncedAt))
+	) return undefined;
+	try {
+		const solutionPath = validateRelativeMarkdownPath(input.solutionPath);
+		const planPath = validateRelativeMarkdownPath(input.planPath);
+		if (solutionPath === planPath) return undefined;
+		return {
+			version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
+			requirementName: input.requirementName.trim(),
+			solutionPath,
+			planPath,
+			selectionSource: input.selectionSource as DocumentSelectionSource,
+			solutionContentDigest: input.solutionContentDigest,
 			syncedAt: input.syncedAt,
 		};
 	} catch {

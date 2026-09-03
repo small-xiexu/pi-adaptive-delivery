@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -445,8 +445,10 @@ function approvalBranch(
 	const needsPlanApproval = ["IMPLEMENTING", "VALIDATING", "REWORKING"].includes(state);
 	const extractedSolution = `${`# ${TEST_REQUIREMENT_NAME}-技术方案`}\n\n保持公开行为不变。\n`;
 	const extractedPlan = `${`# ${TEST_REQUIREMENT_NAME}-实施计划`}\n\nStatus: pending\n`;
-	if (needsPlanApproval) {
+	if (needsSolution && !existsSync(path.join(cwd, TEST_SOLUTION_PATH))) {
 		writeFileSync(path.join(cwd, TEST_SOLUTION_PATH), extractedSolution);
+	}
+	if (needsPlanApproval) {
 		writeFileSync(path.join(cwd, TEST_PLAN_PATH), extractedPlan);
 	}
 	return [
@@ -484,6 +486,19 @@ function approvalBranch(
 									planContentDigest: digestPlanningDocumentContent(extractedPlan),
 									syncedAt: "2026-01-01T00:01:00.000Z",
 								},
+						}
+					: {}),
+				...(needsSolution && !needsPlanApproval
+					? {
+							solutionDocument: {
+								version: 1,
+								requirementName: TEST_REQUIREMENT_NAME,
+								solutionPath: TEST_SOLUTION_PATH,
+								planPath: TEST_PLAN_PATH,
+								selectionSource: "project",
+								solutionContentDigest: digestPlanningDocumentContent(extractedSolution),
+								syncedAt: "2026-01-01T00:00:30.000Z",
+							},
 						}
 					: {}),
 			},
@@ -789,6 +804,8 @@ test("requires an affirmative TUI gesture before approving a solution", async ()
 	harness.setConfirmResult(false);
 	await harness.commands.get("delivery-approve-solution")?.handler("", harness.ctx);
 	assert.equal(harness.getConfirmCalls(), 1);
+	assert.equal(existsSync(path.join(repo, TEST_SOLUTION_PATH)), false);
+	assert.equal(existsSync(path.join(repo, TEST_PLAN_PATH)), false);
 	assert.deepEqual(harness.ui.statuses.at(-1), [
 		"adaptive-delivery",
 		"技术方案待确认 [SOLUTION_PENDING_APPROVAL]",
@@ -804,20 +821,70 @@ test("requires an affirmative TUI gesture before approving a solution", async ()
 	assert.equal(persisted.approvals.solution.sessionId, harness.sessionId);
 	assert.equal(persisted.proposedDocuments.requirementName, TEST_REQUIREMENT_NAME);
 	assert.equal(persisted.proposedDocuments.solutionPath, TEST_SOLUTION_PATH);
+	assert.equal(persisted.solutionDocument.solutionPath, TEST_SOLUTION_PATH);
+	assert.equal(persisted.writerLease, undefined);
 	assert.match(harness.confirmationRequests.at(-1)?.message ?? "", new RegExp(TEST_PLAN_PATH));
 	await harness.commands.get("delivery-status")?.handler("", harness.ctx);
 	const statusText = harness.ui.notifications.at(-1)?.[0] ?? "";
-	assert.match(statusText, /规划文档：Canvas写路径拆分.*待同步/);
-	assert.match(statusText, /断点：技术方案已批准/);
+	assert.match(statusText, /规划文档：Canvas写路径拆分.*技术方案已同步.*实施计划待同步/);
+	assert.match(statusText, /断点：技术方案已同步/);
 	assert.match(statusText, /下一步：生成实施计划/);
-	assert.throws(() => readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /ENOENT/);
+	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /保持公开行为不变/);
 	assert.throws(() => readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /ENOENT/);
 	assert.deepEqual(harness.sentUserMessages.at(-1), {
 		content: "/delivery-plan",
 		options: { expandPromptTemplates: true },
 	});
 	assert.equal(harness.sentMessages.at(-1)?.message.display, true);
-	assert.match(harness.sentMessages.at(-1)?.message.content ?? "", /正在生成实施计划/);
+	assert.match(harness.sentMessages.at(-1)?.message.content ?? "", /技术方案已批准并写入项目/);
+});
+
+test("revises the synchronized solution in place but never overwrites manual changes", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const initialBranch = approvalBranch("SOLUTION_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd);
+	harness.setBranch(initialBranch);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-solution")?.handler("", harness.ctx);
+	const firstState = harness.appendedEntries.at(-1)?.data as any;
+	const firstDigest = firstState.solutionDocument.solutionContentDigest;
+
+	await harness.commands.get("delivery-revise")?.handler("", harness.ctx);
+	const revising = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(revising.snapshot.state, "SHAPING");
+	assert.equal(revising.approvals.solution, undefined);
+	assert.equal(revising.solutionDocument.solutionPath, TEST_SOLUTION_PATH);
+	assert.equal(revising.proposedDocuments.solutionPath, TEST_SOLUTION_PATH);
+
+	const revisedContent = structuredClone((initialBranch.find((entry: any) => entry.id === "assistant-solution") as any).message.content);
+	revisedContent[0].text = revisedContent[0].text.replace("保持公开行为不变。", "保持公开行为和错误优先级不变。");
+	harness.setBranch([
+		...initialBranch,
+		{ type: "message", id: "revision-request", message: { role: "user", content: "revise" } },
+		{ type: "message", id: "assistant-revised", message: { role: "assistant", content: revisedContent } },
+	]);
+	await harness.commands.get("delivery-approve-solution")?.handler("", harness.ctx);
+	const revisedState = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(revisedState.snapshot.state, "PLANNING");
+	assert.equal(revisedState.approvals.solution.entryId, "assistant-revised");
+	assert.notEqual(revisedState.solutionDocument.solutionContentDigest, firstDigest);
+	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /错误优先级不变/);
+	assert.equal(existsSync(path.join(repo, TEST_PLAN_PATH)), false);
+
+	await harness.commands.get("delivery-revise")?.handler("", harness.ctx);
+	writeFileSync(path.join(repo, TEST_SOLUTION_PATH), "人工修改\n");
+	const thirdContent = structuredClone(revisedContent);
+	thirdContent[0].text = thirdContent[0].text.replace("错误优先级不变", "错误优先级与排序不变");
+	harness.setBranch([
+		...initialBranch,
+		{ type: "message", id: "manual-revision-request", message: { role: "user", content: "revise again" } },
+		{ type: "message", id: "assistant-third", message: { role: "assistant", content: thirdContent } },
+	]);
+	await harness.commands.get("delivery-approve-solution")?.handler("", harness.ctx);
+	assert.equal(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), "人工修改\n");
+	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
+	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /will not be overwritten/);
 });
 
 test("records plan approval and enters writer state after acquiring the lease", async () => {
@@ -1103,7 +1170,7 @@ test("rejects plan approval before confirmation when no reviewer model is usable
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /独立审查暂时不可用/);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /固定命令验证本身不依赖模型/);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /No usable subagent model/);
-	assert.throws(() => readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /ENOENT/);
+	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /保持公开行为不变/);
 	assert.throws(() => readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /ENOENT/);
 });
 
@@ -1129,7 +1196,7 @@ test("combined approval creates separate requirement documents before enabling w
 
 test("planning document collision blocks implementation without overwriting the existing file", async () => {
 	const repo = candidateRepo();
-	writeFileSync(path.join(repo, TEST_SOLUTION_PATH), "existing solution\n");
+	writeFileSync(path.join(repo, TEST_PLAN_PATH), "existing plan\n");
 	const harness = createHarness(repo);
 	harness.setConfirmResult(true);
 	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
@@ -1137,7 +1204,8 @@ test("planning document collision blocks implementation without overwriting the 
 
 	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
 
-	assert.equal(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), "existing solution\n");
+	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /保持公开行为不变/);
+	assert.equal(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), "existing plan\n");
 	assert.equal(harness.getActiveTools().includes("edit"), false);
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /will not be overwritten/);
@@ -1187,7 +1255,7 @@ test("plan approval without an affirmative TUI confirmation does not create plan
 		assert.equal(harness.getConfirmCalls(), mode === "tui" ? 1 : 0, mode);
 		assert.equal(harness.getActiveTools().includes("edit"), false, mode);
 		assert.equal(harness.sentUserMessages.length, 0, mode);
-		assert.throws(() => readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /ENOENT/);
+		assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /保持公开行为不变/);
 		assert.throws(() => readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /ENOENT/);
 	}
 });

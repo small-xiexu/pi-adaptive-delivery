@@ -6,6 +6,8 @@ argument-hint: "[补充要求]"
 
 $@
 
+标准流程中的技术方案文档已经由 `/delivery-approve-solution` 同步。先只读核对该文件与 Session 批准内容，不得重建、改写或把文件内容反向当作授权；不一致时停止并提示 `/delivery-revise`。
+
 实施计划必须服从项目自己的计划/Issue/TODO 规则，不创建第二套进度系统。已有总计划默认只作入口；用户和项目规则允许需求级台账时，使用已批准 `adaptive-delivery-documents` 契约中的同一需求短名称、路径和选择来源。路径或唯一台账需要改变时先 `/delivery-revise`，不能在计划阶段静默改名。
 
 完整实施计划及其 JSON 契约必须放在以下唯一标记之间：
@@ -40,4 +42,4 @@ $@
 }
 ```
 
-`validation` 至少一项；`progressTargets` 必须包含 `documents.planPath`，其他 progress target 和 `progressChecks` 可以为空。两个文档路径必须不同、以 `.md` 结尾且 basename 包含完全相同的 `requirementName`。不要把 shell 重定向、管道或动态命令放进 `progressChecks`。输出后提示用户运行 `/delivery-approve-plan`；TUI 确认后 Extension 会先 create-only 写入两份文档，成功后才开放源码写入。本阶段禁止项目写入。
+`validation` 至少一项；`progressTargets` 必须包含 `documents.planPath`，其他 progress target 和 `progressChecks` 可以为空。两个文档路径必须不同、以 `.md` 结尾且 basename 包含完全相同的 `requirementName`。不要把 shell 重定向、管道或动态命令放进 `progressChecks`。输出后提示用户运行 `/delivery-approve-plan`；TUI 确认后 Extension 会复验技术方案摘要并只 create-only 写入实施计划，成功后才开放源码写入。本阶段禁止项目写入。

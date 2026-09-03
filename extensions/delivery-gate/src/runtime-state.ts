@@ -21,7 +21,9 @@ import {
 } from "./plan-contract.ts";
 import {
 	parsePlanningDocumentEvidence,
+	parseSolutionDocumentEvidence,
 	type PlanningDocumentEvidence,
+	type SolutionDocumentEvidence,
 } from "./planning-documents.ts";
 
 export const DELIVERY_STATE_CUSTOM_TYPE = "pi-adaptive-delivery.state";
@@ -69,6 +71,7 @@ export interface DeliveryRuntimeState {
 	writerLease?: WriterLeaseReference;
 	proposedDocuments?: PlanningDocumentsContract;
 	planContract?: ApprovedPlanContract;
+	solutionDocument?: SolutionDocumentEvidence;
 	planningDocuments?: PlanningDocumentEvidence;
 	workerRunId?: string;
 	workerStatus?: "starting" | "running" | "completed" | "failed";
@@ -232,6 +235,14 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 		}
 	}
 	let planningDocuments: PlanningDocumentEvidence | undefined;
+	let solutionDocument: SolutionDocumentEvidence | undefined;
+	if (input.solutionDocument !== undefined) {
+		solutionDocument = parseSolutionDocumentEvidence(input.solutionDocument);
+		if (!solutionDocument) {
+			const reason = "Delivery technical solution document evidence is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
 	if (input.planningDocuments !== undefined) {
 		planningDocuments = parsePlanningDocumentEvidence(input.planningDocuments);
 		if (!planningDocuments) {
@@ -454,6 +465,7 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			...(writerLease ? { writerLease } : {}),
 			...(proposedDocuments ? { proposedDocuments } : {}),
 			...(planContract ? { planContract } : {}),
+			...(solutionDocument ? { solutionDocument } : {}),
 			...(planningDocuments ? { planningDocuments } : {}),
 			...(workerRunId ? { workerRunId } : {}),
 			...(workerStatus ? { workerStatus } : {}),

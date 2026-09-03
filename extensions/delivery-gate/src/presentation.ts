@@ -68,6 +68,7 @@ const EXACT_RUNTIME_TEXT: Readonly<Record<string, string>> = {
 };
 
 const PREFIX_RUNTIME_TEXT: ReadonlyArray<readonly [string, string]> = [
+	["Technical solution synchronized: ", "技术方案已同步："],
 	["Planning documents synchronized for ", "规划文档已同步："],
 	["Candidate frozen: ", "候选版本已冻结："],
 	["Validation launched for ", "已启动候选验证："],

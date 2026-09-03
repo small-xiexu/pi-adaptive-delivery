@@ -15,9 +15,10 @@
   -> Package 读取用户规则、项目 AGENTS.md、代码、测试和计划
   -> 用大白话说明最终效果、范围、非目标和验收方式
   -> 你批准技术方案
+  -> Package 立即创建按需求命名的技术方案文档
   -> Package 自动生成实施计划
   -> 你批准实施计划
-  -> Package 创建按需求命名的技术方案和实施计划文档
+  -> Package 创建按需求命名的实施计划文档
   -> 单 writer 实现
   -> 运行已批准的真实验证命令
   -> fresh reviewer 检查当前 candidate
@@ -137,13 +138,13 @@ Package 已把“方案追问”内置到 `adaptive-delivery`，不依赖额外�
 /delivery-approve-solution
 ```
 
-Package 会在对话区显示批准摘要，并自动生成实施计划。计划正确时执行：
+Package 会在对话区显示批准摘要，立即把已批准技术方案写入项目，然后自动生成实施计划。计划正确时执行：
 
 ```text
 /delivery-approve-plan
 ```
 
-随后 Package 会自动同步规划文档并开始实现，不需要再输入 `/delivery-run`。
+随后 Package 会创建实施计划文档并开始实现，不需要再输入 `/delivery-run`。
 
 ### 小型低风险任务
 
@@ -196,22 +197,22 @@ docs/避免重复扣款-实施计划.md
 
 需求短名称描述稳定的用户目标，不使用日期、`final-v2`、代码行号或可能变化的实现细节。
 
-路径会在技术方案批准时冻结，实施计划不能静默改名。批准 plan 后，Extension 以 create-only 方式创建两个新 Markdown：
+路径会在技术方案批准时冻结，实施计划不能静默改名。标准任务批准 solution 后，Extension 先以 create-only 方式创建技术方案；批准 plan 后只创建实施计划。小型合并批准仍一次创建两个 Markdown：
 
 - 不覆盖已有同名文件。
 - 拒绝绝对路径、`..`、symlink、非 Markdown 和同一目标。
-- 两份文档都成功后才开放源码写入。
+- 技术方案批准后立即落盘，但不开放源码写入；两份文档都成功后才进入实现。
 - 项目实施计划同时作为本任务的 progress target。
 
 TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract 保留在 Session 原始消息中用于批准、恢复和校验，但默认不会显示给用户。
 
-当前 v0.1 不会合并或覆盖已经存在的需求文档。两份文档创建后若执行 `/delivery-revise` 并重新规划，必须由用户明确决定新的需求名/路径或先处理旧文档；Package 不会自行覆盖。
+当前版本不会合并或覆盖无法证明来源的需求文档。实施计划批准前执行 `/delivery-revise` 时，Package 保留已落盘技术方案的路径和摘要；重新批准后，只有文件仍与 Package 上次写入内容完全一致且路径无 symlink 时才原位更新。人工改过、身份漂移或摘要不符时保持只读并拒绝覆盖。实施计划已经落盘后的跨阶段重规划仍需用户明确处理旧计划或开始新任务。
 
 ## Package 自动完成什么
 
 批准实施计划后，正常情况下无需继续输入命令：
 
-1. 创建技术方案和实施计划文档。
+1. 复验已批准技术方案文档并创建实施计划文档。
 2. 获取当前 Git worktree 的唯一 writer lease。
 3. 小型低风险任务由父 Pi 直接实现；其他任务由一个受控 foreground worker 实现，父 Pi 只编排。
 4. 冻结包含 HEAD、staged、tracked、untracked、submodule 和批准记录的 candidate digest。

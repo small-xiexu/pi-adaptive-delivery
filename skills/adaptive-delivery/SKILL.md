@@ -78,7 +78,7 @@ docs/<需求短名称>-实施计划.md
 
 需求短名称描述稳定用户目标，不使用日期、版本尾缀、代码行号或可能变化的实现方式。方案回复必须展示需求名、两条路径和 `user|project|global|package-default` 选择来源。规则冲突、远程 Issue/TODO、多个唯一台账候选或路径职责不明确时停止询问，不能静默 fallback。
 
-solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 只 create-only 写入两份新 Markdown；目标存在或任一路径无法证明时保持只读。两份文档成功并记录摘要后才进入 `IMPLEMENTING`。Session entry 仍是批准主体，文件不能反向授予权限。
+solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源，确认后立即 create-only 写入技术方案，但仍保持只读。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 复验技术方案摘要并只 create-only 写入实施计划；两份文档成功并记录摘要后才进入 `IMPLEMENTING`。实施计划批准前执行 `/delivery-revise` 时保留方案路径和同步摘要，重新批准只允许更新仍与该摘要一致的 regular file；人工改动或 symlink 漂移必须拒绝覆盖。Session entry 仍是批准主体，文件不能反向授予权限。
 
 显示 plan 批准对话前，Extension 必须用 pi-subagents 公开 preflight 证明 builtin reviewer 至少有一个可用 model candidate，且只读工具、`denyExtensions`、output 和 cwd 边界成立。preflight 不启动 child 或调用 Provider。无可用 reviewer/fallback 时保持待批准和只读，先让用户修复模型配置；不得先实现再等验证资源。
 

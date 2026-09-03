@@ -13,6 +13,7 @@ import type { DeliveryRuntimeState } from "./runtime-state.ts";
 import {
 	digestPlanningDocumentContent,
 	extractPlanningDocumentContent,
+	type SolutionDocumentEvidence,
 } from "./planning-documents.ts";
 
 export interface AuthorizationContext {
@@ -49,6 +50,16 @@ function samePlanningDocuments(left: PlanningDocumentsContract, right: PlanningD
 		left.selectionSource === right.selectionSource;
 }
 
+function solutionEvidenceMatches(
+	evidence: SolutionDocumentEvidence,
+	documents: PlanningDocumentsContract,
+): boolean {
+	return evidence.requirementName === documents.requirementName &&
+		evidence.solutionPath === documents.solutionPath &&
+		evidence.planPath === documents.planPath &&
+		evidence.selectionSource === documents.selectionSource;
+}
+
 export function validateAuthorizationBundle(
 	state: DeliveryRuntimeState,
 	context: AuthorizationContext,
@@ -70,7 +81,18 @@ export function validateAuthorizationBundle(
 	if (needsSolution && state.approvals?.solution) {
 		const entry = approvalEntry(context.branch, state.approvals.solution.entryId);
 		const proposed = entry ? parsePlanningDocumentsFromContent(entry.message.content) : undefined;
-		if (!proposed || !state.proposedDocuments || !samePlanningDocuments(proposed, state.proposedDocuments)) {
+		const solutionContent = entry
+			? extractPlanningDocumentContent(entry.message.content, "solution")
+			: undefined;
+		if (
+			!proposed ||
+			!state.proposedDocuments ||
+			!samePlanningDocuments(proposed, state.proposedDocuments) ||
+			!state.solutionDocument ||
+			!solutionEvidenceMatches(state.solutionDocument, proposed) ||
+			!solutionContent ||
+			state.solutionDocument.solutionContentDigest !== digestPlanningDocumentContent(solutionContent)
+		) {
 			return { ok: false, reason: "Planning document paths do not match the approved solution entry" };
 		}
 	}
