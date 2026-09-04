@@ -121,6 +121,7 @@ export function parseTinyContractValue(value: unknown): TinyDeliveryContract | u
 		!intent ||
 		!nonGoals ||
 		!validation ||
+		validation.some((command) => command.repairCommand !== undefined) ||
 		!eligibility ||
 		input.review !== "none" ||
 		!Array.isArray(input.changeScope) ||

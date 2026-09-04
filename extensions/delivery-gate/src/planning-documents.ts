@@ -1,10 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
 	lstat,
 	mkdir,
 	open,
 	realpath,
+	rename,
 	unlink,
 	type FileHandle,
 } from "node:fs/promises";
@@ -18,7 +19,8 @@ import {
 } from "./plan-contract.ts";
 import { pathIsInside } from "./subagents.ts";
 
-export const PLANNING_DOCUMENT_EVIDENCE_VERSION = 1 as const;
+export const PLANNING_DOCUMENT_EVIDENCE_VERSION = 2 as const;
+export const PLANNING_DOCUMENT_REVISION_INTENT_VERSION = 1 as const;
 export const SOLUTION_DOCUMENT_START = "<!-- adaptive-delivery:solution:start -->";
 export const SOLUTION_DOCUMENT_END = "<!-- adaptive-delivery:solution:end -->";
 export const PLAN_DOCUMENT_START = "<!-- adaptive-delivery:plan:start -->";
@@ -29,6 +31,10 @@ const MAX_DOCUMENT_BYTES = 512 * 1024;
 interface FileIdentity {
 	dev: number;
 	ino: number;
+}
+
+interface PersistedParentIdentity extends FileIdentity {
+	relativePath: string;
 }
 
 interface ParentIdentity extends FileIdentity {
@@ -54,7 +60,12 @@ export interface PlanningDocumentEvidence {
 	solutionPath: string;
 	planPath: string;
 	selectionSource: DocumentSelectionSource;
+	solutionFileIdentity: FileIdentity;
+	solutionParentIdentities: PersistedParentIdentity[];
 	solutionContentDigest: string;
+	planFileIdentity: FileIdentity;
+	planParentIdentities: PersistedParentIdentity[];
+	approvedPlanContentDigest: string;
 	planContentDigest: string;
 	syncedAt: string;
 }
@@ -65,8 +76,23 @@ export interface SolutionDocumentEvidence {
 	solutionPath: string;
 	planPath: string;
 	selectionSource: DocumentSelectionSource;
+	solutionFileIdentity: FileIdentity;
+	solutionParentIdentities: PersistedParentIdentity[];
 	solutionContentDigest: string;
 	syncedAt: string;
+}
+
+export interface PlanningDocumentRevisionIntent {
+	version: typeof PLANNING_DOCUMENT_REVISION_INTENT_VERSION;
+	kind: "solution" | "plan";
+	path: string;
+	previousFileIdentity: FileIdentity;
+	previousParentIdentities: PersistedParentIdentity[];
+	previousContentDigest: string;
+	nextFileIdentity: FileIdentity;
+	nextParentIdentities: PersistedParentIdentity[];
+	nextContentDigest: string;
+	preparedAt: string;
 }
 
 export function digestPlanningDocumentContent(value: string): string {
@@ -75,6 +101,35 @@ export function digestPlanningDocumentContent(value: string): string {
 
 function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function persistedParentIdentities(target: NewDocumentTarget): PersistedParentIdentity[] {
+	return target.parents.map((parent) => ({
+		relativePath: path.relative(target.root, parent.path),
+		dev: parent.dev,
+		ino: parent.ino,
+	}));
+}
+
+function assertPersistedIdentity(
+	existing: { target: NewDocumentTarget; identity: FileIdentity },
+	fileIdentity: FileIdentity,
+	parentIdentities: readonly PersistedParentIdentity[],
+	label: string,
+): void {
+	if (!sameIdentity(existing.identity, fileIdentity)) {
+		throw new Error(`${label} file identity changed: ${existing.target.relative}`);
+	}
+	const currentParents = persistedParentIdentities(existing.target);
+	if (
+		currentParents.length !== parentIdentities.length ||
+		currentParents.some((parent, index) => {
+			const expected = parentIdentities[index];
+			return !expected || parent.relativePath !== expected.relativePath || !sameIdentity(parent, expected);
+		})
+	) {
+		throw new Error(`${label} parent identity changed: ${existing.target.relative}`);
+	}
 }
 
 function markerPair(kind: "solution" | "plan"): readonly [string, string] {
@@ -249,6 +304,21 @@ async function removeOpenedDocument(opened: OpenedDocument): Promise<void> {
 	}
 }
 
+async function syncParentDirectory(absolutePath: string): Promise<void> {
+	try {
+		const handle = await open(path.dirname(absolutePath), constants.O_RDONLY);
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform === "win32" && (code === "EPERM" || code === "EISDIR" || code === "EINVAL")) return;
+		throw error;
+	}
+}
+
 export async function writePlanningDocuments(input: {
 	gitRoot: string;
 	documents: PlanningDocumentsContract;
@@ -285,7 +355,12 @@ export async function writePlanningDocuments(input: {
 			solutionPath: solutionTarget.relative,
 			planPath: planTarget.relative,
 			selectionSource: input.documents.selectionSource,
+			solutionFileIdentity: opened[0]!.identity,
+			solutionParentIdentities: persistedParentIdentities(solutionTarget),
 			solutionContentDigest: digestPlanningDocumentContent(input.solutionContent),
+			planFileIdentity: opened[1]!.identity,
+			planParentIdentities: persistedParentIdentities(planTarget),
+			approvedPlanContentDigest: digestPlanningDocumentContent(input.planContent),
 			planContentDigest: digestPlanningDocumentContent(input.planContent),
 			syncedAt: (input.now ?? new Date()).toISOString(),
 		};
@@ -308,6 +383,13 @@ function assertSolutionEvidenceContract(
 	) {
 		throw new Error("Technical solution evidence does not match the approved document contract");
 	}
+}
+
+function assertPlanningEvidenceContract(
+	documents: PlanningDocumentsContract,
+	evidence: PlanningDocumentEvidence,
+): void {
+	assertSolutionEvidenceContract(documents, evidence);
 }
 
 async function readExistingDocument(
@@ -343,14 +425,169 @@ async function readExistingDocument(
 	}
 }
 
+async function overwriteExistingDocument(input: {
+	gitRoot: string;
+	kind: PlanningDocumentRevisionIntent["kind"];
+	relativePath: string;
+	expectedDigest: string;
+	expectedFileIdentity: FileIdentity;
+	expectedParentIdentities: readonly PersistedParentIdentity[];
+	content: string;
+	label: string;
+	afterResolveBeforeOpen?: () => Promise<void>;
+	afterTemporaryWriteBeforeCommit?: () => Promise<void>;
+	afterRenameBeforeDirectorySync?: () => Promise<void>;
+	onRevisionPrepared: (intent: PlanningDocumentRevisionIntent) => Promise<void>;
+	beforeCommit?: () => Promise<void>;
+}): Promise<{ fileIdentity: FileIdentity; parentIdentities: PersistedParentIdentity[] }> {
+	const existing = await readExistingDocument(input.gitRoot, input.relativePath);
+	assertPersistedIdentity(existing, input.expectedFileIdentity, input.expectedParentIdentities, input.label);
+	if (digestPlanningDocumentContent(existing.content) !== input.expectedDigest) {
+		throw new Error(`${input.label} content changed and will not be overwritten: ${input.relativePath}`);
+	}
+	await input.afterResolveBeforeOpen?.();
+	const temporaryRelative = path.join(
+		path.dirname(existing.target.relative),
+		`.${path.basename(existing.target.relative)}.adaptive-delivery-${randomUUID()}.tmp`,
+	);
+	const temporaryTarget: NewDocumentTarget = {
+		root: existing.target.root,
+		relative: temporaryRelative,
+		absolute: path.join(existing.target.root, temporaryRelative),
+		parents: existing.target.parents,
+	};
+	const temporary = await openNewDocument(temporaryTarget);
+	try {
+		await writeAllAtStart(temporary.handle, input.content);
+		await temporary.handle.sync();
+		await assertParentIdentities(temporary.target.parents);
+		await assertOpenedTargetIdentity(temporary);
+		await input.afterTemporaryWriteBeforeCommit?.();
+		await input.beforeCommit?.();
+		await assertExpectedDocumentCurrent(input);
+		const nextContentDigest = digestPlanningDocumentContent(input.content);
+		await input.onRevisionPrepared({
+			version: PLANNING_DOCUMENT_REVISION_INTENT_VERSION,
+			kind: input.kind,
+			path: input.relativePath,
+			previousFileIdentity: input.expectedFileIdentity,
+			previousParentIdentities: [...input.expectedParentIdentities],
+			previousContentDigest: input.expectedDigest,
+			nextFileIdentity: temporary.identity,
+			nextParentIdentities: persistedParentIdentities(existing.target),
+			nextContentDigest,
+			preparedAt: new Date().toISOString(),
+		});
+		await input.beforeCommit?.();
+		await assertExpectedDocumentCurrent(input);
+		await temporary.handle.close();
+		await rename(temporary.target.absolute, existing.target.absolute);
+		await input.afterRenameBeforeDirectorySync?.();
+		await syncParentDirectory(existing.target.absolute);
+		return {
+			fileIdentity: temporary.identity,
+			parentIdentities: persistedParentIdentities(existing.target),
+		};
+	} catch (error) {
+		await temporary.handle.close().catch(() => {});
+		await removeOpenedDocument(temporary);
+		throw error;
+	}
+}
+
+async function assertExpectedDocumentCurrent(input: {
+	gitRoot: string;
+	relativePath: string;
+	expectedDigest: string;
+	expectedFileIdentity: FileIdentity;
+	expectedParentIdentities: readonly PersistedParentIdentity[];
+	label: string;
+}): Promise<void> {
+	const current = await readExistingDocument(input.gitRoot, input.relativePath);
+	assertPersistedIdentity(current, input.expectedFileIdentity, input.expectedParentIdentities, input.label);
+	if (digestPlanningDocumentContent(current.content) !== input.expectedDigest) {
+		throw new Error(`${input.label} content changed and will not be overwritten: ${input.relativePath}`);
+	}
+}
+
+export async function resolvePlanningDocumentRevision(
+	gitRoot: string,
+	intent: PlanningDocumentRevisionIntent,
+): Promise<"previous" | "next"> {
+	const current = await readExistingDocument(gitRoot, intent.path);
+	const digest = digestPlanningDocumentContent(current.content);
+	const matches = (
+		fileIdentity: FileIdentity,
+		parentIdentities: readonly PersistedParentIdentity[],
+		contentDigest: string,
+	) => {
+		try {
+			assertPersistedIdentity(current, fileIdentity, parentIdentities, "Planning document revision");
+			return digest === contentDigest;
+		} catch {
+			return false;
+		}
+	};
+	if (matches(intent.previousFileIdentity, intent.previousParentIdentities, intent.previousContentDigest)) {
+		return "previous";
+	}
+	if (matches(intent.nextFileIdentity, intent.nextParentIdentities, intent.nextContentDigest)) return "next";
+	throw new Error(`Planning document revision matches neither recorded state: ${intent.path}`);
+}
+
 export async function assertSolutionDocumentCurrent(
 	gitRoot: string,
 	evidence: SolutionDocumentEvidence,
 ): Promise<void> {
 	const existing = await readExistingDocument(gitRoot, evidence.solutionPath);
+	assertPersistedIdentity(
+		existing,
+		evidence.solutionFileIdentity,
+		evidence.solutionParentIdentities,
+		"Technical solution document",
+	);
 	if (digestPlanningDocumentContent(existing.content) !== evidence.solutionContentDigest) {
 		throw new Error(`Technical solution document content changed: ${evidence.solutionPath}`);
 	}
+}
+
+export async function assertPlanDocumentCurrent(
+	gitRoot: string,
+	evidence: PlanningDocumentEvidence,
+): Promise<void> {
+	const existing = await readExistingDocument(gitRoot, evidence.planPath);
+	assertPersistedIdentity(
+		existing,
+		evidence.planFileIdentity,
+		evidence.planParentIdentities,
+		"Implementation plan document",
+	);
+	if (digestPlanningDocumentContent(existing.content) !== evidence.planContentDigest) {
+		throw new Error(`Implementation plan document content changed: ${evidence.planPath}`);
+	}
+}
+
+export async function refreshPlanDocumentEvidence(
+	gitRoot: string,
+	evidence: PlanningDocumentEvidence,
+	expectedDigest: string,
+	now: Date = new Date(),
+): Promise<PlanningDocumentEvidence> {
+	const existing = await readExistingDocument(gitRoot, evidence.planPath);
+	assertPersistedIdentity(
+		existing,
+		evidence.planFileIdentity,
+		evidence.planParentIdentities,
+		"Implementation plan document",
+	);
+	if (digestPlanningDocumentContent(existing.content) !== expectedDigest) {
+		throw new Error(`Implementation plan document does not match the completed progress write: ${evidence.planPath}`);
+	}
+	return {
+		...evidence,
+		planContentDigest: expectedDigest,
+		syncedAt: now.toISOString(),
+	};
 }
 
 export async function writeSolutionDocument(input: {
@@ -358,8 +595,12 @@ export async function writeSolutionDocument(input: {
 	documents: PlanningDocumentsContract;
 	solutionContent: string;
 	previous?: SolutionDocumentEvidence;
+	previousPlanning?: PlanningDocumentEvidence;
 	now?: Date;
 	afterResolveBeforeOpen?: () => Promise<void>;
+	afterTemporaryWriteBeforeCommit?: () => Promise<void>;
+	afterRenameBeforeDirectorySync?: () => Promise<void>;
+	onRevisionPrepared?: (intent: PlanningDocumentRevisionIntent) => Promise<void>;
 }): Promise<SolutionDocumentEvidence> {
 	if (!input.solutionContent.includes(input.documents.requirementName)) {
 		throw new Error("Technical solution document does not contain the approved requirement name");
@@ -367,9 +608,8 @@ export async function writeSolutionDocument(input: {
 	if (Buffer.byteLength(input.solutionContent, "utf8") > MAX_DOCUMENT_BYTES) {
 		throw new Error("Technical solution document exceeds the size limit");
 	}
-	await resolveNewTarget(input.gitRoot, input.documents.planPath);
-
 	if (!input.previous) {
+		await resolveNewTarget(input.gitRoot, input.documents.planPath);
 		const target = await resolveNewTarget(input.gitRoot, input.documents.solutionPath);
 		await input.afterResolveBeforeOpen?.();
 		const opened = await openNewDocument(target);
@@ -385,6 +625,8 @@ export async function writeSolutionDocument(input: {
 				solutionPath: target.relative,
 				planPath: input.documents.planPath,
 				selectionSource: input.documents.selectionSource,
+				solutionFileIdentity: opened.identity,
+				solutionParentIdentities: persistedParentIdentities(target),
 				solutionContentDigest: digestPlanningDocumentContent(input.solutionContent),
 				syncedAt: (input.now ?? new Date()).toISOString(),
 			};
@@ -396,45 +638,49 @@ export async function writeSolutionDocument(input: {
 	}
 
 	assertSolutionEvidenceContract(input.documents, input.previous);
-	const existing = await readExistingDocument(input.gitRoot, input.previous.solutionPath);
-	if (digestPlanningDocumentContent(existing.content) !== input.previous.solutionContentDigest) {
-		throw new Error(`Technical solution document content changed and will not be overwritten: ${input.previous.solutionPath}`);
+	if (!input.onRevisionPrepared) throw new Error("Technical solution revision requires a durable revision intent callback");
+	if (input.previousPlanning) {
+		assertPlanningEvidenceContract(input.documents, input.previousPlanning);
+		if (input.previous.solutionContentDigest !== input.previousPlanning.solutionContentDigest) {
+			throw new Error("Technical solution evidence does not match the previous planning document evidence");
+		}
+		await assertPlanDocumentCurrent(input.gitRoot, input.previousPlanning);
 	}
-	await input.afterResolveBeforeOpen?.();
-	const handle = await open(existing.target.absolute, constants.O_RDWR | constants.O_NOFOLLOW);
-	let mutated = false;
-	try {
-		const opened = { target: existing.target, handle, identity: existing.identity };
-		const current = await handle.stat();
-		if (!current.isFile() || !sameIdentity(existing.identity, current)) {
-			throw new Error(`Planning document target identity changed: ${existing.target.relative}`);
-		}
-		await assertParentIdentities(existing.target.parents);
-		await assertOpenedTargetIdentity(opened);
-		const currentContent = await handle.readFile("utf8");
-		if (digestPlanningDocumentContent(currentContent) !== input.previous.solutionContentDigest) {
-			throw new Error(`Technical solution document content changed and will not be overwritten: ${input.previous.solutionPath}`);
-		}
-		await assertParentIdentities(existing.target.parents);
-		await assertOpenedTargetIdentity(opened);
-		mutated = true;
-		await writeAllAtStart(handle, input.solutionContent);
-		await handle.sync();
-		await assertParentIdentities(existing.target.parents);
-		await assertOpenedTargetIdentity(opened);
-		return {
-			...input.previous,
-			solutionContentDigest: digestPlanningDocumentContent(input.solutionContent),
-			syncedAt: (input.now ?? new Date()).toISOString(),
-		};
-	} catch (error) {
-		if (mutated) {
-			await writeAllAtStart(handle, existing.content).then(() => handle.sync()).catch(() => {});
-		}
-		throw error;
-	} finally {
-		await handle.close();
-	}
+	const replaced = await overwriteExistingDocument({
+		gitRoot: input.gitRoot,
+		kind: "solution",
+		relativePath: input.previous.solutionPath,
+		expectedDigest: input.previous.solutionContentDigest,
+		expectedFileIdentity: input.previous.solutionFileIdentity,
+		expectedParentIdentities: input.previous.solutionParentIdentities,
+		content: input.solutionContent,
+		label: "Technical solution document",
+		...(input.afterResolveBeforeOpen || input.previousPlanning
+			? {
+				afterResolveBeforeOpen: async () => {
+					await input.afterResolveBeforeOpen?.();
+					if (input.previousPlanning) await assertPlanDocumentCurrent(input.gitRoot, input.previousPlanning);
+				},
+			}
+			: {}),
+		...(input.afterTemporaryWriteBeforeCommit
+			? { afterTemporaryWriteBeforeCommit: input.afterTemporaryWriteBeforeCommit }
+			: {}),
+		...(input.afterRenameBeforeDirectorySync
+			? { afterRenameBeforeDirectorySync: input.afterRenameBeforeDirectorySync }
+			: {}),
+		onRevisionPrepared: input.onRevisionPrepared,
+		...(input.previousPlanning
+			? { beforeCommit: () => assertPlanDocumentCurrent(input.gitRoot, input.previousPlanning!) }
+			: {}),
+	});
+	return {
+		...input.previous,
+		solutionFileIdentity: replaced.fileIdentity,
+		solutionParentIdentities: replaced.parentIdentities,
+		solutionContentDigest: digestPlanningDocumentContent(input.solutionContent),
+		syncedAt: (input.now ?? new Date()).toISOString(),
+	};
 }
 
 export async function writePlanDocument(input: {
@@ -443,8 +689,12 @@ export async function writePlanDocument(input: {
 	solutionContent: string;
 	planContent: string;
 	solutionEvidence: SolutionDocumentEvidence;
+	previous?: PlanningDocumentEvidence;
 	now?: Date;
 	afterResolveBeforeOpen?: () => Promise<void>;
+	afterTemporaryWriteBeforeCommit?: () => Promise<void>;
+	afterRenameBeforeDirectorySync?: () => Promise<void>;
+	onRevisionPrepared?: (intent: PlanningDocumentRevisionIntent) => Promise<void>;
 }): Promise<PlanningDocumentEvidence> {
 	assertSolutionEvidenceContract(input.documents, input.solutionEvidence);
 	if (digestPlanningDocumentContent(input.solutionContent) !== input.solutionEvidence.solutionContentDigest) {
@@ -453,6 +703,47 @@ export async function writePlanDocument(input: {
 	await assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence);
 	if (!input.planContent.includes(input.documents.requirementName)) {
 		throw new Error("Implementation plan document does not contain the approved requirement name");
+	}
+	if (input.previous) {
+		assertPlanningEvidenceContract(input.documents, input.previous);
+		if (!input.onRevisionPrepared) throw new Error("Implementation plan revision requires a durable revision intent callback");
+		const replaced = await overwriteExistingDocument({
+			gitRoot: input.gitRoot,
+			kind: "plan",
+			relativePath: input.previous.planPath,
+			expectedDigest: input.previous.planContentDigest,
+			expectedFileIdentity: input.previous.planFileIdentity,
+			expectedParentIdentities: input.previous.planParentIdentities,
+			content: input.planContent,
+			label: "Implementation plan document",
+			afterResolveBeforeOpen: async () => {
+				await input.afterResolveBeforeOpen?.();
+				await assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence);
+			},
+			beforeCommit: () => assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence),
+			...(input.afterTemporaryWriteBeforeCommit
+				? { afterTemporaryWriteBeforeCommit: input.afterTemporaryWriteBeforeCommit }
+				: {}),
+			...(input.afterRenameBeforeDirectorySync
+				? { afterRenameBeforeDirectorySync: input.afterRenameBeforeDirectorySync }
+				: {}),
+			onRevisionPrepared: input.onRevisionPrepared,
+		});
+		return {
+			version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
+			requirementName: input.documents.requirementName,
+			solutionPath: input.solutionEvidence.solutionPath,
+			planPath: input.previous.planPath,
+			selectionSource: input.documents.selectionSource,
+			solutionFileIdentity: input.solutionEvidence.solutionFileIdentity,
+			solutionParentIdentities: input.solutionEvidence.solutionParentIdentities,
+			solutionContentDigest: input.solutionEvidence.solutionContentDigest,
+			planFileIdentity: replaced.fileIdentity,
+			planParentIdentities: replaced.parentIdentities,
+			approvedPlanContentDigest: digestPlanningDocumentContent(input.planContent),
+			planContentDigest: digestPlanningDocumentContent(input.planContent),
+			syncedAt: (input.now ?? new Date()).toISOString(),
+		};
 	}
 	const planTarget = await resolveNewTarget(input.gitRoot, input.documents.planPath);
 	await input.afterResolveBeforeOpen?.();
@@ -471,7 +762,12 @@ export async function writePlanDocument(input: {
 			solutionPath: input.solutionEvidence.solutionPath,
 			planPath: planTarget.relative,
 			selectionSource: input.documents.selectionSource,
+			solutionFileIdentity: input.solutionEvidence.solutionFileIdentity,
+			solutionParentIdentities: input.solutionEvidence.solutionParentIdentities,
 			solutionContentDigest: input.solutionEvidence.solutionContentDigest,
+			planFileIdentity: opened.identity,
+			planParentIdentities: persistedParentIdentities(planTarget),
+			approvedPlanContentDigest: digestPlanningDocumentContent(input.planContent),
 			planContentDigest: digestPlanningDocumentContent(input.planContent),
 			syncedAt: (input.now ?? new Date()).toISOString(),
 		};
@@ -482,32 +778,96 @@ export async function writePlanDocument(input: {
 	}
 }
 
-async function assertExistingDocument(gitRoot: string, relativePath: string): Promise<void> {
-	const root = await realpath(gitRoot);
-	const relative = validateRelativeMarkdownPath(relativePath);
-	const absolute = path.join(root, relative);
-	if (!pathIsInside(root, absolute) || absolute === root) throw new Error(`Planning document escapes Git root: ${relative}`);
-	let current = root;
-	const components = relative.split(path.sep).filter(Boolean);
-	for (let index = 0; index < components.length; index += 1) {
-		current = path.join(current, components[index]!);
-		const stats = await lstat(current);
-		if (stats.isSymbolicLink()) throw new Error(`Planning document contains a symlink component: ${relative}`);
-		if (index < components.length - 1 && !stats.isDirectory()) {
-			throw new Error(`Planning document parent is not a directory: ${relative}`);
-		}
-		if (index === components.length - 1 && !stats.isFile()) {
-			throw new Error(`Planning document is not a regular file: ${relative}`);
-		}
-	}
-}
-
 export async function assertPlanningDocumentsExist(
 	gitRoot: string,
 	evidence: PlanningDocumentEvidence,
 ): Promise<void> {
-	await assertExistingDocument(gitRoot, evidence.solutionPath);
-	await assertExistingDocument(gitRoot, evidence.planPath);
+	await assertSolutionDocumentCurrent(gitRoot, evidence);
+	await assertPlanDocumentCurrent(gitRoot, evidence);
+}
+
+function parseFileIdentity(value: unknown): FileIdentity | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const input = value as Record<string, unknown>;
+	if (
+		Object.keys(input).length !== 2 ||
+		typeof input.dev !== "number" ||
+		!Number.isSafeInteger(input.dev) ||
+		input.dev < 0 ||
+		typeof input.ino !== "number" ||
+		!Number.isSafeInteger(input.ino) ||
+		input.ino < 0
+	) return undefined;
+	return { dev: input.dev, ino: input.ino };
+}
+
+function parseParentIdentities(value: unknown, relativeFile: string): PersistedParentIdentity[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const parent = path.dirname(relativeFile);
+	const expectedPaths: string[] = [];
+	if (parent !== ".") {
+		let current = "";
+		for (const component of parent.split(path.sep)) {
+			current = current ? path.join(current, component) : component;
+			expectedPaths.push(current);
+		}
+	}
+	if (value.length !== expectedPaths.length) return undefined;
+	const result: PersistedParentIdentity[] = [];
+	for (const [index, item] of value.entries()) {
+		if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+		const input = item as Record<string, unknown>;
+		const identity = parseFileIdentity({ dev: input.dev, ino: input.ino });
+		if (
+			Object.keys(input).length !== 3 ||
+			typeof input.relativePath !== "string" ||
+			input.relativePath !== expectedPaths[index] ||
+			!identity
+		) return undefined;
+		result.push({ relativePath: input.relativePath, ...identity });
+	}
+	return result;
+}
+
+export function parsePlanningDocumentRevisionIntent(value: unknown): PlanningDocumentRevisionIntent | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const input = value as Record<string, unknown>;
+	if (
+		Object.keys(input).length !== 10 ||
+		input.version !== PLANNING_DOCUMENT_REVISION_INTENT_VERSION ||
+		(input.kind !== "solution" && input.kind !== "plan") ||
+		typeof input.path !== "string" ||
+		typeof input.previousContentDigest !== "string" ||
+		!/^[a-f0-9]{64}$/.test(input.previousContentDigest) ||
+		typeof input.nextContentDigest !== "string" ||
+		!/^[a-f0-9]{64}$/.test(input.nextContentDigest) ||
+		typeof input.preparedAt !== "string" ||
+		Number.isNaN(Date.parse(input.preparedAt))
+	) return undefined;
+	try {
+		const relativePath = validateRelativeMarkdownPath(input.path);
+		const previousFileIdentity = parseFileIdentity(input.previousFileIdentity);
+		const previousParentIdentities = parseParentIdentities(input.previousParentIdentities, relativePath);
+		const nextFileIdentity = parseFileIdentity(input.nextFileIdentity);
+		const nextParentIdentities = parseParentIdentities(input.nextParentIdentities, relativePath);
+		if (!previousFileIdentity || !previousParentIdentities || !nextFileIdentity || !nextParentIdentities) {
+			return undefined;
+		}
+		return {
+			version: PLANNING_DOCUMENT_REVISION_INTENT_VERSION,
+			kind: input.kind,
+			path: relativePath,
+			previousFileIdentity,
+			previousParentIdentities,
+			previousContentDigest: input.previousContentDigest,
+			nextFileIdentity,
+			nextParentIdentities,
+			nextContentDigest: input.nextContentDigest,
+			preparedAt: input.preparedAt,
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 export function parsePlanningDocumentEvidence(value: unknown): PlanningDocumentEvidence | undefined {
@@ -525,6 +885,8 @@ export function parsePlanningDocumentEvidence(value: unknown): PlanningDocumentE
 		!/^[a-f0-9]{64}$/.test(input.solutionContentDigest) ||
 		typeof input.planContentDigest !== "string" ||
 		!/^[a-f0-9]{64}$/.test(input.planContentDigest) ||
+		typeof input.approvedPlanContentDigest !== "string" ||
+		!/^[a-f0-9]{64}$/.test(input.approvedPlanContentDigest) ||
 		typeof input.syncedAt !== "string" ||
 		Number.isNaN(Date.parse(input.syncedAt))
 	) {
@@ -534,13 +896,23 @@ export function parsePlanningDocumentEvidence(value: unknown): PlanningDocumentE
 		const solutionPath = validateRelativeMarkdownPath(input.solutionPath);
 		const planPath = validateRelativeMarkdownPath(input.planPath);
 		if (solutionPath === planPath) return undefined;
+		const solutionFileIdentity = parseFileIdentity(input.solutionFileIdentity);
+		const solutionParentIdentities = parseParentIdentities(input.solutionParentIdentities, solutionPath);
+		const planFileIdentity = parseFileIdentity(input.planFileIdentity);
+		const planParentIdentities = parseParentIdentities(input.planParentIdentities, planPath);
+		if (!solutionFileIdentity || !solutionParentIdentities || !planFileIdentity || !planParentIdentities) return undefined;
 		return {
 			version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
 			requirementName: input.requirementName.trim(),
 			solutionPath,
 			planPath,
 			selectionSource: input.selectionSource as DocumentSelectionSource,
+			solutionFileIdentity,
+			solutionParentIdentities,
 			solutionContentDigest: input.solutionContentDigest,
+			planFileIdentity,
+			planParentIdentities,
+			approvedPlanContentDigest: input.approvedPlanContentDigest,
 			planContentDigest: input.planContentDigest,
 			syncedAt: input.syncedAt,
 		};
@@ -569,12 +941,17 @@ export function parseSolutionDocumentEvidence(value: unknown): SolutionDocumentE
 		const solutionPath = validateRelativeMarkdownPath(input.solutionPath);
 		const planPath = validateRelativeMarkdownPath(input.planPath);
 		if (solutionPath === planPath) return undefined;
+		const solutionFileIdentity = parseFileIdentity(input.solutionFileIdentity);
+		const solutionParentIdentities = parseParentIdentities(input.solutionParentIdentities, solutionPath);
+		if (!solutionFileIdentity || !solutionParentIdentities) return undefined;
 		return {
 			version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
 			requirementName: input.requirementName.trim(),
 			solutionPath,
 			planPath,
 			selectionSource: input.selectionSource as DocumentSelectionSource,
+			solutionFileIdentity,
+			solutionParentIdentities,
 			solutionContentDigest: input.solutionContentDigest,
 			syncedAt: input.syncedAt,
 		};

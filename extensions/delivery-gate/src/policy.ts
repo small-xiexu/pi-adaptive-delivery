@@ -25,12 +25,12 @@ export interface PolicyControllerOptions {
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const WRITE_TOOLS = new Set(["edit", "write"]);
 const SAFE_CONTROL_TOOLS = new Set([
-	"delivery_begin",
 	"delivery_runtime_status",
 	"delivery_invalidate",
 	"delivery_progress_sync",
 ]);
 const MANAGED_DELIVERY_TOOLS = new Set([
+	"delivery_begin",
 	...SAFE_CONTROL_TOOLS,
 	"delivery_delegate_readonly",
 	"delivery_delegate_worker",
@@ -55,8 +55,16 @@ function processBaselines(): Map<string, string[]> {
 	return created;
 }
 
-function resolveActiveTools(baseline: readonly string[], policy: DeliveryPolicy): string[] {
-	const active = baseline.filter((name) => READ_TOOLS.has(name) || SAFE_CONTROL_TOOLS.has(name));
+function resolveActiveTools(
+	baseline: readonly string[],
+	policy: DeliveryPolicy,
+	state?: DeliverySnapshot["state"],
+): string[] {
+	const active = baseline.filter((name) =>
+		READ_TOOLS.has(name) ||
+		SAFE_CONTROL_TOOLS.has(name) ||
+		(state === "IDLE" && name === "delivery_begin"),
+	);
 
 	if (policy.sourceWrite || policy.writablePaths.length > 0) {
 		active.push(...baseline.filter((name) => WRITE_TOOLS.has(name)));
@@ -162,7 +170,7 @@ export class PolicyController {
 
 	apply(snapshot: DeliverySnapshot, context: PolicyContext): ApplyPolicyResult {
 		const policy = resolveDeliveryPolicy(snapshot, context);
-		const activeTools = resolveActiveTools(this.baselineTools, policy);
+		const activeTools = resolveActiveTools(this.baselineTools, policy, snapshot.state);
 		const missingTools = requiredTools(policy).filter((name) => !activeTools.includes(name));
 		if (missingTools.length > 0) {
 			const fallback = this.forceReadOnly();

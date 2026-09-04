@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,13 +7,17 @@ import test from "node:test";
 import {
 	assertPlanningDocumentsExist,
 	assertSolutionDocumentCurrent,
+	digestPlanningDocumentContent,
 	extractPlanningDocumentContent,
 	parsePlanningDocumentEvidence,
+	parsePlanningDocumentRevisionIntent,
 	parseSolutionDocumentEvidence,
+	resolvePlanningDocumentRevision,
 	stripAdaptiveDeliveryProtocol,
 	writePlanDocument,
 	writePlanningDocuments,
 	writeSolutionDocument,
+	type PlanningDocumentRevisionIntent,
 } from "../../extensions/delivery-gate/src/planning-documents.ts";
 
 const documents = {
@@ -22,6 +26,8 @@ const documents = {
 	planPath: "docs/Canvas写路径拆分-实施计划.md",
 	selectionSource: "project",
 } as const;
+
+const acknowledgeRevisionIntent = async () => {};
 
 test("extracts exactly one marked solution and plan document", () => {
 	const content = [{
@@ -81,6 +87,8 @@ test("creates two requirement-named Markdown documents and records evidence", as
 	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), solutionContent);
 	assert.match(await readFile(path.join(root, documents.solutionPath), "utf8"), /```mermaid\nflowchart LR/);
 	assert.equal(await readFile(path.join(root, documents.planPath), "utf8"), planContent);
+	assert.equal(evidence.approvedPlanContentDigest, digestPlanningDocumentContent(planContent));
+	assert.equal(evidence.planContentDigest, evidence.approvedPlanContentDigest);
 	assert.deepEqual(parsePlanningDocumentEvidence(evidence), evidence);
 	await assertPlanningDocumentsExist(root, evidence);
 	await assert.rejects(
@@ -122,6 +130,7 @@ test("revises only the unchanged package-written solution and rejects content or
 		documents,
 		solutionContent: second,
 		previous: evidence,
+		onRevisionPrepared: acknowledgeRevisionIntent,
 	});
 	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), second);
 	await assertSolutionDocumentCurrent(root, revised);
@@ -133,6 +142,7 @@ test("revises only the unchanged package-written solution and rejects content or
 			documents,
 			solutionContent: first,
 			previous: revised,
+			onRevisionPrepared: acknowledgeRevisionIntent,
 		}),
 		/content changed and will not be overwritten/,
 	);
@@ -150,6 +160,7 @@ test("revises only the unchanged package-written solution and rejects content or
 			documents,
 			solutionContent: second,
 			previous: swapEvidence,
+			onRevisionPrepared: acknowledgeRevisionIntent,
 			afterResolveBeforeOpen: async () => {
 				await rename(path.join(swapRoot, "docs"), path.join(swapRoot, "docs-original"));
 				await symlink(path.join(outside, "docs"), path.join(swapRoot, "docs"));
@@ -158,6 +169,170 @@ test("revises only the unchanged package-written solution and rejects content or
 		/identity changed/,
 	);
 	assert.equal(await readFile(outsideTarget, "utf8"), first);
+});
+
+test("rejects same-content file or parent replacement between synchronization and revision", async () => {
+	const fileRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-file-identity-"));
+	const first = "# Canvas写路径拆分技术方案\n\n第一版。\n";
+	const second = "# Canvas写路径拆分技术方案\n\n第二版。\n";
+	const fileEvidence = await writeSolutionDocument({ gitRoot: fileRoot, documents, solutionContent: first });
+	await rename(path.join(fileRoot, documents.solutionPath), path.join(fileRoot, `${documents.solutionPath}.old`));
+	await writeFile(path.join(fileRoot, documents.solutionPath), first);
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: fileRoot,
+			documents,
+			solutionContent: second,
+			previous: fileEvidence,
+			onRevisionPrepared: acknowledgeRevisionIntent,
+		}),
+		/file identity changed/,
+	);
+	assert.equal(await readFile(path.join(fileRoot, documents.solutionPath), "utf8"), first);
+
+	const parentRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-parent-identity-"));
+	const parentEvidence = await writeSolutionDocument({ gitRoot: parentRoot, documents, solutionContent: first });
+	await rename(path.join(parentRoot, "docs"), path.join(parentRoot, "docs-old"));
+	await mkdir(path.join(parentRoot, "docs"));
+	await writeFile(path.join(parentRoot, documents.solutionPath), first);
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: parentRoot,
+			documents,
+			solutionContent: second,
+			previous: parentEvidence,
+			onRevisionPrepared: acknowledgeRevisionIntent,
+		}),
+		/file identity changed|parent identity changed/,
+	);
+	assert.equal(await readFile(path.join(parentRoot, documents.solutionPath), "utf8"), first);
+});
+
+test("keeps the old document intact when atomic replacement fails before rename", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-atomic-"));
+	const first = "# Canvas写路径拆分技术方案\n\n第一版。\n";
+	const second = "# Canvas写路径拆分技术方案\n\n第二版。\n";
+	const evidence = await writeSolutionDocument({ gitRoot: root, documents, solutionContent: first });
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: root,
+			documents,
+			solutionContent: second,
+			previous: evidence,
+			onRevisionPrepared: acknowledgeRevisionIntent,
+			afterTemporaryWriteBeforeCommit: async () => { throw new Error("injected replacement failure"); },
+		}),
+		/injected replacement failure/,
+	);
+	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), first);
+	assert.equal((await readdir(path.join(root, "docs"))).some((name) => name.includes("adaptive-delivery")), false);
+});
+
+test("resolves a durable revision intent to the complete old or new document after interruption", async () => {
+	const first = "# Canvas写路径拆分技术方案\n\n第一版。\n";
+	const second = "# Canvas写路径拆分技术方案\n\n第二版。\n";
+
+	const oldRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-intent-old-"));
+	const oldEvidence = await writeSolutionDocument({ gitRoot: oldRoot, documents, solutionContent: first });
+	let oldIntent: PlanningDocumentRevisionIntent | undefined;
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: oldRoot,
+			documents,
+			solutionContent: second,
+			previous: oldEvidence,
+			onRevisionPrepared: async (intent) => {
+				oldIntent = intent;
+				throw new Error("interrupted after intent persistence");
+			},
+		}),
+		/interrupted after intent persistence/,
+	);
+	assert.ok(oldIntent);
+	assert.deepEqual(parsePlanningDocumentRevisionIntent(oldIntent), oldIntent);
+	assert.equal(await resolvePlanningDocumentRevision(oldRoot, oldIntent), "previous");
+	assert.equal(await readFile(path.join(oldRoot, documents.solutionPath), "utf8"), first);
+
+	const nextRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-intent-next-"));
+	const nextEvidence = await writeSolutionDocument({ gitRoot: nextRoot, documents, solutionContent: first });
+	let nextIntent: PlanningDocumentRevisionIntent | undefined;
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: nextRoot,
+			documents,
+			solutionContent: second,
+			previous: nextEvidence,
+			onRevisionPrepared: async (intent) => { nextIntent = intent; },
+			afterRenameBeforeDirectorySync: async () => { throw new Error("injected directory sync failure"); },
+		}),
+		/injected directory sync failure/,
+	);
+	assert.ok(nextIntent);
+	assert.deepEqual(parsePlanningDocumentRevisionIntent(nextIntent), nextIntent);
+	assert.equal(await resolvePlanningDocumentRevision(nextRoot, nextIntent), "next");
+	assert.equal(await readFile(path.join(nextRoot, documents.solutionPath), "utf8"), second);
+});
+
+test("revises an unchanged package-written plan in place and rejects manual changes", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-plan-revise-"));
+	const solutionContent = "# Canvas写路径拆分技术方案\n\n保持公开行为不变。\n";
+	const firstPlan = "# Canvas写路径拆分实施计划\n\n运行第一组固定验证。\n";
+	const secondPlan = "# Canvas写路径拆分实施计划\n\n运行修订后的固定验证。\n";
+	const first = await writePlanningDocuments({
+		gitRoot: root,
+		documents,
+		solutionContent,
+		planContent: firstPlan,
+	});
+	const solutionEvidence = {
+		version: first.version,
+		requirementName: first.requirementName,
+		solutionPath: first.solutionPath,
+		planPath: first.planPath,
+		selectionSource: first.selectionSource,
+		solutionFileIdentity: first.solutionFileIdentity,
+		solutionParentIdentities: first.solutionParentIdentities,
+		solutionContentDigest: first.solutionContentDigest,
+		syncedAt: first.syncedAt,
+	};
+	const revised = await writePlanDocument({
+		gitRoot: root,
+		documents,
+		solutionContent,
+		planContent: secondPlan,
+		solutionEvidence,
+		previous: first,
+		onRevisionPrepared: acknowledgeRevisionIntent,
+	});
+	assert.equal(await readFile(path.join(root, documents.planPath), "utf8"), secondPlan);
+	assert.equal(revised.planContentDigest, digestPlanningDocumentContent(secondPlan));
+
+	await writeFile(path.join(root, documents.planPath), "人工修改\n");
+	await assert.rejects(
+		writePlanDocument({
+			gitRoot: root,
+			documents,
+			solutionContent,
+			planContent: firstPlan,
+			solutionEvidence,
+			previous: revised,
+			onRevisionPrepared: acknowledgeRevisionIntent,
+		}),
+		/content changed and will not be overwritten/,
+	);
+	assert.equal(await readFile(path.join(root, documents.planPath), "utf8"), "人工修改\n");
+	await assert.rejects(
+		writeSolutionDocument({
+			gitRoot: root,
+			documents,
+			solutionContent: "# Canvas写路径拆分技术方案\n\n修订方案。\n",
+			previous: solutionEvidence,
+			previousPlanning: revised,
+			onRevisionPrepared: acknowledgeRevisionIntent,
+		}),
+		/Implementation plan document content changed/,
+	);
+	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), solutionContent);
 });
 
 test("rejects traversal, symlink parents, and a pre-existing second target without partial creation", async () => {

@@ -23,6 +23,8 @@ export interface ValidationCommand {
 	id: string;
 	command: string;
 	timeoutMs: number;
+	repairCommand?: string;
+	repairTimeoutMs?: number;
 }
 
 export interface ProgressCheck {
@@ -97,6 +99,8 @@ export function parseValidationCommands(value: unknown): ValidationCommand[] | u
 	for (const item of value) {
 		if (!item || typeof item !== "object") return undefined;
 		const record = item as Record<string, unknown>;
+		const hasRepairCommand = Object.hasOwn(record, "repairCommand");
+		const hasRepairTimeout = Object.hasOwn(record, "repairTimeoutMs");
 		if (
 			typeof record.id !== "string" ||
 			!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(record.id) ||
@@ -107,12 +111,32 @@ export function parseValidationCommands(value: unknown): ValidationCommand[] | u
 			typeof record.timeoutMs !== "number" ||
 			!Number.isInteger(record.timeoutMs) ||
 			record.timeoutMs < 1000 ||
-			record.timeoutMs > 3_600_000
+			record.timeoutMs > 3_600_000 ||
+			hasRepairCommand !== hasRepairTimeout ||
+			(hasRepairCommand && (
+				typeof record.repairCommand !== "string" ||
+				!record.repairCommand.trim() ||
+				Buffer.byteLength(record.repairCommand, "utf8") > 4096 ||
+				typeof record.repairTimeoutMs !== "number" ||
+				!Number.isInteger(record.repairTimeoutMs) ||
+				record.repairTimeoutMs < 1000 ||
+				record.repairTimeoutMs > 3_600_000
+			))
 		) {
 			return undefined;
 		}
 		seen.add(record.id);
-		commands.push({ id: record.id, command: record.command.trim(), timeoutMs: record.timeoutMs });
+		commands.push({
+			id: record.id,
+			command: record.command.trim(),
+			timeoutMs: record.timeoutMs,
+			...(hasRepairCommand
+				? {
+					repairCommand: (record.repairCommand as string).trim(),
+					repairTimeoutMs: record.repairTimeoutMs as number,
+				}
+				: {}),
+		});
 	}
 	return commands;
 }
@@ -191,6 +215,12 @@ export function parsePlanContractValue(value: unknown): ApprovedPlanContract | u
 	if (!validation || !documents || !progressTargets || !progressChecks || !progressTargets.includes(documents.planPath)) {
 		return undefined;
 	}
+	if (
+		validation.some((command) => command.repairCommand !== undefined) &&
+		input.risk === "low" &&
+		input.complexity === "small" &&
+		input.uncertainty === "low"
+	) return undefined;
 	return {
 		version: PLAN_CONTRACT_VERSION,
 		risk: input.risk,

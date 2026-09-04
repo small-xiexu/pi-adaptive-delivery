@@ -39,6 +39,14 @@ test("rejects unknown fields, empty or duplicate scope, and malformed validation
 	assert.equal(parseTinyContractValue({ ...valid, changeScope: [] }), undefined);
 	assert.equal(parseTinyContractValue({ ...valid, changeScope: [valid.changeScope[0], valid.changeScope[0]] }), undefined);
 	assert.equal(parseTinyContractValue({ ...valid, validation: [{ id: "bad id", command: "test", timeoutMs: 1000 }] }), undefined);
+	assert.equal(parseTinyContractValue({
+		...valid,
+		validation: [{
+			...valid.validation[0],
+			repairCommand: "npm run format",
+			repairTimeoutMs: 120000,
+		}],
+	}), undefined);
 	assert.equal(parseTinyContractValue({ ...valid, validation: [] }), undefined);
 });
 

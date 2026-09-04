@@ -7,7 +7,7 @@ description: 使用风险分级 Delivery Contract、用户授权、单 writer、
 
 ## 适用入口
 
-只有用户明确输入 `/delivery-shape` 才能调用 `delivery_begin` 并从 `IDLE` 启动修改交付。纯问答、只读梳理、状态盘点、诊断和代码评审保持 `IDLE`，即使相关 Delivery 工具当前可见也不得调用 `delivery_begin`。自然语言只读请求后续转为修改时，先提示用户使用 `/delivery-shape <需求>`，不能在原只读回合自行启动流程。
+只有用户明确输入 `/delivery-shape` 才能调用 `delivery_begin` 并从 `IDLE` 启动修改交付；runtime 在其他状态不暴露该工具。纯问答、只读梳理、状态盘点、诊断和代码评审保持 `IDLE`。自然语言只读请求后续转为修改时，先提示用户使用 `/delivery-shape <需求>`，不能在原只读回合自行启动流程。
 
 ## 不变量
 
@@ -89,7 +89,7 @@ docs/<需求短名称>-实施计划.md
 
 需求短名称描述稳定用户目标，不使用日期、版本尾缀、代码行号或可能变化的实现方式。方案回复必须展示需求名、两条路径和 `user|project|global|package-default` 选择来源。规则冲突、远程 Issue/TODO、多个唯一台账候选或路径职责不明确时停止询问，不能静默 fallback。
 
-solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源，确认后立即 create-only 写入技术方案，但仍保持只读。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 复验技术方案摘要并只 create-only 写入实施计划；两份文档成功并记录摘要后才进入 `IMPLEMENTING`。实施计划批准前执行 `/delivery-revise` 时保留方案路径和同步摘要，重新批准只允许更新仍与该摘要一致的 regular file；人工改动或 symlink 漂移必须拒绝覆盖。Session entry 仍是批准主体，文件不能反向授予权限。
+solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源，首次确认后立即 create-only 写入技术方案，但仍保持只读。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 复验技术方案摘要并在首次批准时只 create-only 写入实施计划；两份文档成功并记录摘要后才进入 `IMPLEMENTING`。已同步两份文档后执行 `/delivery-revise` 时保留原 evidence，重新批准只允许更新路径、文件身份和现场摘要仍匹配的同一份 Package 文档；人工改动或 symlink 漂移必须拒绝覆盖。Session entry 仍是批准主体，文件不能反向授予权限。
 
 显示 Standard/High-Risk plan 批准对话前，Extension 必须用 pi-subagents 公开 preflight 证明 builtin reviewer 至少有一个可用 model candidate，且只读工具、`denyExtensions`、output 和 cwd 边界成立。preflight 不启动 child 或调用 Provider。无可用 reviewer/fallback 时保持待批准和只读，先让用户修复模型配置；不得先实现再等验证资源。Tiny 不 preflight reviewer。
 
@@ -126,11 +126,12 @@ Delivery 工具按状态动态开放。任何时候不确定当前阶段时，�
 
 - `IMPLEMENTING` 和授权 `REWORKING` 根据 plan route 二选一：`single` 只给父 Pi 源码写入工具与 `delivery_submit_candidate`；`standard/high-risk` 从父 Pi 移除源码写入，只给 `delivery_delegate_worker`。
 - `delivery_delegate_worker` 使用 builtin fresh foreground worker。父进程在 child 运行期间保管 workspace lease，但没有写工具、没有并行下一回合，且 tool-batch barrier 拒绝 sibling write；匹配 run ID 和 `launchContractDigest` 的 terminal response 到达后才自动冻结 candidate 与释放 lease。proof 缺失时保留 lease并 BLOCKED。
+- builtin worker 不获得 shell、ambient Extension 或 MCP。确需 formatter/generator 确定性改写时，plan v2 的对应 validation item 必须同时声明用户批准的 `repairCommand` 和 `repairTimeoutMs`；Delivery Gate 只在可信 worker terminal 后、candidate freeze 前、同一 lease 内执行。Tiny 不支持 repair command，调用者不能临时传入命令，失败时不得冻结 candidate。
 - 候选提交成功、状态切到 `VALIDATING` 后，验证、审查、返工和完成工具才会在下一次模型请求中出现。
 - 后续阶段工具提前不可见不是运行时故障，不得以此为由撤销批准或删除规划文档。
 - 当前阶段必需工具确实缺失时可以 `delivery_invalidate(target=BLOCKED)` 暂停；该动作只释放 writer 并保留批准链、规划文档、candidate 和 evidence。恢复权限仍必须由 TUI 用户执行 `/delivery-resume`。
 - 只有需求、范围、架构或计划真的失效时，才使用 `SHAPING` 或 `PLANNING` 目标撤销相应批准。
-- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 Delivery Contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。
+- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 Delivery Contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；TUI validation 窗口隐藏默认高频 spinner并使用低频进度更新。父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。
 - validation terminal checkpoint 保存绑定 candidate 的批次 ID 和逐命令摘要。命令无法启动、工具中断或 terminal checkpoint 缺失按 infrastructure failure；真实非零退出或超时只证明批准命令未通过。父会话必须再区分候选代码、验证环境和已批准计划，只有代码问题调用 `delivery_begin_rework`，计划错误使用 `/delivery-revise`。
 
 ```text

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,10 @@ import { resolveCurrentSubagentCapabilityCeiling } from "pi-subagents/capability
 import deliveryGate from "../../extensions/delivery-gate/index.ts";
 import { digestApprovalContent } from "../../extensions/delivery-gate/src/approvals.ts";
 import { DIAGRAM_ENTRY_CUSTOM_TYPE } from "../../extensions/delivery-gate/src/diagrams.ts";
-import { digestPlanningDocumentContent } from "../../extensions/delivery-gate/src/planning-documents.ts";
+import {
+	digestPlanningDocumentContent,
+	PLANNING_DOCUMENT_EVIDENCE_VERSION,
+} from "../../extensions/delivery-gate/src/planning-documents.ts";
 import {
 	DELIVERY_STATE_CUSTOM_TYPE,
 	createInitialRuntimeState,
@@ -42,16 +45,29 @@ const TEST_MODEL = {
 	contextWindow: 100000,
 	maxTokens: 4096,
 };
+
+function fixtureDocumentIdentity(cwd: string, relativeFile: string) {
+	const root = realpathSync(cwd);
+	const stats = lstatSync(path.join(root, relativeFile));
+	const parentIdentities: Array<{ relativePath: string; dev: number; ino: number }> = [];
+	let current = "";
+	for (const component of path.dirname(relativeFile).split(path.sep).filter((value) => value !== ".")) {
+		current = current ? path.join(current, component) : component;
+		const parent = lstatSync(path.join(root, current));
+		parentIdentities.push({ relativePath: current, dev: parent.dev, ino: parent.ino });
+	}
+	return { fileIdentity: { dev: stats.dev, ino: stats.ino }, parentIdentities };
+}
 const BASE_ACTIVE_TOOLS = [
 	"read",
 	"grep",
 	"find",
 	"ls",
 	"delivery_runtime_status",
-	"delivery_begin",
 	"delivery_progress_sync",
 	"delivery_invalidate",
 ];
+const IDLE_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS.slice(0, 5), "delivery_begin", ...BASE_ACTIVE_TOOLS.slice(5)];
 const READONLY_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS, "delivery_delegate_readonly"];
 const WRITER_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS, "edit", "write", "delivery_submit_candidate"];
 const DELEGATED_WRITER_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS, "delivery_delegate_worker"];
@@ -69,6 +85,8 @@ interface FakeUi {
 	setStatus(key: string, value: string | undefined): void;
 	notify(message: string, level?: string): void;
 	confirm(title: string, message: string): Promise<boolean>;
+	setWorkingVisible(visible: boolean): void;
+	workingVisibility: boolean[];
 	theme: { fg(_color: string, text: string): string };
 }
 
@@ -105,9 +123,11 @@ function createHarness(
 	let workerIncludeTerminalRunId = true;
 	let workerExecution: (() => void) | undefined;
 	let failSendUserMessage = false;
+	let failNextWorkingVisibilityAfterEffect = false;
 	const ui: FakeUi = {
 		statuses: [],
 		notifications: [],
+		workingVisibility: [],
 		setStatus(key, value) {
 			this.statuses.push([key, value]);
 		},
@@ -118,6 +138,13 @@ function createHarness(
 			confirmCalls += 1;
 			confirmationRequests.push({ title, message });
 			return confirmResult;
+		},
+		setWorkingVisible(visible) {
+			this.workingVisibility.push(visible);
+			if (failNextWorkingVisibilityAfterEffect) {
+				failNextWorkingVisibilityAfterEffect = false;
+				throw new Error("setWorkingVisible injected failure");
+			}
 		},
 		theme: { fg: (_color, text) => text },
 	};
@@ -264,6 +291,15 @@ function createHarness(
 		},
 		setExecExecution: (execute: () => void) => {
 			execExecution = execute;
+		},
+		invalidateWriterLease: () => {
+			const leases = path.join(stateRoot, "leases");
+			for (const name of existsSync(leases) ? readdirSync(leases) : []) {
+				if (name.endsWith(".json")) unlinkSync(path.join(leases, name));
+			}
+		},
+		failNextWorkingVisibilityAfterEffect: () => {
+			failNextWorkingVisibilityAfterEffect = true;
 		},
 		setReviewText: (value: string) => {
 			reviewText = value;
@@ -469,6 +505,9 @@ function approvalBranch(
 	};
 	const needsSolution = ["PLANNING", "PLAN_PENDING_APPROVAL", "IMPLEMENTING", "VALIDATING", "REWORKING", "BLOCKED"].includes(state);
 	const needsPlanApproval = ["IMPLEMENTING", "VALIDATING", "REWORKING"].includes(state);
+	if (needsSolution && canonicalCwd === realpathSync(process.cwd())) {
+		throw new Error("Planning document fixtures must use an isolated Git repository");
+	}
 	const extractedSolution = `${`# ${TEST_REQUIREMENT_NAME}-技术方案`}\n\n保持公开行为不变。\n`;
 	const extractedPlan = `${`# ${TEST_REQUIREMENT_NAME}-实施计划`}\n\nStatus: pending\n`;
 	if (needsSolution && !existsSync(path.join(cwd, TEST_SOLUTION_PATH))) {
@@ -477,6 +516,8 @@ function approvalBranch(
 	if (needsPlanApproval) {
 		writeFileSync(path.join(cwd, TEST_PLAN_PATH), extractedPlan);
 	}
+	const solutionIdentity = needsSolution ? fixtureDocumentIdentity(cwd, TEST_SOLUTION_PATH) : undefined;
+	const planIdentity = needsPlanApproval ? fixtureDocumentIdentity(cwd, TEST_PLAN_PATH) : undefined;
 	return [
 		{ type: "message", id: "user-1", message: { role: "user", content: "request" } },
 		{ type: "message", id: "assistant-solution", message: { role: "assistant", content: solutionContent } },
@@ -503,12 +544,17 @@ function approvalBranch(
 					? {
 								planContract,
 								planningDocuments: {
-									version: 1,
+									version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
 									requirementName: TEST_REQUIREMENT_NAME,
 									solutionPath: TEST_SOLUTION_PATH,
 									planPath: TEST_PLAN_PATH,
 									selectionSource: "project",
+									solutionFileIdentity: solutionIdentity!.fileIdentity,
+									solutionParentIdentities: solutionIdentity!.parentIdentities,
 									solutionContentDigest: digestPlanningDocumentContent(extractedSolution),
+									planFileIdentity: planIdentity!.fileIdentity,
+									planParentIdentities: planIdentity!.parentIdentities,
+									approvedPlanContentDigest: digestPlanningDocumentContent(extractedPlan),
 									planContentDigest: digestPlanningDocumentContent(extractedPlan),
 									syncedAt: "2026-01-01T00:01:00.000Z",
 								},
@@ -517,11 +563,13 @@ function approvalBranch(
 				...(needsSolution && !needsPlanApproval
 					? {
 							solutionDocument: {
-								version: 1,
+								version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
 								requirementName: TEST_REQUIREMENT_NAME,
 								solutionPath: TEST_SOLUTION_PATH,
 								planPath: TEST_PLAN_PATH,
 								selectionSource: "project",
+								solutionFileIdentity: solutionIdentity!.fileIdentity,
+								solutionParentIdentities: solutionIdentity!.parentIdentities,
 								solutionContentDigest: digestPlanningDocumentContent(extractedSolution),
 								syncedAt: "2026-01-01T00:00:30.000Z",
 							},
@@ -530,6 +578,17 @@ function approvalBranch(
 			},
 		},
 	];
+}
+
+function addApprovedRepairCommand(branch: any[], command = "npm run format"): void {
+	const planEntry = branch.find((entry: any) => entry.id === "assistant-1") as any;
+	const planContract = JSON.parse(planEntry.message.content[0].text.match(/```adaptive-delivery-plan\n([\s\S]*?)\n```/)![1]);
+	planContract.validation[0].repairCommand = command;
+	planContract.validation[0].repairTimeoutMs = 30000;
+	planEntry.message.content[0].text = planEntry.message.content[0].text.replace(
+		/```adaptive-delivery-plan\n[\s\S]*?\n```/,
+		`\`\`\`adaptive-delivery-plan\n${JSON.stringify(planContract)}\n\`\`\``,
+	);
 }
 
 function tinyApprovalBranch(sessionId: string, cwd: string, changeScope = ["tracked.txt"]) {
@@ -605,7 +664,7 @@ test("restores IDLE as read-only and exposes Chinese status", async () => {
 
 	await emit(harness, "session_start");
 
-	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+	assert.deepEqual(harness.getActiveTools(), IDLE_ACTIVE_TOOLS);
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "空闲 [IDLE]"]);
 	assert.ok(harness.commands.has("delivery-status"));
 	assert.equal(harness.appendedEntries.length, 1);
@@ -633,7 +692,7 @@ test("restores IDLE as read-only and exposes Chinese status", async () => {
 	);
 	assert.equal(runtimeStatus.details.state, "IDLE");
 	assert.equal(runtimeStatus.details.implementationWriter, undefined);
-	assert.deepEqual(runtimeStatus.details.activeTools, BASE_ACTIVE_TOOLS);
+	assert.deepEqual(runtimeStatus.details.activeTools, IDLE_ACTIVE_TOOLS);
 });
 
 test("registers a display-only transformer that hides internal protocol from assistant Markdown", () => {
@@ -818,7 +877,7 @@ test("fails closed for malformed branch state", async () => {
 });
 
 test("fails closed when a persisted approval no longer matches cwd or branch", async () => {
-	const harness = createHarness();
+	const harness = createHarness(candidateRepo());
 	const entries = approvalBranch("PLANNING", harness.sessionId, harness.ctx.cwd);
 	const content = (entries[1] as any).message.content;
 	(entries.at(-1) as any).data.approvals = {
@@ -967,6 +1026,225 @@ test("revises the synchronized solution in place but never overwrites manual cha
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /will not be overwritten/);
 });
 
+test("revises already synchronized solution and plan documents in place", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const initialBranch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd);
+	harness.setBranch(initialBranch);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: pending/);
+
+	await harness.commands.get("delivery-revise")?.handler("", harness.ctx);
+	const revising = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(revising.snapshot.state, "SHAPING");
+	assert.equal(revising.planningDocuments.planPath, TEST_PLAN_PATH);
+	assert.equal(revising.solutionDocument.solutionPath, TEST_SOLUTION_PATH);
+
+	const revisedSolution = structuredClone((initialBranch.find((entry: any) => entry.id === "assistant-solution") as any).message.content);
+	revisedSolution[0].text = revisedSolution[0].text.replace("保持公开行为不变。", "保持公开行为与错误优先级不变。");
+	const solutionRevisionBranch = [
+		...initialBranch,
+		{ type: "message", id: "solution-revision-request", message: { role: "user", content: "revise solution" } },
+		{ type: "message", id: "assistant-revised-solution", message: { role: "assistant", content: revisedSolution } },
+	];
+	harness.setBranch(solutionRevisionBranch);
+	await harness.commands.get("delivery-approve-solution")?.handler("", harness.ctx);
+	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /错误优先级不变/);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: pending/);
+
+	const revisedPlan = structuredClone((initialBranch.find((entry: any) => entry.id === "assistant-1") as any).message.content);
+	revisedPlan[0].text = revisedPlan[0].text.replace("Status: pending", "Status: revised");
+	const revisedPlanContract = JSON.parse(revisedPlan[0].text.match(/```adaptive-delivery-plan\n([\s\S]*?)\n```/)![1]);
+	revisedPlanContract.validation[0].command = "npm test -- revised";
+	revisedPlan[0].text = revisedPlan[0].text.replace(
+		/```adaptive-delivery-plan\n[\s\S]*?\n```/,
+		`\`\`\`adaptive-delivery-plan\n${JSON.stringify(revisedPlanContract)}\n\`\`\``,
+	);
+	harness.setBranch([
+		...solutionRevisionBranch,
+		{ type: "message", id: "plan-revision-request", message: { role: "user", content: "revise plan" } },
+		{ type: "message", id: "assistant-revised-plan", message: { role: "assistant", content: revisedPlan } },
+	]);
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: revised/);
+	const completed = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(completed.snapshot.state, "IMPLEMENTING");
+	assert.equal(completed.solutionDocument, undefined);
+	assert.equal(completed.planContract.validation[0].command, "npm test -- revised");
+	assert.equal(completed.planningDocuments.planContentDigest, digestPlanningDocumentContent(`# ${TEST_REQUIREMENT_NAME}-实施计划\n\nStatus: revised\n`));
+});
+
+test("restores between a synchronized solution revision and the following plan revision", async () => {
+	const repo = candidateRepo();
+	const first = createHarness(repo);
+	first.setConfirmResult(true);
+	const initialBranch = approvalBranch("PLAN_PENDING_APPROVAL", first.sessionId, first.ctx.cwd);
+	first.setBranch(initialBranch);
+	await emit(first, "session_start");
+	await first.commands.get("delivery-approve-plan")?.handler("", first.ctx);
+	await first.commands.get("delivery-revise")?.handler("", first.ctx);
+
+	const revisedSolution = structuredClone((initialBranch.find((entry: any) => entry.id === "assistant-solution") as any).message.content);
+	revisedSolution[0].text = revisedSolution[0].text.replace("保持公开行为不变。", "保持公开行为与恢复语义不变。");
+	const revisionBranch = [
+		...initialBranch,
+		{ type: "message", id: "solution-revision-request", message: { role: "user", content: "revise solution" } },
+		{ type: "message", id: "assistant-revised-solution", message: { role: "assistant", content: revisedSolution } },
+	];
+	first.setBranch(revisionBranch);
+	await first.commands.get("delivery-approve-solution")?.handler("", first.ctx);
+	const persisted = structuredClone(first.appendedEntries.at(-1)?.data as any);
+	assert.equal(persisted.snapshot.state, "PLANNING");
+	assert.ok(persisted.solutionDocument);
+	assert.ok(persisted.planningDocuments);
+	await emit(first, "session_shutdown");
+
+	const second = createHarness(repo, { sessionId: first.sessionId, stateRoot: first.stateRoot });
+	second.setBranch([
+		...revisionBranch,
+		{ type: "custom", id: "revision-state", customType: DELIVERY_STATE_CUSTOM_TYPE, data: persisted },
+	]);
+	await emit(second, "session_start");
+
+	assert.deepEqual(second.ui.statuses.at(-1), ["adaptive-delivery", "实施计划编制中 [PLANNING]"]);
+	assert.match(readFileSync(path.join(repo, TEST_SOLUTION_PATH), "utf8"), /恢复语义不变/);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: pending/);
+});
+
+test("reconciles a persisted planning revision intent to only its complete old or new state", async () => {
+	for (const outcome of ["previous", "next"] as const) {
+		const repo = candidateRepo();
+		const harness = createHarness(repo);
+		const branch = approvalBranch("IMPLEMENTING", harness.sessionId, harness.ctx.cwd);
+		const runtime = (branch.at(-1) as any).data;
+		const previous = runtime.planningDocuments;
+		const previousSolution = {
+			version: previous.version,
+			requirementName: previous.requirementName,
+			solutionPath: previous.solutionPath,
+			planPath: previous.planPath,
+			selectionSource: previous.selectionSource,
+			solutionFileIdentity: previous.solutionFileIdentity,
+			solutionParentIdentities: previous.solutionParentIdentities,
+			solutionContentDigest: previous.solutionContentDigest,
+			syncedAt: previous.syncedAt,
+		};
+		const nextContent = `# ${TEST_REQUIREMENT_NAME}-技术方案\n\n恢复到完整新态。\n`;
+		const temporary = path.join(repo, "docs", `.revision-${outcome}.tmp`);
+		writeFileSync(temporary, nextContent);
+		const nextStats = lstatSync(temporary);
+		runtime.snapshot = { state: "SHAPING" };
+		runtime.approvals = {};
+		runtime.planContract = undefined;
+		runtime.solutionDocument = previousSolution;
+		runtime.planningDocumentRevision = {
+			version: 1,
+			kind: "solution",
+			path: TEST_SOLUTION_PATH,
+			previousFileIdentity: previous.solutionFileIdentity,
+			previousParentIdentities: previous.solutionParentIdentities,
+			previousContentDigest: previous.solutionContentDigest,
+			nextFileIdentity: { dev: nextStats.dev, ino: nextStats.ino },
+			nextParentIdentities: previous.solutionParentIdentities,
+			nextContentDigest: digestPlanningDocumentContent(nextContent),
+			preparedAt: "2026-01-01T00:02:00.000Z",
+		};
+		if (outcome === "next") renameSync(temporary, path.join(repo, TEST_SOLUTION_PATH));
+		harness.setBranch(branch);
+
+		await emit(harness, "session_start");
+
+		assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "方案梳理中 [SHAPING]"]);
+		const reconciled = harness.appendedEntries.at(-1)?.data as any;
+		assert.equal(reconciled.planningDocumentRevision, undefined);
+		assert.equal(
+			reconciled.solutionDocument.solutionContentDigest,
+			outcome === "next" ? digestPlanningDocumentContent(nextContent) : previous.solutionContentDigest,
+		);
+		assert.equal(reconciled.planningDocuments.solutionContentDigest, reconciled.solutionDocument.solutionContentDigest);
+	}
+});
+
+test("restores real plan revision intent checkpoints to old or new state before reapproval", async () => {
+	for (const outcome of ["previous", "next"] as const) {
+		const repo = candidateRepo();
+		const first = createHarness(repo);
+		first.setConfirmResult(true);
+		const initialBranch = approvalBranch("PLAN_PENDING_APPROVAL", first.sessionId, first.ctx.cwd);
+		first.setBranch(initialBranch);
+		await emit(first, "session_start");
+		await first.commands.get("delivery-approve-plan")?.handler("", first.ctx);
+		await first.commands.get("delivery-revise")?.handler("plan", first.ctx);
+
+		const oldPlanPath = path.join(repo, "docs", `.plan-revision-${outcome}.old`);
+		linkSync(path.join(repo, TEST_PLAN_PATH), oldPlanPath);
+		const revisedPlan = structuredClone((initialBranch.find((entry: any) => entry.id === "assistant-1") as any).message.content);
+		revisedPlan[0].text = revisedPlan[0].text.replace("Status: pending", `Status: recovered-${outcome}`);
+		const revisedPlanContract = JSON.parse(revisedPlan[0].text.match(/```adaptive-delivery-plan\n([\s\S]*?)\n```/)![1]);
+		revisedPlanContract.validation[0].command = `npm test -- recovered-${outcome}`;
+		revisedPlan[0].text = revisedPlan[0].text.replace(
+			/```adaptive-delivery-plan\n[\s\S]*?\n```/,
+			`\`\`\`adaptive-delivery-plan\n${JSON.stringify(revisedPlanContract)}\n\`\`\``,
+		);
+		const revisionBranch = [
+			...initialBranch,
+			{ type: "message", id: `plan-revision-request-${outcome}`, message: { role: "user", content: "revise plan" } },
+			{ type: "message", id: `assistant-revised-plan-${outcome}`, message: { role: "assistant", content: revisedPlan } },
+		];
+		first.setBranch(revisionBranch);
+		await first.commands.get("delivery-approve-plan")?.handler("", first.ctx);
+
+		const intentCheckpoint = structuredClone(
+			(first.appendedEntries.find((entry) => (entry.data as any).planningDocumentRevision)?.data ?? null) as any,
+		);
+		assert.ok(intentCheckpoint?.planningDocumentRevision);
+		assert.equal(intentCheckpoint.snapshot.state, "PLANNING");
+		assert.equal(intentCheckpoint.approvals.plan, undefined);
+		assert.equal(intentCheckpoint.planContract, undefined);
+		assert.ok(intentCheckpoint.approvals.solution);
+		if (outcome === "previous") renameSync(oldPlanPath, path.join(repo, TEST_PLAN_PATH));
+		else unlinkSync(oldPlanPath);
+		await emit(first, "session_shutdown");
+
+		const second = createHarness(repo, { sessionId: first.sessionId, stateRoot: first.stateRoot });
+		second.setConfirmResult(true);
+		second.setBranch([
+			...revisionBranch,
+			{ type: "custom", id: `plan-intent-${outcome}`, customType: DELIVERY_STATE_CUSTOM_TYPE, data: intentCheckpoint },
+		]);
+		await emit(second, "session_start");
+
+		assert.deepEqual(second.ui.statuses.at(-1), ["adaptive-delivery", "实施计划编制中 [PLANNING]"]);
+		const reconciled = second.appendedEntries.find((entry) => !(entry.data as any).planningDocumentRevision)?.data as any;
+		assert.equal(reconciled.planningDocumentRevision, undefined);
+		assert.equal(reconciled.approvals.plan, undefined);
+		assert.equal(reconciled.planContract, undefined);
+		assert.equal(
+			reconciled.planningDocuments.planContentDigest,
+			outcome === "next"
+				? digestPlanningDocumentContent(`# ${TEST_REQUIREMENT_NAME}-实施计划\n\nStatus: recovered-next\n`)
+				: intentCheckpoint.planningDocumentRevision.previousContentDigest,
+		);
+		await second.commands.get("delivery-approve-plan")?.handler("", second.ctx);
+
+		const completed = second.appendedEntries.at(-1)?.data as any;
+		assert.equal(
+			completed.snapshot.state,
+			"IMPLEMENTING",
+			JSON.stringify(second.ui.notifications, null, 2),
+		);
+		assert.equal(completed.approvals.plan.entryId, `assistant-revised-plan-${outcome}`);
+		assert.equal(completed.planContract.validation[0].command, `npm test -- recovered-${outcome}`);
+		assert.equal(completed.planningDocumentRevision, undefined);
+		assert.equal(
+			completed.planningDocuments.planContentDigest,
+			digestPlanningDocumentContent(`# ${TEST_REQUIREMENT_NAME}-实施计划\n\nStatus: recovered-${outcome}\n`),
+		);
+	}
+});
+
 test("records plan approval and enters writer state after acquiring the lease", async () => {
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
@@ -1071,6 +1349,91 @@ test("standard route delegates one worker and freezes its terminal candidate", a
 	assert.match(statusText, /开发执行者：已完成（运行 ID：worker-run）/);
 	await harness.commands.get("delivery-force-release-lease")?.handler("", harness.ctx);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /没有写入租约/);
+});
+
+test("runs only the plan-approved deterministic repair after the worker and before candidate freeze", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard");
+	addApprovedRepairCommand(branch);
+	harness.setBranch(branch);
+	harness.configureWorkerResponse({
+		execute: () => writeFileSync(path.join(repo, "worker-change.txt"), "needs formatting\n"),
+	});
+	harness.setExecExecution(() => writeFileSync(path.join(repo, "worker-change.txt"), "formatted\n"));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	const result = await harness.tools.get("delivery_delegate_worker").execute(
+		"worker-with-repair",
+		{},
+		undefined,
+		() => { throw new Error("render failed"); },
+		harness.ctx,
+	);
+
+	assert.equal(readFileSync(path.join(repo, "worker-change.txt"), "utf8"), "formatted\n");
+	assert.deepEqual(harness.execCalls.at(-1), { command: "/bin/sh", args: ["-c", "npm run format"] });
+	assert.match(result.details.candidateDigest, /^[a-f0-9]{64}$/);
+	assert.equal((harness.appendedEntries.at(-1)?.data as any).snapshot.state, "VALIDATING");
+});
+
+test("blocks without freezing a candidate when an approved deterministic repair fails", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard");
+	addApprovedRepairCommand(branch);
+	harness.setBranch(branch);
+	harness.configureWorkerResponse({
+		execute: () => writeFileSync(path.join(repo, "worker-change.txt"), "needs formatting\n"),
+	});
+	harness.setExecResult({ stdout: "", stderr: "format failed", code: 1, killed: false });
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute("worker-repair-failure", {}, undefined, undefined, harness.ctx),
+		/Approved deterministic repair failed/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.equal(blocked.writerLease, undefined);
+	assert.equal(blocked.workerStatus, "completed");
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
+test("does not run an approved repair when lease ownership changed after worker terminal", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard");
+	addApprovedRepairCommand(branch);
+	harness.setBranch(branch);
+	harness.configureWorkerResponse({
+		execute: () => {
+			writeFileSync(path.join(repo, "worker-change.txt"), "needs formatting\n");
+			harness.invalidateWriterLease();
+		},
+	});
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute("worker-lost-lease", {}, undefined, undefined, harness.ctx),
+		/Writer lease ownership changed before approved deterministic repair/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.equal(harness.execCalls.length, 0);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("standard route blocks before source work when worker preflight is shadowed", async () => {
@@ -1502,7 +1865,7 @@ test("plan approval rejects document paths that differ from the approved solutio
 });
 
 test("rejects plan approval when the solution approval is missing", async () => {
-	const harness = createHarness();
+	const harness = createHarness(candidateRepo());
 	harness.setConfirmResult(true);
 	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd);
 	delete (branch.at(-1) as any).data.approvals;
@@ -1553,7 +1916,7 @@ test("blocks restore when planning document evidence does not match approved con
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
 	const branch = approvalBranch("IMPLEMENTING", harness.sessionId, harness.ctx.cwd);
-	(branch.at(-1) as any).data.planningDocuments.planContentDigest = "a".repeat(64);
+	(branch.at(-1) as any).data.planningDocuments.approvedPlanContentDigest = "a".repeat(64);
 	harness.setBranch(branch);
 
 	await emit(harness, "session_start");
@@ -1786,7 +2149,7 @@ test("cancels navigation when read-only policy cannot be applied", async () => {
 });
 
 test("resume and force-release cannot bypass the TUI confirmation gate", async () => {
-	const rpcHarness = createHarness();
+	const rpcHarness = createHarness(candidateRepo());
 	const rpcBlockedBranch = approvalBranch("BLOCKED", rpcHarness.sessionId, rpcHarness.ctx.cwd);
 	(rpcBlockedBranch.at(-1) as any).data.snapshot = { state: "BLOCKED", resumeState: "PLANNING" };
 	rpcHarness.setMode("rpc");
@@ -1799,7 +2162,7 @@ test("resume and force-release cannot bypass the TUI confirmation gate", async (
 	assert.equal(rpcHarness.sentUserMessages.length, 0);
 	assert.deepEqual(rpcHarness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 
-	const tuiHarness = createHarness();
+	const tuiHarness = createHarness(candidateRepo());
 	const tuiBlockedBranch = approvalBranch("BLOCKED", tuiHarness.sessionId, tuiHarness.ctx.cwd);
 	(tuiBlockedBranch.at(-1) as any).data.snapshot = { state: "BLOCKED", resumeState: "PLANNING" };
 	tuiHarness.setConfirmResult(true);
@@ -1818,7 +2181,7 @@ test("resume and force-release cannot bypass the TUI confirmation gate", async (
 });
 
 test("resume does not auto-continue after TUI cancellation or a failed policy commit", async () => {
-	const cancelled = createHarness();
+	const cancelled = createHarness(candidateRepo());
 	const cancelledBranch = approvalBranch("BLOCKED", cancelled.sessionId, cancelled.ctx.cwd);
 	(cancelledBranch.at(-1) as any).data.snapshot = { state: "BLOCKED", resumeState: "PLANNING" };
 	cancelled.setBranch(cancelledBranch);
@@ -1828,7 +2191,7 @@ test("resume does not auto-continue after TUI cancellation or a failed policy co
 	assert.equal(cancelled.sentUserMessages.length, 0);
 	assert.deepEqual(cancelled.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 
-	const failed = createHarness();
+	const failed = createHarness(candidateRepo());
 	const failedBranch = approvalBranch("BLOCKED", failed.sessionId, failed.ctx.cwd);
 	(failedBranch.at(-1) as any).data.snapshot = { state: "BLOCKED", resumeState: "PLANNING" };
 	failed.setBranch(failedBranch);
@@ -1888,11 +2251,13 @@ test("freezes one candidate, launches only approved validation, and invalidates 
 	);
 
 	const updates: any[] = [];
+	harness.failNextWorkingVisibilityAfterEffect();
 	const validation = await validate.execute("validate-1", {}, undefined, (update: any) => updates.push(update), harness.ctx);
 	assert.match(validation.details.runId, /^[a-f0-9-]{36}$/);
 	assert.equal(validation.details.candidateDigest, candidateDigest);
 	assert.equal(validation.details.result.status, "passed");
 	assert.match(validation.content[0].text, /unit：通过/);
+	assert.deepEqual(harness.ui.workingVisibility, [false, true]);
 	assert.equal(updates.length >= 2, true);
 	assert.match(updates[0].content[0].text, /正在启动固定验证/);
 	assert.match(updates.at(-1).content[0].text, /unit：通过/);
@@ -1940,7 +2305,13 @@ test("ignores validation artifacts but blocks and diagnoses real candidate drift
 		mkdirSync(path.join(repo, "runtime-cache"));
 		writeFileSync(path.join(repo, "runtime-cache", "result.bin"), "generated during validation\n");
 	});
-	const validation = await harness.tools.get("delivery_validate").execute("validate", {}, undefined, undefined, harness.ctx);
+	const validation = await harness.tools.get("delivery_validate").execute(
+		"validate",
+		{},
+		undefined,
+		() => { throw new Error("render failed"); },
+		harness.ctx,
+	);
 	assert.equal(validation.details.result.status, "passed");
 	assert.equal(validation.details.staleCandidate, undefined);
 	const persisted = harness.appendedEntries.at(-1)?.data as any;
@@ -2206,6 +2577,7 @@ test("blocks a failed approved command and ignores unrelated async completion", 
 	assert.equal((harness.appendedEntries.at(-1)?.data as any).validationFailureKind, "candidate");
 	assert.match(validation.content[0].text, /unit：失败/);
 	assert.match(validation.content[0].text, /tests failed/);
+	assert.deepEqual(harness.ui.workingVisibility, [false, true]);
 	const entryCount = harness.appendedEntries.length;
 	await emitBus(harness, "subagent:async-complete", {
 		runId: validation.details.runId,
@@ -2279,6 +2651,9 @@ test("syncs only the approved progress target at a writer-free boundary", async 
 
 	assert.match(result.content[0].text, /项目进度已同步/);
 	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: complete/);
+	const synchronized = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(synchronized.planningDocuments.approvedPlanContentDigest, digestPlanningDocumentContent(`# ${TEST_REQUIREMENT_NAME}-实施计划\n\nStatus: pending\n`));
+	assert.equal(synchronized.planningDocuments.planContentDigest, result.details.digest);
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "验证中 [VALIDATING]"]);
 	assert.equal(harness.execCalls.some((call) => call.command === "git" && call.args.includes("--check")), true);
 	await harness.commands.get("delivery-status")?.handler("", harness.ctx);
@@ -2317,6 +2692,9 @@ test("blocks after a failed progress check without leaving write tools or lease"
 	);
 
 	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: complete/);
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.planningDocuments.approvedPlanContentDigest, digestPlanningDocumentContent(`# ${TEST_REQUIREMENT_NAME}-实施计划\n\nStatus: pending\n`));
+	assert.equal(blocked.planningDocuments.planContentDigest, digestPlanningDocumentContent(`# ${TEST_REQUIREMENT_NAME}-实施计划\n\nStatus: complete\n`));
 	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 	const confirmations = harness.getConfirmCalls();

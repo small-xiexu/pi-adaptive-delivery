@@ -56,11 +56,15 @@ import {
 	parsePlanContractFromContent,
 	parsePlanningDocumentsFromContent,
 	selectDeliveryRoute,
+	type ValidationCommand,
 } from "./src/plan-contract.ts";
 import {
+	assertPlanDocumentCurrent,
 	assertPlanningDocumentsExist,
 	assertSolutionDocumentCurrent,
 	extractPlanningDocumentContent,
+	refreshPlanDocumentEvidence,
+	resolvePlanningDocumentRevision,
 	stripAdaptiveDeliveryProtocol,
 	writePlanDocument,
 	writePlanningDocuments,
@@ -258,6 +262,18 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		return state.tinyContract?.validation ?? state.planContract?.validation ?? [];
 	}
 
+	function approvedRepairCommands(): ValidationCommand[] {
+		return (state.planContract?.validation ?? []).flatMap((command) =>
+			command.repairCommand && command.repairTimeoutMs
+				? [{
+					id: `${command.id}.repair`,
+					command: command.repairCommand,
+					timeoutMs: command.repairTimeoutMs,
+				}]
+				: [],
+		);
+	}
+
 	function runtimePhaseGuidance(): string {
 		if (state.snapshot.state === "BLOCKED") {
 			return "当前保持只读。先解决阻塞原因，再由 TUI 用户执行 /delivery-resume；Agent 不能自行恢复权限。";
@@ -307,6 +323,14 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		if (seconds < 60) return `${seconds} 秒`;
 		const minutes = Math.floor(seconds / 60);
 		return `${minutes} 分 ${seconds % 60} 秒`;
+	}
+
+	function renderProgress(update: () => void): void {
+		try {
+			update();
+		} catch {
+			// Rendering must not change delivery execution or evidence.
+		}
 	}
 
 	function formatValidationRuns(
@@ -364,11 +388,59 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 	}
 
+	async function reconcilePlanningDocumentRevision(gitRoot: string): Promise<void> {
+		const intent = state.planningDocumentRevision;
+		if (!intent) return;
+		const resolved = await resolvePlanningDocumentRevision(gitRoot, intent);
+		if (resolved === "next") {
+			if (intent.kind === "solution") {
+				if (!state.solutionDocument) throw new Error("Technical solution revision has no previous evidence");
+				const solutionDocument = {
+					...state.solutionDocument,
+					solutionFileIdentity: intent.nextFileIdentity,
+					solutionParentIdentities: intent.nextParentIdentities,
+					solutionContentDigest: intent.nextContentDigest,
+					syncedAt: intent.preparedAt,
+				};
+				const planningDocuments = state.planningDocuments
+					? {
+							...state.planningDocuments,
+							solutionFileIdentity: intent.nextFileIdentity,
+							solutionParentIdentities: intent.nextParentIdentities,
+							solutionContentDigest: intent.nextContentDigest,
+							syncedAt: intent.preparedAt,
+						}
+					: undefined;
+				state = checkpointRuntimeState(state, {
+					solutionDocument,
+					...(planningDocuments ? { planningDocuments } : {}),
+					planningDocumentRevision: undefined,
+				});
+			} else {
+				if (!state.planningDocuments) throw new Error("Implementation plan revision has no previous evidence");
+				state = checkpointRuntimeState(state, {
+					planningDocuments: {
+						...state.planningDocuments,
+						planFileIdentity: intent.nextFileIdentity,
+						planParentIdentities: intent.nextParentIdentities,
+						planContentDigest: intent.nextContentDigest,
+						syncedAt: intent.preparedAt,
+					},
+					planningDocumentRevision: undefined,
+				});
+			}
+		} else {
+			state = checkpointRuntimeState(state, { planningDocumentRevision: undefined });
+		}
+		if (!persistCurrentState()) throw new Error("Failed to persist planning document revision reconciliation");
+	}
+
 	async function validateStoredApprovals(
 		ctx: ExtensionContext,
 		requirement: AuthorizationRequirement = "state",
 	): Promise<string | undefined> {
 		const identity = await resolveWorkspaceIdentity(ctx.cwd);
+		await reconcilePlanningDocumentRevision(identity.gitRoot);
 		const result = validateAuthorizationBundle(state, {
 			sessionId: ctx.sessionManager.getSessionId(),
 			branch: ctx.sessionManager.getBranch(),
@@ -385,7 +457,11 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 		if (state.planningDocuments) {
 			try {
-				await assertPlanningDocumentsExist(identity.gitRoot, state.planningDocuments);
+				if (state.solutionDocument) {
+					await assertPlanDocumentCurrent(identity.gitRoot, state.planningDocuments);
+				} else {
+					await assertPlanningDocumentsExist(identity.gitRoot, state.planningDocuments);
+				}
 			} catch (error) {
 				return `Planning documents cannot be proven: ${error instanceof Error ? error.message : String(error)}`;
 			}
@@ -826,6 +902,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 		if (kind === "solution") {
 			const previousSolutionDocument = state.solutionDocument;
+			const previousPlanningDocuments = state.planningDocuments;
 			if (!(await ensureParentWriterLease(ctx, "SHAPING"))) return;
 			try {
 				const identity = await resolveWorkspaceIdentity(ctx.cwd);
@@ -834,11 +911,29 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					documents: proposedDocuments,
 					solutionContent: solutionOnlyContent!,
 					...(previousSolutionDocument ? { previous: previousSolutionDocument } : {}),
+					...(previousPlanningDocuments ? { previousPlanning: previousPlanningDocuments } : {}),
+					onRevisionPrepared: async (planningDocumentRevision) => {
+						state = checkpointRuntimeState(state, { planningDocumentRevision });
+						if (!persistCurrentState()) {
+							throw new Error("Technical solution revision intent could not be persisted");
+						}
+					},
 				});
+				const planningDocuments = previousPlanningDocuments
+					? {
+							...previousPlanningDocuments,
+							solutionFileIdentity: solutionDocument.solutionFileIdentity,
+							solutionParentIdentities: solutionDocument.solutionParentIdentities,
+							solutionContentDigest: solutionDocument.solutionContentDigest,
+							syncedAt: solutionDocument.syncedAt,
+						}
+					: undefined;
 				state = checkpointRuntimeState(state, {
 					approvals: { ...state.approvals, solution: record },
 					proposedDocuments,
 					solutionDocument,
+					...(planningDocuments ? { planningDocuments } : {}),
+					planningDocumentRevision: undefined,
 					checkpoint: {
 						summary: `Technical solution synchronized: ${solutionDocument.solutionPath}`,
 						nextReadyAction: "Generate the implementation plan",
@@ -871,12 +966,6 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 				return;
 			}
-		} else {
-			state = checkpointRuntimeState(state, {
-				approvals: { ...state.approvals, [kind]: record },
-				proposedDocuments,
-				...(planContract ? { planContract } : {}),
-			});
 		}
 		const widening = transition.snapshot.state === "IMPLEMENTING";
 		if (widening) {
@@ -907,11 +996,22 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 						solutionContent: planningDocumentContent.solution,
 						planContent: planningDocumentContent.plan,
 						solutionEvidence: state.solutionDocument,
+						...(state.planningDocuments ? { previous: state.planningDocuments } : {}),
+						onRevisionPrepared: async (planningDocumentRevision) => {
+							state = checkpointRuntimeState(state, { planningDocumentRevision });
+							if (!persistCurrentState()) {
+								throw new Error("Implementation plan revision intent could not be persisted");
+							}
+						},
 					});
 				}
 				state = checkpointRuntimeState(state, {
+					approvals: { ...state.approvals, [kind]: record },
+					proposedDocuments,
+					planContract,
 					solutionDocument: undefined,
 					planningDocuments,
+					planningDocumentRevision: undefined,
 					checkpoint: {
 						summary: `Planning documents synchronized for ${planningDocuments.requirementName}`,
 						nextReadyAction: "Enter implementation using the approved requirement documents",
@@ -1086,16 +1186,31 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				ctx.ui.notify(formatRuntimeText(transition.reason) ?? "无法修改当前方案", "error");
 				return;
 			}
+			const previousPlanningDocuments = state.planningDocuments;
+			const solutionDocument = state.solutionDocument ?? (previousPlanningDocuments
+				? {
+						version: previousPlanningDocuments.version,
+						requirementName: previousPlanningDocuments.requirementName,
+						solutionPath: previousPlanningDocuments.solutionPath,
+						planPath: previousPlanningDocuments.planPath,
+						selectionSource: previousPlanningDocuments.selectionSource,
+						solutionFileIdentity: previousPlanningDocuments.solutionFileIdentity,
+						solutionParentIdentities: previousPlanningDocuments.solutionParentIdentities,
+						solutionContentDigest: previousPlanningDocuments.solutionContentDigest,
+						syncedAt: previousPlanningDocuments.syncedAt,
+					}
+				: undefined);
 			state = checkpointRuntimeState(state, {
 				approvals: event.type === "REVISE_PLAN" ? { solution: state.approvals?.solution } : {},
-				proposedDocuments: event.type === "REVISE_PLAN" || state.solutionDocument
+				proposedDocuments: event.type === "REVISE_PLAN" || solutionDocument
 					? state.proposedDocuments
 					: undefined,
+				solutionDocument,
 				planContract: undefined,
 				tinyContract: undefined,
 				tinyBaseline: undefined,
 				tinyScopeEvidence: undefined,
-				planningDocuments: undefined,
+				planningDocuments: previousPlanningDocuments,
 				workerRunId: undefined,
 				workerStatus: undefined,
 				workerLaunchContractDigest: undefined,
@@ -1403,7 +1518,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 						if (!persistCurrentState()) workerCheckpointFailed = true;
 					},
 					onUpdate: (update) => {
-						onUpdate?.({
+						renderProgress(() => onUpdate?.({
 							content: [{
 								type: "text",
 								text: update.currentTool
@@ -1411,7 +1526,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 									: "唯一 worker 正在执行已批准计划...",
 							}],
 							details: { runId: update.runId, toolCount: update.toolCount },
-						});
+						}));
 					},
 				});
 			} catch (error) {
@@ -1494,6 +1609,66 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				persistCurrentState();
 				updateStatus(ctx);
 				throw new Error(result.error ?? `Controlled worker ended with ${result.status}`);
+			}
+
+			const repairCommands = approvedRepairCommands();
+			if (repairCommands.length > 0) {
+				if (!state.writerLease || !(await writerLeases.isCurrentOwner(state.writerLease))) {
+					leaseValid = false;
+					setBlocked("Writer lease ownership changed before approved deterministic repair", sourceState);
+					state = checkpointRuntimeState(state, {
+						workerRunId: result.runId,
+						workerStatus: "completed",
+						workerLaunchContractDigest: result.launchContractDigest,
+						checkpoint: {
+							summary: `Writer lease ownership changed before repair after worker ${result.runId}`,
+							nextReadyAction: "Resolve the writer lease before retrying implementation",
+						},
+					});
+					if (!persistCurrentState()) throw new Error("Writer lease changed and the blocked checkpoint could not be persisted");
+					updateStatus(ctx);
+					throw new Error("Writer lease ownership changed before approved deterministic repair");
+				}
+				leaseValid = true;
+				renderProgress(() => onUpdate?.({
+					content: [{ type: "text", text: `正在执行计划已批准的确定性修复：${repairCommands.map((command) => command.id).join("、")}` }],
+					details: { runId: result.runId, repairCommandIds: repairCommands.map((command) => command.id) },
+				}));
+				const repairResult = await runApprovedValidation({
+					pi,
+					cwd: ctx.cwd,
+					commands: repairCommands,
+					signal,
+				});
+				if (repairResult.status !== "passed") {
+					let released = false;
+					let releaseError: string | undefined;
+					try {
+						released = await releaseParentLeaseIfOwned();
+					} catch (error) {
+						releaseError = error instanceof Error ? error.message : String(error);
+					}
+					const failedIds = repairResult.runs
+						.filter((run) => run.status !== "passed")
+						.map((run) => run.id);
+					setBlocked(
+						`Approved deterministic repair failed: ${failedIds.join(", ") || repairResult.error || "unknown failure"}${releaseError ? `; lease release failed: ${releaseError}` : ""}`,
+						sourceState,
+					);
+					state = checkpointRuntimeState(state, {
+						workerRunId: result.runId,
+						workerStatus: "completed",
+						workerLaunchContractDigest: result.launchContractDigest,
+						...(released ? { writerLease: undefined } : {}),
+						checkpoint: {
+							summary: `Approved deterministic repair failed after worker ${result.runId}`,
+							nextReadyAction: "Fix the approved repair command or revise the plan before freezing a candidate",
+						},
+					});
+					if (!persistCurrentState()) throw new Error("Approved repair failed and its blocked checkpoint could not be persisted");
+					updateStatus(ctx);
+					throw new Error(`Approved deterministic repair failed: ${failedIds.join(", ") || repairResult.error || "unknown failure"}`);
+				}
 			}
 
 			let candidate;
@@ -1665,10 +1840,10 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const commandIds = validationCommands.map((command) => command.id);
 			const startedAt = Date.now();
 			const runId = randomUUID();
-			onUpdate?.({
+			renderProgress(() => onUpdate?.({
 				content: [{ type: "text", text: `正在启动固定验证\n批准命令：${commandIds.join("、")}` }],
 				details: { state: "starting", candidateDigest, commandIds },
-			});
+			}));
 			state = checkpointRuntimeState(state, {
 				validationRunId: runId,
 				validationStatus: "pending",
@@ -1682,33 +1857,52 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!persistCurrentState()) throw new Error("Validation started but its checkpoint could not be persisted");
 
 			const completedRuns: ValidationCommandResult[] = [];
-			const result: ValidationBatchResult = await runApprovedValidation({
-				pi,
-				cwd: ctx.cwd,
-				commands: validationCommands,
-				signal,
-				onProgress: (progress) => {
-					if (progress.phase === "completed" && progress.result) completedRuns.push(progress.result);
-					const current = progress.phase === "completed"
-						? `已完成 ${progress.index + 1}/${progress.total}：${progress.command.id}`
-						: `正在执行 ${progress.index + 1}/${progress.total}：${progress.command.id}`;
-					const visibleCommand = progress.command.command.length > 500
-						? `${progress.command.command.slice(0, 500)}...`
-						: progress.command.command;
-					onUpdate?.({
-						content: [{
-							type: "text",
-							text: [
-								`${current}（已运行 ${formatElapsed(startedAt)}）`,
-								`命令：${visibleCommand}`,
-								`验证批次：${runId}`,
-								...formatValidationRuns(completedRuns),
-							].join("\n"),
-						}],
-						details: { runId, candidateDigest, commandIds, completedRuns: [...completedRuns] },
-					});
-				},
-			});
+			const restoreWorkingVisibility = ctx.mode === "tui";
+			let result: ValidationBatchResult;
+			try {
+				if (restoreWorkingVisibility) {
+					try {
+						ctx.ui.setWorkingVisible(false);
+					} catch {
+						// TUI rendering controls must not alter validation execution.
+					}
+				}
+				result = await runApprovedValidation({
+					pi,
+					cwd: ctx.cwd,
+					commands: validationCommands,
+					signal,
+					onProgress: (progress) => {
+						if (progress.phase === "completed" && progress.result) completedRuns.push(progress.result);
+						const current = progress.phase === "completed"
+							? `已完成 ${progress.index + 1}/${progress.total}：${progress.command.id}`
+							: `正在执行 ${progress.index + 1}/${progress.total}：${progress.command.id}`;
+						const visibleCommand = progress.command.command.length > 500
+							? `${progress.command.command.slice(0, 500)}...`
+							: progress.command.command;
+						renderProgress(() => onUpdate?.({
+							content: [{
+								type: "text",
+								text: [
+									`${current}（已运行 ${formatElapsed(startedAt)}）`,
+									`命令：${visibleCommand}`,
+									`验证批次：${runId}`,
+									...formatValidationRuns(completedRuns),
+								].join("\n"),
+							}],
+							details: { runId, candidateDigest, commandIds, completedRuns: [...completedRuns] },
+						}));
+					},
+				});
+			} finally {
+				if (restoreWorkingVisibility) {
+					try {
+						ctx.ui.setWorkingVisible(true);
+					} catch {
+						// Terminal evidence remains authoritative when TUI restoration fails.
+					}
+				}
+			}
 
 			let candidateCheckError: string | undefined;
 			try {
@@ -2060,8 +2254,20 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					target: params.target,
 					oldText: params.oldText,
 					newText: params.newText,
-					checks: planContract.progressChecks,
-					runCheck: async (check) => {
+						checks: planContract.progressChecks,
+						onWrite: async (evidence) => {
+							if (!state.planningDocuments || state.planningDocuments.planPath !== evidence.target) return;
+							const planningDocuments = await refreshPlanDocumentEvidence(
+								identity.gitRoot,
+								state.planningDocuments,
+								evidence.digest,
+							);
+							state = checkpointRuntimeState(state, { planningDocuments });
+							if (!persistCurrentState()) {
+								throw new Error("Progress target changed but its planning document evidence checkpoint failed");
+							}
+						},
+						runCheck: async (check) => {
 						const checkResult = await pi.exec(check.command, [...check.args], {
 							cwd: identity.workspacePath,
 							timeout: check.timeoutMs,

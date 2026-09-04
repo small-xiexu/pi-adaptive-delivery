@@ -42,4 +42,8 @@ $@
 }
 ```
 
-`validation` 至少一项；`progressTargets` 必须包含 `documents.planPath`，其他 progress target 和 `progressChecks` 可以为空。两个文档路径必须不同、以 `.md` 结尾且 basename 包含完全相同的 `requirementName`。不要把 shell 重定向、管道或动态命令放进 `progressChecks`。输出后提示用户运行 `/delivery-approve-plan`；TUI 确认后 Extension 会复验技术方案摘要并只 create-only 写入实施计划，成功后才开放源码写入。本阶段禁止项目写入。
+`validation` 至少一项；`progressTargets` 必须包含 `documents.planPath`，其他 progress target 和 `progressChecks` 可以为空。两个文档路径必须不同、以 `.md` 结尾且 basename 包含完全相同的 `requirementName`。不要把 shell 重定向、管道或动态命令放进 `progressChecks`。
+
+Standard/High-Risk 的 builtin worker 没有 shell。若某条验证需要 formatter 或 generator 的确定性改写，可在同一个 validation item 中同时增加 `"repairCommand": "exact approved repair command"` 和 `"repairTimeoutMs": 120000`；两项必须同时存在，且只在确有确定性修复需求时填写。Extension 会在唯一 worker 可信结束后、candidate freeze 前执行批准的修复命令。不得用它执行测试、发布、生产操作、动态命令或未获授权的范围外修改；Tiny 不支持 repair command。
+
+输出后提示用户运行 `/delivery-approve-plan`；TUI 确认后 Extension 会复验技术方案摘要，首次只 create-only 写入实施计划；若这是 `/delivery-revise`，则只覆盖路径、身份和摘要仍与 runtime 旧 evidence 匹配的同一份 Package 文档。同步成功后才开放源码写入。本阶段禁止项目写入。

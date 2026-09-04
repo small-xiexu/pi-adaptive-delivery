@@ -58,10 +58,10 @@ const BASE_TOOLS = [
 	"find",
 	"ls",
 	"delivery_runtime_status",
-	"delivery_begin",
 	"delivery_progress_sync",
 	"delivery_invalidate",
 ];
+const IDLE_TOOLS = [...BASE_TOOLS.slice(0, 5), "delivery_begin", ...BASE_TOOLS.slice(5)];
 const READONLY_TOOLS = [...BASE_TOOLS, "delivery_delegate_readonly"];
 const WRITER_TOOLS = [...BASE_TOOLS, "edit", "write", "delivery_submit_candidate"];
 const DELEGATED_WRITER_TOOLS = [...BASE_TOOLS, "delivery_delegate_worker"];
@@ -82,6 +82,17 @@ test("captures baseline and applies state policy to Pi tools", () => {
 	assert.equal(shaping.ok, true);
 	assert.deepEqual(host.activeTools, READONLY_TOOLS);
 	assert.equal(host.access.at(-1), "readonly");
+});
+
+test("exposes delivery_begin only while the runtime is IDLE", () => {
+	const host = new FakePolicyHost();
+	const controller = new PolicyController(host);
+	controller.captureBaseline();
+
+	assert.equal(controller.apply({ state: "IDLE" }, READ_ONLY_CONTEXT).ok, true);
+	assert.deepEqual(host.activeTools, IDLE_TOOLS);
+	assert.equal(controller.apply({ state: "VALIDATING" }, READ_ONLY_CONTEXT).ok, true);
+	assert.equal(host.activeTools.includes("delivery_begin"), false);
 });
 
 test("applies writer tools only when policy preconditions are proven", () => {

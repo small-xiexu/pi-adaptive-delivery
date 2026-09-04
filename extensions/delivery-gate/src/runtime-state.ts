@@ -21,8 +21,10 @@ import {
 } from "./plan-contract.ts";
 import {
 	parsePlanningDocumentEvidence,
+	parsePlanningDocumentRevisionIntent,
 	parseSolutionDocumentEvidence,
 	type PlanningDocumentEvidence,
+	type PlanningDocumentRevisionIntent,
 	type SolutionDocumentEvidence,
 } from "./planning-documents.ts";
 import {
@@ -88,6 +90,7 @@ export interface DeliveryRuntimeState {
 	tinyScopeEvidence?: TinyScopeEvidence;
 	solutionDocument?: SolutionDocumentEvidence;
 	planningDocuments?: PlanningDocumentEvidence;
+	planningDocumentRevision?: PlanningDocumentRevisionIntent;
 	workerRunId?: string;
 	workerStatus?: "starting" | "running" | "completed" | "failed";
 	workerLaunchContractDigest?: string;
@@ -294,6 +297,41 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 		planningDocuments = parsePlanningDocumentEvidence(input.planningDocuments);
 		if (!planningDocuments) {
 			const reason = "Delivery planning document evidence is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+	}
+	let planningDocumentRevision: PlanningDocumentRevisionIntent | undefined;
+	if (input.planningDocumentRevision !== undefined) {
+		planningDocumentRevision = parsePlanningDocumentRevisionIntent(input.planningDocumentRevision);
+		if (!planningDocumentRevision) {
+			const reason = "Delivery planning document revision intent is malformed";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
+		const previousParents = JSON.stringify(planningDocumentRevision.previousParentIdentities);
+		const matchesSolution = solutionDocument &&
+			planningDocumentRevision.path === solutionDocument.solutionPath &&
+			planningDocumentRevision.previousContentDigest === solutionDocument.solutionContentDigest &&
+			planningDocumentRevision.previousFileIdentity.dev === solutionDocument.solutionFileIdentity.dev &&
+			planningDocumentRevision.previousFileIdentity.ino === solutionDocument.solutionFileIdentity.ino &&
+			previousParents === JSON.stringify(solutionDocument.solutionParentIdentities);
+		const matchesPlan = planningDocuments &&
+			planningDocumentRevision.path === planningDocuments.planPath &&
+			planningDocumentRevision.previousContentDigest === planningDocuments.planContentDigest &&
+			planningDocumentRevision.previousFileIdentity.dev === planningDocuments.planFileIdentity.dev &&
+			planningDocumentRevision.previousFileIdentity.ino === planningDocuments.planFileIdentity.ino &&
+			previousParents === JSON.stringify(planningDocuments.planParentIdentities);
+		const matchesPlanningSolution = !planningDocuments || (
+			planningDocumentRevision.path === planningDocuments.solutionPath &&
+			planningDocumentRevision.previousContentDigest === planningDocuments.solutionContentDigest &&
+			planningDocumentRevision.previousFileIdentity.dev === planningDocuments.solutionFileIdentity.dev &&
+			planningDocumentRevision.previousFileIdentity.ino === planningDocuments.solutionFileIdentity.ino &&
+			previousParents === JSON.stringify(planningDocuments.solutionParentIdentities)
+		);
+		if (
+			(planningDocumentRevision.kind === "solution" && (!matchesSolution || !matchesPlanningSolution)) ||
+			(planningDocumentRevision.kind === "plan" && !matchesPlan)
+		) {
+			const reason = "Delivery planning document revision intent does not match the previous evidence";
 			return { ok: false, state: blockedState(reason, now), reason };
 		}
 	}
@@ -523,6 +561,7 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			...(tinyScopeEvidence ? { tinyScopeEvidence } : {}),
 			...(solutionDocument ? { solutionDocument } : {}),
 			...(planningDocuments ? { planningDocuments } : {}),
+			...(planningDocumentRevision ? { planningDocumentRevision } : {}),
 			...(workerRunId ? { workerRunId } : {}),
 			...(workerStatus ? { workerStatus } : {}),
 			...(workerLaunchContractDigest ? { workerLaunchContractDigest } : {}),

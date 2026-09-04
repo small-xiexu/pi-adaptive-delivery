@@ -103,14 +103,17 @@ test("emits a running heartbeat while one approved command is quiet", async () =
 	const result = await runApprovedValidation({
 		pi: {
 			exec: async () => {
-				await new Promise((resolve) => setTimeout(resolve, 2100));
+				await new Promise((resolve) => setTimeout(resolve, 20));
 				return { stdout: "ok", stderr: "", code: 0, killed: false };
 			},
 		} as any,
 		cwd: "/repo",
 		commands: [{ id: "quiet", command: "quiet-check", timeoutMs: 5000 }],
+		heartbeatMs: 5,
 		onProgress: (progress) => phases.push(progress.phase),
 	});
 	assert.equal(result.status, "passed");
-	assert.deepEqual(phases, ["starting", "running", "completed"]);
+	assert.equal(phases[0], "starting");
+	assert.equal(phases.includes("running"), true);
+	assert.equal(phases.at(-1), "completed");
 });

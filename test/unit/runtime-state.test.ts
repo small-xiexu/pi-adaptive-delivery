@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { PLANNING_DOCUMENT_EVIDENCE_VERSION } from "../../extensions/delivery-gate/src/planning-documents.ts";
 import {
 	DELIVERY_RUNTIME_STATE_VERSION,
 	DELIVERY_STATE_CUSTOM_TYPE,
@@ -96,11 +97,13 @@ test("restores the latest state from the active branch entries", () => {
 		version: 1,
 		snapshot: { state: "PLANNING" },
 		solutionDocument: {
-			version: 1,
+			version: PLANNING_DOCUMENT_EVIDENCE_VERSION,
 			requirementName: "Canvas写路径拆分",
 			solutionPath: "docs/Canvas写路径拆分-技术方案.md",
 			planPath: "docs/Canvas写路径拆分-实施计划.md",
 			selectionSource: "project",
+			solutionFileIdentity: { dev: 1, ino: 2 },
+			solutionParentIdentities: [{ relativePath: "docs", dev: 1, ino: 1 }],
 			solutionContentDigest: "c".repeat(64),
 			syncedAt: NOW.toISOString(),
 		},
@@ -127,6 +130,12 @@ test("fails closed for malformed or unknown persisted state", () => {
 		{ version: 1, snapshot: { state: "UNKNOWN" }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "BLOCKED", resumeState: "DELIVERED" }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "IDLE" }, updatedAt: "not-a-date" },
+		{
+			version: 1,
+			snapshot: { state: "SHAPING" },
+			planningDocumentRevision: { version: 1, kind: "solution" },
+			updatedAt: NOW.toISOString(),
+		},
 		{ version: 1, snapshot: { state: "IDLE" }, checkpoint: { changedFiles: [42] }, updatedAt: NOW.toISOString() },
 		{
 			version: 1,

@@ -159,7 +159,7 @@ export function validateAuthorizationBundle(
 				documents.planPath !== state.planContract.documents.planPath ||
 				documents.selectionSource !== state.planContract.documents.selectionSource ||
 				documents.solutionContentDigest !== digestPlanningDocumentContent(solutionContent) ||
-				documents.planContentDigest !== digestPlanningDocumentContent(planContent)
+				documents.approvedPlanContentDigest !== digestPlanningDocumentContent(planContent)
 			) {
 				return { ok: false, reason: "Planning document evidence does not match the approved entries" };
 			}

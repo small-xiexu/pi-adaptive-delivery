@@ -57,7 +57,8 @@ function fakeStream(
 			output.stopReason = "stop";
 		} else if (
 			process.env.PI_ADAPTIVE_READONLY_DELEGATION_PROBE === "1" &&
-			!availableTools.has("delivery_begin")
+			!availableTools.has("delivery_begin") &&
+			!availableTools.has("delivery_delegate_readonly")
 		) {
 			const text = "Fake read-only delegate completed.";
 			output.content.push({ type: "text", text });

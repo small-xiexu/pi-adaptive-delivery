@@ -211,16 +211,16 @@ docs/避免重复扣款-实施计划.md
 
 需求短名称描述稳定的用户目标，不使用日期、`final-v2`、代码行号或可能变化的实现细节。
 
-路径会在技术方案批准时冻结，实施计划不能静默改名。Standard/High-Risk 批准 solution 后，Extension 先以 create-only 方式创建技术方案；批准 plan 后只创建实施计划：
+路径会在技术方案批准时冻结，实施计划不能静默改名。Standard/High-Risk 首次批准 solution 后，Extension 先以 create-only 方式创建技术方案；首次批准 plan 后只创建实施计划：
 
-- 不覆盖已有同名文件。
+- 首次创建不覆盖已有同名文件；修订只覆盖 runtime evidence 仍匹配的 Package 文档。
 - 拒绝绝对路径、`..`、symlink、非 Markdown 和同一目标。
 - 技术方案批准后立即落盘，但不开放源码写入；两份文档都成功后才进入实现。
 - 项目实施计划同时作为本任务的 progress target。
 
 TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract 保留在 Session 原始消息中用于批准、恢复和校验，但默认不会显示给用户。
 
-当前版本不会合并或覆盖无法证明来源的需求文档。实施计划批准前执行 `/delivery-revise` 时，Package 保留已落盘技术方案的路径和摘要；重新批准后，只有文件仍与 Package 上次写入内容完全一致且路径无 symlink 时才原位更新。人工改过、身份漂移或摘要不符时保持只读并拒绝覆盖。实施计划已经落盘后的跨阶段重规划仍需用户明确处理旧计划或开始新任务。
+当前版本不会合并或覆盖无法证明来源的需求文档。执行 `/delivery-revise` 时，Package 保留已落盘技术方案和实施计划的路径、摘要及文件/父目录身份；重新批准后，只有现场仍与 Package 上次同步 evidence 完全一致时，才通过同目录临时文件和原子替换更新。替换前会持久化同时绑定完整旧态和新态的 revision intent；若在 rename 或目录同步附近中断，恢复只接受其中一个完整状态。人工改过、同内容替换、身份漂移或 symlink 边界变化时保持只读并拒绝覆盖。旧规划文档 evidence 不做隐式迁移，需要显式处理旧文档或选择新路径后重新进入流程。
 
 ## Package 自动完成什么
 
@@ -228,7 +228,7 @@ TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract
 
 1. 复验已批准技术方案文档并创建实施计划文档。
 2. 获取当前 Git worktree 的唯一 writer lease。
-3. Tiny 由父 Pi 在 exact scope 内直接实现；Standard/High-Risk 默认由一个受控 foreground worker 实现，兼容的 plan-v2 `single` 路径仍保留父 Pi 实现。
+3. Tiny 由父 Pi 在 exact scope 内直接实现；Standard/High-Risk 默认由一个受控 foreground worker 实现，兼容的 plan-v2 `single` 路径仍保留父 Pi 实现。worker 不持有 shell；计划中可选的、明确批准的 formatter/generator 修复命令由 Delivery Gate 在 worker 结束后、candidate freeze 前执行。
 4. 冻结包含 HEAD、staged、tracked、untracked、submodule 和批准记录的 candidate digest。
 5. 由 Delivery Gate 通过 Pi 的公开命令 API 顺序执行批准的验证命令。
 6. Standard/High-Risk 使用 fresh reviewer 检查 runtime 提供的同一 candidate actual diff，并把结果绑定 candidate/diff digest；Tiny 默认省略。
@@ -239,9 +239,9 @@ TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract
 
 P2、推测性意见和与当前修改无关的历史问题只进入最终 notes，不会无限触发 review/fix。
 
-这些内部工具按阶段和任务路由出现，不会一次全部显示给 AI。`single` 实现阶段给父 Pi 代码修改和“提交候选”；`standard/high-risk` 只给父 Pi `delivery_delegate_worker`，父 Pi 看不到 `edit/write`，worker 成功结束后自动冻结候选。随后才切换为验证、审查、返工和完成工具。AI 不确定时会调用只读的 `delivery_runtime_status` 查看当前阶段与开发方式。
+这些内部工具按阶段和任务路由出现，不会一次全部显示给 AI。`delivery_begin` 只在 `IDLE` 可见；`single` 实现阶段给父 Pi 代码修改和“提交候选”；`standard/high-risk` 只给父 Pi `delivery_delegate_worker`，父 Pi 看不到 `edit/write`，worker 成功结束且可选批准修复命令通过后自动冻结候选。随后才切换为验证、审查、返工和完成工具。AI 不确定时会调用只读的 `delivery_runtime_status` 查看当前阶段与开发方式。
 
-固定验证开始后不需要查询状态。`delivery_validate` 会保持当前工具调用，依次显示“正在执行哪条批准命令”和已经完成的结果；全部结束后再返回逐命令摘要。若 Pi 在终态保存前 reload 或验证工具被中断，Package 会保持只读并要求确认没有遗留命令后重试，不会把未知结果当成通过。
+固定验证开始后不需要查询状态。`delivery_validate` 会保持当前工具调用，临时隐藏 TUI 默认高频 spinner，以 30 秒低频 heartbeat 显示“正在执行哪条批准命令”和已经完成的结果；全部结束后恢复 TUI working 状态并返回逐命令摘要。若 Pi 在终态保存前 reload 或验证工具被中断，Package 会保持只读并要求确认没有遗留命令后重试，不会把未知结果当成通过。
 
 ## 状态和下一步
 
@@ -429,14 +429,15 @@ pi remove -l git:github.com/small-xiexu/pi-adaptive-delivery
 内部协议当前为：
 
 - `adaptive-delivery-documents` v1：需求短名称、solution/plan 路径和选择来源
-- `adaptive-delivery-plan` v2：文档身份、风险分类、验证命令和 progress target/check
+- `adaptive-delivery-plan` v2：规划文档路由、风险分类、验证命令、可选批准修复命令和 progress target/check
 - `adaptive-delivery-tiny` v1：Tiny intent、non-goals、exact scope、validation 和风险否决声明
 - `adaptive-delivery-review` v1：绑定 candidate/diff digest 的 reviewer verdict 和 findings
+- Planning document evidence v2：同步时文件/父目录身份和内容摘要
 - Delivery runtime state v1
 - Candidate manifest v3
 - Writer lease v1
 
-plan v1 不包含规划文档身份，当前版本会失败关闭并要求重新生成、重新批准，不提供隐式迁移。
+Planning document evidence v1 不包含文件及父目录身份，当前版本恢复时会失败关闭并要求重新进入流程，不提供隐式迁移。
 
 开发验证：
 

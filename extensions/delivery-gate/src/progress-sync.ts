@@ -16,8 +16,14 @@ export interface ProgressSyncInput {
 	newText: string;
 	checks: readonly ProgressCheck[];
 	runCheck: (check: ProgressCheck) => Promise<{ code: number; stdout: string; stderr: string }>;
+	onWrite?: (evidence: ProgressWriteEvidence) => Promise<void>;
 	beforeOpen?: () => Promise<void>;
 	afterRecheckBeforeOpen?: () => Promise<void>;
+}
+
+export interface ProgressWriteEvidence {
+	target: string;
+	digest: string;
 }
 
 export interface ProgressSyncResult {
@@ -129,6 +135,14 @@ export async function syncProjectProgress(input: ProgressSyncInput): Promise<Pro
 		}
 		const finalTarget = await resolveProgressTarget(target.root, input.approvedTargets, target.relative);
 		if (finalTarget.absolute !== target.absolute) throw new Error("Progress target changed after write");
+		if (!sameIdentity(finalTarget.identity.target, target.identity.target)) {
+			throw new Error("Progress target identity changed after write");
+		}
+		const writeEvidence = {
+			target: target.relative,
+			digest: createHash("sha256").update(next!).digest("hex"),
+		};
+		await input.onWrite?.(writeEvidence);
 		const checkResults: Array<{ id: string; code: number }> = [];
 		for (const check of input.checks) {
 			const result = await input.runCheck(check);
@@ -138,8 +152,7 @@ export async function syncProjectProgress(input: ProgressSyncInput): Promise<Pro
 			}
 		}
 		return {
-			target: target.relative,
-			digest: createHash("sha256").update(next!).digest("hex"),
+			...writeEvidence,
 			checks: checkResults,
 		};
 	});

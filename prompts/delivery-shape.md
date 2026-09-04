@@ -49,7 +49,7 @@ Tiny 只输出简短的“将修改、不会修改、成功效果、验证”，
 
 Tiny 提示用户执行 `/delivery-approve-plan` 做一次 TUI 批准。Extension 在批准时捕获 baseline 并固定 exact scope，不创建项目规划文档，也不 preflight reviewer。
 
-Standard/High-Risk 执行 `/delivery-approve-solution` 并在 TUI 确认后，Extension 会立即 create-only 写入技术方案文档，再自动生成实施计划；此时仍不开放源码写入。实施计划批准前若需要调整，使用 `/delivery-revise`，重新批准后只在方案文件仍与上次同步摘要一致时更新同一文件。
+Standard/High-Risk 首次执行 `/delivery-approve-solution` 并在 TUI 确认后，Extension 会立即 create-only 写入技术方案文档，再自动生成实施计划；此时仍不开放源码写入。需要调整已批准方案或计划时使用 `/delivery-revise`；重新批准只更新路径、文件身份和现场摘要仍与 runtime 旧 evidence 匹配的同一份 Package 文档，任何外部改动都拒绝覆盖。
 
 先按“用户明确要求 -> 项目规则与文档路由 -> 用户全局规则 -> Package 默认”选择需求短名称和规划文档路径。已有总技术方案或总计划默认只作为背景事实，不因存在就追加；没有明确规则时使用 `docs/<需求短名称>-技术方案.md` 与 `docs/<需求短名称>-实施计划.md`。规则冲突或唯一台账不明确时先询问用户。
 

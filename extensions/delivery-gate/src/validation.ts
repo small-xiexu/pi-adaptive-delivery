@@ -3,6 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ValidationCommand } from "./plan-contract.ts";
 
 const MAX_CAPTURED_OUTPUT_CHARS = 8_000;
+const DEFAULT_HEARTBEAT_MS = 30_000;
 
 export type ValidationCommandStatus = "passed" | "failed" | "timed-out" | "cancelled" | "error";
 
@@ -49,6 +50,7 @@ export async function runApprovedValidation(options: {
 	commands: readonly ValidationCommand[];
 	signal?: AbortSignal;
 	onProgress?: (progress: ValidationProgress) => void;
+	heartbeatMs?: number;
 }): Promise<ValidationBatchResult> {
 	const runs: ValidationCommandResult[] = [];
 	let commandFailed = false;
@@ -75,7 +77,7 @@ export async function runApprovedValidation(options: {
 				phase: "running",
 				elapsedMs: Date.now() - startedAt,
 			});
-		}, 2_000);
+		}, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
 		heartbeat.unref?.();
 		try {
 			const result = await options.pi.exec(shell.executable, shell.args, {

@@ -57,6 +57,20 @@ test("rejects unknown fields, duplicate validation ids, and unsafe bounds", () =
 		parsePlanContractValue({ ...valid, validation: [{ id: "test", command: "test", timeoutMs: 999 }] }),
 		undefined,
 	);
+	assert.equal(
+		parsePlanContractValue({
+			...valid,
+			validation: [{ ...valid.validation[0], repairCommand: "npm run format" }],
+		}),
+		undefined,
+	);
+	assert.equal(
+		parsePlanContractValue({
+			...valid,
+			validation: [{ ...valid.validation[0], repairTimeoutMs: 120000 }],
+		}),
+		undefined,
+	);
 	assert.equal(parsePlanContractValue({ ...valid, progressTargets: [] }), undefined);
 	assert.equal(
 		parsePlanContractValue({
@@ -73,6 +87,33 @@ test("rejects unknown fields, duplicate validation ids, and unsafe bounds", () =
 		}),
 		undefined,
 	);
+});
+
+test("parses an optional approved deterministic repair command", () => {
+	const contract = parsePlanContractValue({
+		...valid,
+		validation: [{
+			...valid.validation[0],
+			repairCommand: "npm run format",
+			repairTimeoutMs: 120000,
+		}],
+	});
+	assert.deepEqual(contract?.validation[0], {
+		...valid.validation[0],
+		repairCommand: "npm run format",
+		repairTimeoutMs: 120000,
+	});
+	assert.equal(parsePlanContractValue({
+		...valid,
+		risk: "low",
+		complexity: "small",
+		uncertainty: "low",
+		validation: [{
+			...valid.validation[0],
+			repairCommand: "npm run format",
+			repairTimeoutMs: 120000,
+		}],
+	}), undefined);
 });
 
 test("selects routes with risk and uncertainty taking precedence", () => {

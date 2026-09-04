@@ -85,6 +85,8 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 	assert.match(prompts[1]!.body, /adaptive-delivery:plan:start/);
 	assert.match(prompts[1]!.body, /"version": 2/);
 	assert.match(prompts[1]!.body, /documents\.planPath/);
+	assert.match(prompts[1]!.body, /repairCommand.*repairTimeoutMs/);
+	assert.match(prompts[1]!.body, /Tiny 不支持 repair command/);
 	assert.match(prompts[2]!.body, /delivery_submit_candidate/);
 	assert.match(prompts[2]!.body, /delivery_runtime_status/);
 	assert.match(prompts[2]!.body, /implementationWriter=parent/);
@@ -131,6 +133,8 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /create-only/);
 	assert.match(skill.body, /确认后立即 create-only 写入技术方案/);
 	assert.match(skill.body, /批准 plan 后.*只 create-only 写入实施计划/);
+	assert.match(skill.body, /repairCommand.*repairTimeoutMs/);
+	assert.match(skill.body, /runtime 在其他状态不暴露该工具/);
 	assert.match(skill.body, /人工改动或 symlink 漂移必须拒绝覆盖/);
 	assert.match(skill.body, /自动展开 `\/delivery-plan`/);
 	assert.match(skill.body, /自动展开 `\/delivery-run`/);
@@ -166,7 +170,9 @@ test("README leads with the user workflow and keeps machine contracts out of the
 	assert.match(source, /复杂流程不会全部塞进一张大图/);
 	assert.match(source, /不使用 `mmdc`\/Chromium，不上传源码/);
 	assert.match(source, /批准 solution 后.*create-only.*技术方案/);
-	assert.match(source, /只有文件仍与 Package 上次写入内容完全一致/);
+	assert.match(source, /现场仍与 Package 上次同步 evidence 完全一致/);
+	assert.match(source, /同目录临时文件和原子替换/);
+	assert.match(source, /同内容替换.*保持只读并拒绝覆盖/);
 	assert.match(source, /defaultTtlMs.*300000/s);
 	assert.match(source, /## 常见恢复/);
 	assert.ok(source.indexOf("## 第一次使用") < source.indexOf("## 维护者参考"));
