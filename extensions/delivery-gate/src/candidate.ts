@@ -9,7 +9,7 @@ import { digestApprovalContent } from "./approvals.ts";
 import { pathIsInside } from "./subagents.ts";
 import { resolveWorkspaceIdentity, type WorkspaceIdentity } from "./workspace.ts";
 
-export const CANDIDATE_MANIFEST_VERSION = 2 as const;
+export const CANDIDATE_MANIFEST_VERSION = 3 as const;
 
 export type CandidateFileMode = "100644" | "100755" | "120000";
 
@@ -31,7 +31,6 @@ export interface CandidateManifest {
 	submoduleDigest: string;
 	approvalDigest: string;
 	controlPlaneExclusions: string[];
-	ignored: { count: number; pathListDigest: string };
 }
 
 export interface CandidateSnapshot {
@@ -141,18 +140,16 @@ export async function createCandidateSnapshot(options: CandidateOptions): Promis
 	const workspace = await resolveWorkspaceIdentity(options.cwd);
 	const exclusions = await canonicalProgressPaths(workspace, options.progressPaths ?? []);
 	const pathspec = diffPathspec(exclusions);
-	const [headOutput, indexDiff, trackedDiff, untrackedOutput, ignoredOutput, submodules] = await Promise.all([
+	const [headOutput, indexDiff, trackedDiff, untrackedOutput, submodules] = await Promise.all([
 		runGit(workspace.workspacePath, ["rev-parse", "--verify", "HEAD"], true),
 		runGit(workspace.workspacePath, ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", ...pathspec]),
 		runGit(workspace.workspacePath, ["diff", "--binary", "--no-ext-diff", "--no-textconv", ...pathspec]),
 		runGit(workspace.workspacePath, ["ls-files", "--others", "--exclude-standard", "-z"]),
-		runGit(workspace.workspacePath, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]),
 		runGit(workspace.workspacePath, ["submodule", "status", "--recursive"], true),
 	]);
 	const excluded = new Set(exclusions);
 	const untrackedPaths = nulPaths(untrackedOutput).filter((value) => !excluded.has(value));
 	const untracked = await Promise.all(untrackedPaths.map((value) => fileDigest(workspace.gitRoot, value)));
-	const ignoredPaths = nulPaths(ignoredOutput);
 	const head = headOutput.toString("utf8").trim() || "UNBORN";
 	const approvalDigest = digestApprovalContent(options.approvals ?? {});
 	const manifest: CandidateManifest = {
@@ -165,7 +162,6 @@ export async function createCandidateSnapshot(options: CandidateOptions): Promis
 		submoduleDigest: sha256(submodules),
 		approvalDigest,
 		controlPlaneExclusions: exclusions,
-		ignored: { count: ignoredPaths.length, pathListDigest: digestApprovalContent(ignoredPaths) },
 	};
 	return { digest: digestApprovalContent(manifest), manifest };
 }

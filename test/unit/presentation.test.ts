@@ -53,6 +53,10 @@ test("translates old and dynamic runtime checkpoint text without mutating identi
 		"解决阻塞条件后，由 TUI 用户执行 /delivery-resume",
 	);
 	assert.equal(
+		formatRuntimeText("Restore the frozen candidate and resume, or revise the plan for intentional drift"),
+		"恢复已冻结候选后继续，或为需要保留的漂移修订实施计划",
+	);
+	assert.equal(
 		formatRuntimeText("Required tools are unavailable in the original Pi tool baseline: edit, write"),
 		"Pi 原始工具配置缺少当前阶段必需工具：edit, write",
 	);

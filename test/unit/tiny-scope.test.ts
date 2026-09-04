@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -97,6 +97,27 @@ test("rejects dirty baselines, protected paths, symlinks, and submodules", async
 	await execFileAsync("git", ["add", ".gitmodules", "child"], { cwd: parent });
 	await execFileAsync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "submodule"], { cwd: parent });
 	await assert.rejects(captureTinyApprovalBaseline({ cwd: parent, contract: contract(["child/tracked.txt"]), approval: approval(parent) }), /submodule/);
+});
+
+test("rejects existing and missing ignored Tiny scope targets at approval and write time", async () => {
+	const cwd = await repo();
+	await writeFile(path.join(cwd, ".gitignore"), "ignored/\n");
+	await execFileAsync("git", ["add", ".gitignore"], { cwd });
+	await execFileAsync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "ignore Tiny targets"], { cwd });
+	await mkdir(path.join(cwd, "ignored"));
+	await writeFile(path.join(cwd, "ignored", "existing.txt"), "ignored\n");
+	for (const relativePath of ["ignored/existing.txt", "ignored/missing.txt"]) {
+		await assert.rejects(
+			captureTinyApprovalBaseline({ cwd, contract: contract([relativePath]), approval: approval(cwd) }),
+			/ignored path/,
+			relativePath,
+		);
+		await assert.rejects(
+			assertTinyWritePath({ cwd, gitRoot: cwd, changeScope: [relativePath], toolPath: relativePath }),
+			/ignored path/,
+			relativePath,
+		);
+	}
 });
 
 test("fails closed for scope escape, staged, delete, rename, HEAD, and branch drift", async () => {

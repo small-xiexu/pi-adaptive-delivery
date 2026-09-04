@@ -26,6 +26,7 @@ const EXACT_RUNTIME_TEXT: Readonly<Record<string, string>> = {
 	"Complete project progress update and restore the base policy": "完成项目进度更新并恢复基础权限策略",
 	"Continue candidate validation": "继续验证当前候选版本",
 	"Resolve the blocking condition": "解决当前阻塞条件",
+	"Restore the frozen candidate and resume, or revise the plan for intentional drift": "恢复已冻结候选后继续，或为需要保留的漂移修订实施计划",
 	"Delivery plan contract is malformed": "交付计划契约格式无效",
 	"Delivery state entry is not an object": "交付状态记录不是有效对象",
 	"Delivery state snapshot is missing": "交付状态快照缺失",

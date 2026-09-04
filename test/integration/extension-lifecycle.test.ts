@@ -96,6 +96,7 @@ function createHarness(
 	let confirmCalls = 0;
 	const confirmationRequests: Array<{ title: string; message: string }> = [];
 	let execResult = { stdout: `${cwd}\n`, stderr: "", code: 0, killed: false };
+	let execExecution: (() => void) | undefined;
 	const execCalls: Array<{ command: string; args: string[] }> = [];
 	let reviewText: string | undefined;
 	let currentModel: any = TEST_MODEL;
@@ -156,6 +157,9 @@ function createHarness(
 		},
 		exec: async (command: string, args: string[]) => {
 			execCalls.push({ command, args: [...args] });
+			const execute = execExecution;
+			execExecution = undefined;
+			execute?.();
 			return { ...execResult };
 		},
 		appendEntry: (customType: string, data: unknown) => {
@@ -257,6 +261,9 @@ function createHarness(
 		execCalls,
 		setExecResult: (result: typeof execResult) => {
 			execResult = result;
+		},
+		setExecExecution: (execute: () => void) => {
+			execExecution = execute;
 		},
 		setReviewText: (value: string) => {
 			reviewText = value;
@@ -1912,6 +1919,76 @@ test("freezes one candidate, launches only approved validation, and invalidates 
 		validate.execute("validate-2", {}, undefined, undefined, harness.ctx),
 		/stale/,
 	);
+	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
+});
+
+test("ignores validation artifacts but blocks and diagnoses real candidate drift", async () => {
+	const repo = candidateRepo();
+	writeFileSync(path.join(repo, ".gitignore"), "runtime-cache/\n");
+	execFileSync("git", ["add", ".gitignore"], { cwd: repo });
+	execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "ignore runtime cache"], {
+		cwd: repo,
+	});
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	harness.setExecExecution(() => {
+		mkdirSync(path.join(repo, "runtime-cache"));
+		writeFileSync(path.join(repo, "runtime-cache", "result.bin"), "generated during validation\n");
+	});
+	const validation = await harness.tools.get("delivery_validate").execute("validate", {}, undefined, undefined, harness.ctx);
+	assert.equal(validation.details.result.status, "passed");
+	assert.equal(validation.details.staleCandidate, undefined);
+	const persisted = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(persisted.snapshot.state, "VALIDATING");
+	assert.equal(persisted.validationStatus, "passed");
+	assert.ok(persisted.validationEvidence);
+
+	harness.setExecExecution(() => {
+		writeFileSync(path.join(repo, "tracked.txt"), "changed during validation\n");
+	});
+	const entryCountBeforeStaleValidation = harness.appendedEntries.length;
+	const stale = await harness.tools.get("delivery_validate").execute("validate-stale", {}, undefined, undefined, harness.ctx);
+	assert.equal(harness.appendedEntries.length, entryCountBeforeStaleValidation + 2);
+	assert.equal(stale.details.staleCandidate, true);
+	assert.match(stale.content[0].text, /unit：通过/);
+	assert.match(stale.content[0].text, /仅用于诊断，不构成当前候选版本的 validation evidence/);
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "VALIDATING");
+	assert.equal(blocked.validationStatus, "failed");
+	assert.equal(blocked.validationFailureKind, undefined);
+	assert.equal(blocked.validationEvidence, undefined);
+	assert.equal(
+		blocked.checkpoint.nextReadyAction,
+		"Restore the frozen candidate and resume, or revise the plan for intentional drift",
+	);
+	assert.match(stale.content[0].text, /\/delivery-resume/);
+	assert.match(stale.content[0].text, /\/delivery-revise plan/);
+});
+
+test("fails closed when the stale validation terminal checkpoint cannot be persisted", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	harness.setExecExecution(() => {
+		writeFileSync(path.join(repo, "tracked.txt"), "changed during validation\n");
+		harness.failNextAppend();
+	});
+	await assert.rejects(
+		harness.tools.get("delivery_validate").execute("validate-stale-persist-failure", {}, undefined, undefined, harness.ctx),
+		/terminal checkpoint could not be persisted/,
+	);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 });
 

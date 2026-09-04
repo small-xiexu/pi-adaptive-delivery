@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -30,6 +30,39 @@ test("produces a stable digest for an unchanged candidate", async () => {
 	const second = await createCandidateSnapshot({ cwd: repo });
 	assert.equal(first.digest, second.digest);
 	assert.deepEqual(first.manifest, second.manifest);
+});
+
+test("keeps the candidate stable when Git-ignored artifacts change", async () => {
+	const repo = await commitRepo("adaptive-candidate-ignored-");
+	await writeFile(path.join(repo, ".gitignore"), "runtime-cache/\n");
+	await execFileAsync("git", ["add", ".gitignore"], { cwd: repo });
+	await execFileAsync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "ignore runtime cache"], {
+		cwd: repo,
+	});
+	const baseline = await createCandidateSnapshot({ cwd: repo });
+	await mkdir(path.join(repo, "runtime-cache"));
+	await writeFile(path.join(repo, "runtime-cache", "result.bin"), "first\n");
+	const created = await createCandidateSnapshot({ cwd: repo });
+	await writeFile(path.join(repo, "runtime-cache", "result.bin"), "second\n");
+	const modified = await createCandidateSnapshot({ cwd: repo });
+	await rm(path.join(repo, "runtime-cache"), { recursive: true });
+	const removed = await createCandidateSnapshot({ cwd: repo });
+	assert.equal(created.digest, baseline.digest);
+	assert.equal(modified.digest, baseline.digest);
+	assert.equal(removed.digest, baseline.digest);
+});
+
+test("changes the candidate digest when HEAD changes", async () => {
+	const repo = await commitRepo("adaptive-candidate-head-");
+	const baseline = await createCandidateSnapshot({ cwd: repo });
+	await writeFile(path.join(repo, "next.txt"), "next\n");
+	await execFileAsync("git", ["add", "next.txt"], { cwd: repo });
+	await execFileAsync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "next head"], {
+		cwd: repo,
+	});
+	const changed = await createCandidateSnapshot({ cwd: repo });
+	assert.notEqual(changed.manifest.head, baseline.manifest.head);
+	assert.notEqual(changed.digest, baseline.digest);
 });
 
 test("changes for HEAD, staged, tracked, untracked, symlink, and approval changes", async () => {

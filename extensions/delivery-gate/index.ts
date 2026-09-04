@@ -1710,19 +1710,37 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				},
 			});
 
+			let candidateCheckError: string | undefined;
 			try {
-				await requireCurrentCandidate(ctx);
+				const current = await recomputeCandidate(ctx);
+				if (current.digest !== candidateDigest) candidateCheckError = "Candidate digest changed";
 			} catch (error) {
-				setBlocked("Candidate changed after validation completed", "VALIDATING");
+				candidateCheckError = `Candidate snapshot failed: ${error instanceof Error ? error.message : String(error)}`;
+			}
+			if (candidateCheckError) {
+				setBlocked(`Candidate changed after validation completed: ${candidateCheckError}`, "VALIDATING");
 				state = checkpointRuntimeState(state, {
 					validationStatus: "failed",
-					validationFailureKind: "candidate",
+					validationFailureKind: undefined,
 					validationEvidence: undefined,
+					checkpoint: {
+						summary: `Candidate changed after validation completed: ${candidateDigest}`,
+						nextReadyAction: "Restore the frozen candidate and resume, or revise the plan for intentional drift",
+					},
 				});
-				persistCurrentState();
+				if (!persistCurrentState()) {
+					updateStatus(ctx);
+					throw new Error("Validation completed with a stale candidate but its terminal checkpoint could not be persisted");
+				}
 				updateStatus(ctx);
 				return {
-					content: [{ type: "text", text: `验证期间候选版本发生变化，当前结果已失效：${error instanceof Error ? error.message : String(error)}` }],
+					content: [{ type: "text", text: [
+						`验证期间无法证明候选版本保持不变，当前结果已失效：${candidateCheckError}`,
+						...formatValidationRuns(result.runs),
+						...validationFailureExcerpts(result.runs),
+						"以上命令终态仅用于诊断，不构成当前候选版本的 validation evidence。",
+						"若漂移非预期，先恢复已冻结候选，再由 TUI 用户执行 /delivery-resume。若需要保留当前改动，执行 /delivery-revise plan 并重新批准。",
+					].join("\n") }],
 					details: { runId, candidateDigest, result, staleCandidate: true },
 				};
 			}
