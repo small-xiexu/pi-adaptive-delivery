@@ -433,7 +433,7 @@ pi remove -l git:github.com/small-xiexu/pi-adaptive-delivery
 - `adaptive-delivery-tiny` v1：Tiny intent、non-goals、exact scope、validation 和风险否决声明
 - `adaptive-delivery-review` v1：绑定 candidate/diff digest 的 reviewer verdict 和 findings
 - Delivery runtime state v1
-- Candidate manifest v1
+- Candidate manifest v3
 - Writer lease v1
 
 plan v1 不包含规划文档身份，当前版本会失败关闭并要求重新生成、重新批准，不提供隐式迁移。
