@@ -129,6 +129,8 @@ test("fails closed for malformed or unknown persisted state", () => {
 		{ version: 2, snapshot: { state: "IDLE" }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "UNKNOWN" }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "BLOCKED", resumeState: "DELIVERED" }, updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "IMPLEMENTING", resumeState: "VALIDATING" }, updatedAt: NOW.toISOString() },
+		{ version: 1, snapshot: { state: "DELIVERED" }, updatedAt: NOW.toISOString() },
 		{ version: 1, snapshot: { state: "IDLE" }, updatedAt: "not-a-date" },
 		{
 			version: 1,

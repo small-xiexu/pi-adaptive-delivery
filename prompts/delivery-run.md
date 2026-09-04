@@ -19,9 +19,9 @@ $@
 2. `parent` 路径使用 `delivery_submit_candidate`；`worker` 路径由 `delivery_delegate_worker` 在 terminal proof 后自动提交候选。
 3. 在 `VALIDATING` 只调用一次 `delivery_validate`。Extension 在当前工具卡中顺序执行并显示已批准命令；不要调用 `delivery_runtime_status` 定时轮询，也不要另启验证子 Agent。
 4. Tiny 固定验证全部通过后直接 `delivery_finalize`，不调用 reviewer 或 progress sync。Standard/High-Risk 使用 `delivery_review_candidate` 进行 fresh-context 独立审查；reviewer 必须审查 runtime 提供并绑定当前 candidate 的 actual diff。命令失败时先区分候选代码、验证环境和已批准计划：只有代码问题进入返工，计划错误使用 `/delivery-revise`。
-5. 父会话一次性裁决有证据的 P0/P1，把 accepted findings 转成可验证关闭义务并交给原 writer 批量返工。
+5. 父会话一次性裁决有证据的 P0/P1，把 accepted findings 转成可验证关闭义务；只有代码问题才调用 `delivery_begin_rework({ reason: "包含全部已接受问题、证据、修复断言和边界的单个字符串" })`，不要传入 `acceptedFindings` 或其他未定义字段。进入 `REWORKING` 后再交给原 writer 批量返工。
 6. 返工候选通过确定性复验后只做一次 closure review；同一复现或不变量再次失败时返回方案或计划阶段升级设计，不继续堆叠补丁。
-7. Standard/High-Risk 在 writer-free 边界按项目规则使用 `delivery_progress_sync` 同步项目进度；Tiny 不注册 progress target。
+7. Standard/High-Risk 在 writer-free 边界按项目规则使用 `delivery_progress_sync` 同步项目进度；Tiny 不注册 progress target。每次调用前重新读取目标文件的当前 exact 区块，不复用更早同步前保存的 `oldText`；`oldText` 和 `newText` 都必须非空，当前入口不支持删除。若 exact `newText` 已唯一存在，Extension 按幂等成功处理；若 `oldText` 缺失或不唯一且尚未写入，保持当前状态并要求用最新精确片段重试。
 8. Tiny 发现 scope expansion 时立即 `delivery_invalidate(target=SHAPING)`，停止写入、保留 partial diff 并升级 Standard/High-Risk；不得自行扩展 scope。未授权决策、未知进程、stale candidate 或门禁失败才进入 BLOCKED，并记录可复验的具体原因。
 
 不得自动 commit、push、创建 PR、npm publish 或部署。最终报告必须列出验证证据、残余风险和所有未执行发布动作。

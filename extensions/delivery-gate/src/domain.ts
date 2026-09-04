@@ -146,6 +146,7 @@ export interface PolicyContext {
 		targetPath?: string;
 		targetPathProven: boolean;
 	};
+	progressSyncAvailable?: boolean;
 }
 
 export interface DeliveryPolicy {

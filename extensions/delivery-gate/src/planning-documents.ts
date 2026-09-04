@@ -99,6 +99,12 @@ export function digestPlanningDocumentContent(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+export function documentContainsRequirementName(content: string, requirementName: string): boolean {
+	const compact = (value: string) => value.normalize("NFC").replace(/\s+/gu, "");
+	const expected = compact(requirementName);
+	return expected.length > 0 && compact(content).includes(expected);
+}
+
 function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
@@ -327,10 +333,10 @@ export async function writePlanningDocuments(input: {
 	now?: Date;
 	afterResolveBeforeOpen?: () => Promise<void>;
 }): Promise<PlanningDocumentEvidence> {
-	if (!input.solutionContent.includes(input.documents.requirementName)) {
+	if (!documentContainsRequirementName(input.solutionContent, input.documents.requirementName)) {
 		throw new Error("Technical solution document does not contain the approved requirement name");
 	}
-	if (!input.planContent.includes(input.documents.requirementName)) {
+	if (!documentContainsRequirementName(input.planContent, input.documents.requirementName)) {
 		throw new Error("Implementation plan document does not contain the approved requirement name");
 	}
 	const solutionTarget = await resolveNewTarget(input.gitRoot, input.documents.solutionPath);
@@ -602,7 +608,7 @@ export async function writeSolutionDocument(input: {
 	afterRenameBeforeDirectorySync?: () => Promise<void>;
 	onRevisionPrepared?: (intent: PlanningDocumentRevisionIntent) => Promise<void>;
 }): Promise<SolutionDocumentEvidence> {
-	if (!input.solutionContent.includes(input.documents.requirementName)) {
+	if (!documentContainsRequirementName(input.solutionContent, input.documents.requirementName)) {
 		throw new Error("Technical solution document does not contain the approved requirement name");
 	}
 	if (Buffer.byteLength(input.solutionContent, "utf8") > MAX_DOCUMENT_BYTES) {
@@ -701,7 +707,7 @@ export async function writePlanDocument(input: {
 		throw new Error("Approved technical solution content does not match the synchronized document evidence");
 	}
 	await assertSolutionDocumentCurrent(input.gitRoot, input.solutionEvidence);
-	if (!input.planContent.includes(input.documents.requirementName)) {
+	if (!documentContainsRequirementName(input.planContent, input.documents.requirementName)) {
 		throw new Error("Implementation plan document does not contain the approved requirement name");
 	}
 	if (input.previous) {

@@ -139,6 +139,114 @@ test("requires one unique oldText occurrence", async () => {
 		}),
 		/not unique/,
 	);
+	await writeFile(fixture.target, "aaa");
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "aa",
+			newText: "x",
+			checks: [],
+			runCheck: async () => ({ code: 0, stdout: "", stderr: "" }),
+		}),
+		/not unique/,
+	);
+	assert.equal(await readFile(fixture.target, "utf8"), "aaa");
+});
+
+test("rejects an empty newText instead of creating an unrecoverable deletion", async () => {
+	const fixture = await progressFixture();
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "Status: pending",
+			newText: "",
+			checks: [],
+			runCheck: async () => ({ code: 0, stdout: "", stderr: "" }),
+		}),
+		/newText must be non-empty/,
+	);
+	assert.equal(await readFile(fixture.target, "utf8"), "Status: pending\n");
+});
+
+test("does not write when progress synchronization is already cancelled", async () => {
+	const fixture = await progressFixture();
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "Status: pending",
+			newText: "Status: complete",
+			checks: [],
+			signal: controller.signal,
+			runCheck: async () => ({ code: 0, stdout: "", stderr: "" }),
+		}),
+		/cancelled before it started/,
+	);
+	assert.equal(await readFile(fixture.target, "utf8"), "Status: pending\n");
+});
+
+test("treats one exact existing newText as an idempotent synchronization", async () => {
+	const fixture = await progressFixture();
+	await writeFile(fixture.target, "Status: complete\n");
+	let writes = 0;
+	let checks = 0;
+	const result = await syncProjectProgress({
+		gitRoot: fixture.root,
+		approvedTargets: [fixture.relative],
+		target: fixture.relative,
+		oldText: "Status: pending",
+		newText: "Status: complete",
+		checks: [{ id: "docs", command: "docs-check", args: [], timeoutMs: 30000 }],
+		onWrite: async () => {
+			writes += 1;
+		},
+		runCheck: async () => {
+			checks += 1;
+			return { code: 0, stdout: "", stderr: "" };
+		},
+	});
+
+	assert.equal(await readFile(fixture.target, "utf8"), "Status: complete\n");
+	assert.match(result.digest, /^[a-f0-9]{64}$/);
+	assert.equal(writes, 1);
+	assert.equal(checks, 1);
+});
+
+test("rejects ambiguous idempotent progress text", async () => {
+	const fixture = await progressFixture();
+	await writeFile(fixture.target, "complete\ncomplete\n");
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "pending",
+			newText: "complete",
+			checks: [],
+			runCheck: async () => ({ code: 0, stdout: "", stderr: "" }),
+		}),
+		/newText is not unique/,
+	);
+	await writeFile(fixture.target, "aaa");
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "missing",
+			newText: "aa",
+			checks: [],
+			runCheck: async () => ({ code: 0, stdout: "", stderr: "" }),
+		}),
+		/newText is not unique/,
+	);
 });
 
 test("keeps the project write but reports a failed post-write check", async () => {
@@ -156,4 +264,44 @@ test("keeps the project write but reports a failed post-write check", async () =
 		/invalid docs/,
 	);
 	assert.equal(await readFile(fixture.target, "utf8"), "Status: complete\n");
+});
+
+test("fails a killed progress check even when its exit code is zero", async () => {
+	const fixture = await progressFixture();
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "Status: pending",
+			newText: "Status: complete",
+			checks: [{ id: "docs", command: "docs-check", args: [], timeoutMs: 30000 }],
+			runCheck: async () => ({ code: 0, stdout: "", stderr: "", killed: true }),
+		}),
+		/timed out/,
+	);
+});
+
+test("passes the cancellation signal to progress checks and fails closed after cancellation", async () => {
+	const fixture = await progressFixture();
+	const controller = new AbortController();
+	let observedSignal: AbortSignal | undefined;
+	await assert.rejects(
+		syncProjectProgress({
+			gitRoot: fixture.root,
+			approvedTargets: [fixture.relative],
+			target: fixture.relative,
+			oldText: "Status: pending",
+			newText: "Status: complete",
+			checks: [{ id: "docs", command: "docs-check", args: [], timeoutMs: 30000 }],
+			signal: controller.signal,
+			runCheck: async (_check, signal) => {
+				observedSignal = signal;
+				controller.abort();
+				return { code: 0, stdout: "", stderr: "", killed: true };
+			},
+		}),
+		/cancelled/,
+	);
+	assert.equal(observedSignal, controller.signal);
 });

@@ -181,6 +181,10 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 		const reason = "Blocked delivery state has an invalid resume state";
 		return { ok: false, state: blockedState(reason, now), reason };
 	}
+	if (state !== "BLOCKED" && snapshotInput.resumeState !== undefined) {
+		const reason = "Only a blocked delivery state may contain a resume state";
+		return { ok: false, state: blockedState(reason, now), reason };
+	}
 
 	const checkpointInput = input.checkpoint;
 	let checkpoint: DeliveryCheckpoint | undefined;
@@ -539,6 +543,41 @@ export function parseRuntimeState(value: unknown, now: Date = new Date()): Resto
 			})),
 			completedAt: final.completedAt,
 		};
+	}
+
+	if (state === "DELIVERED") {
+		const candidateEvidenceValid = Boolean(
+			candidateDigest &&
+			validationStatus === "passed" &&
+			validationEvidence?.outcome === "passed" &&
+			validationEvidence.candidateDigest === candidateDigest &&
+			finalEvidence?.candidateDigest === candidateDigest,
+		);
+		let routeEvidenceValid = false;
+		if (tinyContract && tinyBaseline && tinyScopeEvidence && finalEvidence) {
+			routeEvidenceValid = Boolean(
+				approvals?.combined &&
+				!approvals.solution &&
+				!approvals.plan &&
+				tinyScopeEvidence.baselineDigest === tinyBaseline.candidateDigest &&
+				tinyScopeEvidence.candidateDigest === candidateDigest &&
+				finalEvidence.progressArtifacts.length === 0,
+			);
+		} else if (planContract && reviewEvidence && finalEvidence) {
+			routeEvidenceValid = Boolean(
+				(approvals?.combined || (approvals?.solution && approvals.plan)) &&
+				reviewEvidence.candidateDigest === candidateDigest &&
+				reviewEvidence.reviewContractVersion === 1 &&
+				reviewEvidence.candidateDiffDigest &&
+				reviewEvidence.verdict !== "BLOCK" &&
+				finalEvidence.progressArtifacts.length === planContract.progressTargets.length &&
+				finalEvidence.progressArtifacts.every((artifact, index) => artifact.path === planContract.progressTargets[index]),
+			);
+		}
+		if (!candidateEvidenceValid || !routeEvidenceValid) {
+			const reason = "Delivered state is missing consistent approval, candidate, validation, review, or final evidence";
+			return { ok: false, state: blockedState(reason, now), reason };
+		}
 	}
 
 	return {

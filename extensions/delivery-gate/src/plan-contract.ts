@@ -49,23 +49,30 @@ function oneOf<T extends readonly string[]>(value: unknown, options: T): value i
 	return typeof value === "string" && (options as readonly string[]).includes(value);
 }
 
-function planningDocumentPath(value: unknown): string | undefined {
-	if (typeof value !== "string" || !value.trim() || value.includes("\0") || /[\r\n\\]/.test(value)) return undefined;
-	const input = value.trim();
-	if (input.length > 512 || path.isAbsolute(input)) return undefined;
-	const normalized = path.normalize(input);
+function projectRelativePath(value: unknown): string | undefined {
+	if (typeof value !== "string" || !value.trim() || /[\u0000-\u001f\u007f\\]/u.test(value)) return undefined;
+	if (value !== value.trim()) return undefined;
+	const input = value;
+	if (input.length > 512 || path.posix.isAbsolute(input) || path.win32.isAbsolute(input)) return undefined;
+	const normalized = path.posix.normalize(input);
 	if (
 		normalized !== input ||
 		normalized === "." ||
 		normalized === ".." ||
-		normalized.startsWith(`..${path.sep}`) ||
-		path.extname(normalized).toLowerCase() !== ".md"
+		normalized.startsWith("../")
 	) {
 		return undefined;
 	}
-	const first = normalized.split(path.sep)[0];
-	if (!first || first === ".git" || first === ".pi" || first === "node_modules") return undefined;
+	const components = normalized.split("/");
+	if (components.some((component) => [".git", ".pi", "node_modules"].includes(component.toLowerCase()))) {
+		return undefined;
+	}
 	return normalized;
+}
+
+function planningDocumentPath(value: unknown): string | undefined {
+	const normalized = projectRelativePath(value);
+	return normalized && path.extname(normalized).toLowerCase() === ".md" ? normalized : undefined;
 }
 
 export function parsePlanningDocumentsValue(value: unknown): PlanningDocumentsContract | undefined {
@@ -146,15 +153,9 @@ function parseProgressTargets(value: unknown): string[] | undefined {
 	if (!Array.isArray(value) || value.length > 16) return undefined;
 	const targets: string[] = [];
 	for (const item of value) {
-		if (
-			typeof item !== "string" ||
-			!item.trim() ||
-			item.length > 512 ||
-			item.includes("\0")
-		) {
-			return undefined;
-		}
-		targets.push(item.trim());
+		const target = projectRelativePath(item);
+		if (!target) return undefined;
+		targets.push(target);
 	}
 	return [...new Set(targets)];
 }

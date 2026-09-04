@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +18,7 @@ import {
 import {
 	DELIVERY_STATE_CUSTOM_TYPE,
 	createInitialRuntimeState,
+	parseRuntimeState,
 } from "../../extensions/delivery-gate/src/runtime-state.ts";
 
 const ORIGINAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
@@ -64,7 +65,6 @@ const BASE_ACTIVE_TOOLS = [
 	"find",
 	"ls",
 	"delivery_runtime_status",
-	"delivery_progress_sync",
 	"delivery_invalidate",
 ];
 const IDLE_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS.slice(0, 5), "delivery_begin", ...BASE_ACTIVE_TOOLS.slice(5)];
@@ -73,6 +73,7 @@ const WRITER_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS, "edit", "write", "delivery_su
 const DELEGATED_WRITER_ACTIVE_TOOLS = [...BASE_ACTIVE_TOOLS, "delivery_delegate_worker"];
 const VALIDATION_ACTIVE_TOOLS = [
 	...BASE_ACTIVE_TOOLS,
+	"delivery_progress_sync",
 	"delivery_validate",
 	"delivery_review_candidate",
 	"delivery_begin_rework",
@@ -189,8 +190,11 @@ function createHarness(
 			execute?.();
 			return { ...execResult };
 		},
-		appendEntry: (customType: string, data: unknown) => {
-			if (failAppend) throw new Error("append failed");
+			appendEntry: (customType: string, data: unknown) => {
+				if (failAppend) {
+					failAppend = false;
+					throw new Error("append failed");
+				}
 			appendedEntries.push({ customType, data });
 			return "entry-id";
 		},
@@ -781,6 +785,217 @@ test("only a real delivery-shape input can begin shaping from IDLE", async () =>
 	assert.match(statusText, /下一步：检查项目事实并形成技术方案/);
 });
 
+test("reapplies phase tools before each agent run after provider tools are dynamically activated", async () => {
+	const harness = createHarness();
+	await emit(harness, "session_start");
+	await emitWithResults(harness, "input", { text: "/delivery-shape Add a safe feature", source: "interactive" });
+	await harness.tools.get("delivery_begin").execute(
+		"begin-dynamic-tools",
+		{ goal: "Add a safe feature" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	harness.setActiveTools([
+		...harness.getActiveTools(),
+		"exec_command",
+		"write_stdin",
+		"apply_patch",
+		"view_image",
+		"delivery_begin",
+		"delivery_progress_sync",
+	]);
+
+	await emit(harness, "before_agent_start");
+
+	assert.deepEqual(harness.getActiveTools(), READONLY_ACTIVE_TOOLS);
+});
+
+test("filters tools injected after the delivery before-agent handler from provider payloads", async () => {
+	const harness = createHarness();
+	await emit(harness, "session_start");
+	await emitWithResults(harness, "input", { text: "/delivery-shape Add a safe feature", source: "interactive" });
+	await harness.tools.get("delivery_begin").execute(
+		"begin-provider-payload",
+		{ goal: "Add a safe feature" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	await emit(harness, "before_agent_start");
+	harness.setActiveTools([...harness.getActiveTools(), "exec_command", "apply_patch"]);
+
+	const results = await emitWithResults(harness, "before_provider_request", {
+		payload: {
+			tools: [
+				{ type: "function", function: { name: "read", parameters: {} } },
+				{ type: "custom", custom: { name: "grep", format: {} } },
+				{ type: "function", function: { name: "exec_command", parameters: {} } },
+				{ type: "custom", name: "apply_patch" },
+				{ functionDeclarations: [{ name: "grep" }, { name: "write_stdin" }] },
+			],
+			functions: [{ name: "ls" }, { name: "delivery_begin" }],
+			context: { tools: [{ name: "find" }, { name: "view_image" }] },
+			messages: [{ role: "system", tools: [{ name: "ls" }, { name: "exec_command" }] }],
+		},
+	});
+
+	const payload = results[0] as any;
+	assert.deepEqual(payload.tools, [
+		{ type: "function", function: { name: "read", parameters: {} } },
+		{ type: "custom", custom: { name: "grep", format: {} } },
+		{ functionDeclarations: [{ name: "grep" }] },
+	]);
+	assert.deepEqual(payload.functions, [{ name: "ls" }]);
+	assert.deepEqual(payload.context.tools, [{ name: "find" }]);
+	assert.deepEqual(payload.messages, [{ role: "system", tools: [{ name: "ls" }] }]);
+});
+
+test("blocks before a new agent run when the retained writer lease is no longer current", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	harness.invalidateWriterLease();
+
+	await emit(harness, "before_agent_start");
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.ok(blocked.writerLease?.leaseId);
+	assert.match(blocked.blockingReason, /writer lease/);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+	assert.equal(harness.getActiveTools().includes("delivery_progress_sync"), false);
+});
+
+test("blocks before a new agent run when an approved planning document changed", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	writeFileSync(path.join(repo, TEST_PLAN_PATH), "manually changed between agent runs\n");
+
+	await emit(harness, "before_agent_start");
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.match(blocked.blockingReason, /plan document/i);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
+test("blocks raw provider adapters and phase-invalid control tools before execution", async () => {
+	const harness = createHarness();
+	await emit(harness, "session_start");
+
+	for (const toolName of ["bash", "powershell", "exec_command", "write_stdin", "apply_patch", "subagent"]) {
+		const results = await emitWithResults(harness, "tool_call", {
+			toolCallId: `raw-${toolName}`,
+			toolName,
+			input: {},
+		});
+		assert.match((results[0] as any).reason, new RegExp(`Raw ${toolName}`));
+	}
+
+	await emitWithResults(harness, "input", { text: "/delivery-shape Add a safe feature", source: "interactive" });
+	await harness.tools.get("delivery_begin").execute(
+		"begin-phase-guard",
+		{ goal: "Add a safe feature" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	const begin = await emitWithResults(harness, "tool_call", {
+		toolCallId: "begin-in-shaping",
+		toolName: "delivery_begin",
+		input: { goal: "wrong" },
+	});
+	assert.match((begin[0] as any).reason, /only allowed.*IDLE/);
+	const progress = await emitWithResults(harness, "tool_call", {
+		toolCallId: "progress-in-shaping",
+		toolName: "delivery_progress_sync",
+		input: {},
+	});
+	assert.match((progress[0] as any).reason, /only allowed.*VALIDATING or BLOCKED/);
+});
+
+test("blocks an arbitrary tool injected after the last successful delivery policy", async () => {
+	const harness = createHarness();
+	await emit(harness, "session_start");
+	await emitWithResults(harness, "input", { text: "/delivery-shape Add a safe feature", source: "interactive" });
+	await harness.tools.get("delivery_begin").execute(
+		"begin-late-tool",
+		{ goal: "Add a safe feature" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	harness.setActiveTools([...harness.getActiveTools(), "dangerous_write"]);
+
+	const results = await emitWithResults(harness, "tool_call", {
+		toolCallId: "late-dangerous-write",
+		toolName: "dangerous_write",
+		input: { path: "tracked.txt" },
+	});
+
+	assert.equal((results[0] as any).block, true);
+	assert.match((results[0] as any).reason, /not authorized by the current Adaptive Delivery policy/);
+});
+
+test("bounds shaping reads per call and per agent run", async () => {
+	const idle = createHarness();
+	await emit(idle, "session_start");
+	const idleRead = { path: "README.md", limit: 2_000 };
+	await emitWithResults(idle, "tool_call", { toolCallId: "idle-read", toolName: "read", input: idleRead });
+	assert.equal(idleRead.limit, 2_000);
+
+	const harness = createHarness();
+	await emit(harness, "session_start");
+	await emitWithResults(harness, "input", { text: "/delivery-shape Add a safe feature", source: "interactive" });
+	await harness.tools.get("delivery_begin").execute(
+		"begin-read-budget",
+		{ goal: "Add a safe feature" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	await emit(harness, "agent_start");
+	const first = { path: "README.md", limit: 2_000 };
+	await emitWithResults(harness, "tool_call", { toolCallId: "read-0", toolName: "read", input: first });
+	assert.equal(first.limit, 500);
+	for (let index = 1; index < 10; index += 1) {
+		const input = { path: `file-${index}.md`, limit: 500 };
+		const results = await emitWithResults(harness, "tool_call", {
+			toolCallId: `read-${index}`,
+			toolName: "read",
+			input,
+		});
+		assert.equal(results[0], undefined);
+		assert.equal(input.limit, 500);
+	}
+	const exhausted = await emitWithResults(harness, "tool_call", {
+		toolCallId: "read-exhausted",
+		toolName: "read",
+		input: { path: "more.md" },
+	});
+	assert.match((exhausted[0] as any).reason, /read budget is exhausted/);
+
+	await emit(harness, "agent_start");
+	const reset = { path: "after-reset.md" } as { path: string; limit?: number };
+	const resetResults = await emitWithResults(harness, "tool_call", {
+		toolCallId: "read-after-reset",
+		toolName: "read",
+		input: reset,
+	});
+	assert.equal(resetResults[0], undefined);
+	assert.equal(reset.limit, 500);
+});
+
 test("shows an approved-solution checkpoint for an older PLANNING session", async () => {
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
@@ -1288,6 +1503,27 @@ test("records plan approval and enters writer state after acquiring the lease", 
 	assert.match(runtimeStatus.content[0].text, /验证与审查工具会在候选提交后的下一轮出现/);
 });
 
+test("accepts presentation whitespace in the approved requirement name", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd);
+	const planEntry = branch.find((entry: any) => entry.id === "assistant-1") as any;
+	planEntry.message.content[0].text = planEntry.message.content[0].text.replace(
+		`# ${TEST_REQUIREMENT_NAME}-实施计划`,
+		`# Canvas 写路径拆分-实施计划`,
+	);
+	harness.setBranch(branch);
+	await emit(harness, "session_start");
+
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+
+	const persisted = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(persisted.snapshot.state, "IMPLEMENTING");
+	assert.equal(persisted.planningDocuments.requirementName, TEST_REQUIREMENT_NAME);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Canvas 写路径拆分/);
+});
+
 test("standard route delegates one worker and freezes its terminal candidate", async () => {
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
@@ -1349,6 +1585,74 @@ test("standard route delegates one worker and freezes its terminal candidate", a
 	assert.match(statusText, /开发执行者：已完成（运行 ID：worker-run）/);
 	await harness.commands.get("delivery-force-release-lease")?.handler("", harness.ctx);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /没有写入租约/);
+});
+
+test("reproves the writer lease before launching the controlled worker", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	harness.invalidateWriterLease();
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute("worker-stale-lease", {}, undefined, undefined, harness.ctx),
+		/requires current authorization and writer lease/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.workerStatus, undefined);
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
+test("blocks without worker preflight when authorization revalidation throws", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	rmSync(path.join(repo, ".git"), { recursive: true, force: true });
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute("worker-authorization-error", {}, undefined, undefined, harness.ctx),
+		/requires current authorization and writer lease/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.workerStatus, undefined);
+	assert.equal(blocked.workerLaunchContractDigest, undefined);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
+test("reproves approvals and the writer lease before each direct parent write", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "single"));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	assert.equal(harness.getActiveTools().includes("edit"), true);
+	harness.invalidateWriterLease();
+
+	const results = await emitWithResults(harness, "tool_call", {
+		toolCallId: "parent-write-stale-lease",
+		toolName: "edit",
+		input: { path: "tracked.txt" },
+	});
+
+	assert.match((results[0] as any).reason, /writer lease/);
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("runs only the plan-approved deterministic repair after the worker and before candidate freeze", async () => {
@@ -2389,6 +2693,7 @@ test("finalizes only after passed validation and an OK fresh review", async () =
 	assert.equal(persisted.reviewEvidence.verdict, "OK");
 	assert.equal(persisted.finalEvidence.candidateDigest, persisted.candidateDigest);
 	assert.equal(persisted.finalEvidence.progressArtifacts[0].path, TEST_PLAN_PATH);
+	assert.equal(parseRuntimeState(persisted).ok, true);
 	await harness.commands.get("delivery-status")?.handler("", harness.ctx);
 	const status = harness.ui.notifications.at(-1)?.[0] ?? "";
 	assert.match(status, /候选版本：[a-f0-9]{64}（当前有效）/);
@@ -2473,6 +2778,46 @@ test("restores the writer only for a BLOCK review on the current candidate", asy
 	assert.ok(persisted.writerLease.leaseId);
 });
 
+test("resumes partial rework without treating its edits as frozen-candidate drift", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setReviewText("Concrete P1 finding\nMerge verdict: BLOCK");
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_validate").execute("validate", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_review_candidate").execute("review", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_begin_rework").execute(
+		"rework",
+		{ reason: "Fix accepted P1" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	writeFileSync(path.join(repo, "tracked.txt"), "partial rework\n");
+	await harness.tools.get("delivery_invalidate").execute(
+		"temporary-rework-block",
+		{ target: "BLOCKED", reason: "temporary interruption" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+
+	await harness.commands.get("delivery-resume")?.handler("", harness.ctx);
+
+	const resumed = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(resumed.snapshot.state, "REWORKING");
+	assert.equal(resumed.reworkApproved, true);
+	assert.equal(resumed.reviewEvidence.verdict, "BLOCK");
+	assert.equal(resumed.reviewEvidence.candidateDigest, resumed.candidateDigest);
+	assert.ok(resumed.writerLease?.leaseId);
+	assert.deepEqual(harness.getActiveTools(), WRITER_ACTIVE_TOOLS);
+	await harness.commands.get("delivery-cancel")?.handler("", harness.ctx);
+});
+
 test("fails closed for a validation interrupted before its terminal checkpoint", async () => {
 	const repo = candidateRepo();
 	const first = createHarness(repo);
@@ -2504,6 +2849,45 @@ test("fails closed for a validation interrupted before its terminal checkpoint",
 	assert.equal(restored.validationFailureKind, "infrastructure");
 	assert.match(restored.blockingReason, /interrupted before its terminal checkpoint/);
 	assert.deepEqual(second.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
+});
+
+test("keeps the lease and blocks a running worker after hot restore loses terminal observation", async () => {
+	const repo = candidateRepo();
+	const first = createHarness(repo);
+	first.setConfirmResult(true);
+	const approvedBranch = approvalBranch("PLAN_PENDING_APPROVAL", first.sessionId, first.ctx.cwd, "standard");
+	first.setBranch(approvedBranch);
+	await emit(first, "session_start");
+	await first.commands.get("delivery-approve-plan")?.handler("", first.ctx);
+	const running = structuredClone(first.appendedEntries.at(-1)?.data as any);
+	running.workerRunId = "unobserved-worker";
+	running.workerStatus = "running";
+	running.workerLaunchContractDigest = "a".repeat(64);
+	await emit(first, "session_shutdown");
+
+	const branch = structuredClone(approvedBranch);
+	(branch.at(-1) as any).data = running;
+	const second = createHarness(repo, { sessionId: first.sessionId, stateRoot: first.stateRoot });
+	second.setConfirmResult(true);
+	second.setBranch(branch);
+	await emit(second, "session_start");
+
+	const restored = second.appendedEntries.at(-1)?.data as any;
+	assert.equal(restored.snapshot.state, "BLOCKED");
+	assert.equal(restored.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(restored.workerStatus, "running");
+	assert.equal(restored.workerRunId, "unobserved-worker");
+	assert.ok(restored.writerLease?.leaseId);
+	assert.match(restored.blockingReason, /terminal status is unknown/);
+	assert.deepEqual(second.getActiveTools(), BASE_ACTIVE_TOOLS);
+	await second.commands.get("delivery-resume")?.handler("", second.ctx);
+	const stillBlocked = second.appendedEntries.at(-1)?.data as any;
+	assert.equal(stillBlocked.snapshot.state, "BLOCKED");
+	assert.equal(stillBlocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(stillBlocked.workerStatus, "running");
+	assert.ok(stillBlocked.writerLease?.leaseId);
+	assert.match(stillBlocked.blockingReason, /Worker terminal status is still unknown/);
+	assert.deepEqual(second.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("preserves approvals but blocks an old passed validation without command evidence", async () => {
@@ -2670,6 +3054,88 @@ test("syncs only the approved progress target at a writer-free boundary", async 
 	);
 });
 
+test("cleans an acquired lease and permits retry when the initial progress checkpoint fails", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	const progress = harness.tools.get("delivery_progress_sync");
+	harness.failNextAppend();
+
+	await assert.rejects(
+		progress.execute(
+			"progress-checkpoint-failure",
+			{ target: TEST_PLAN_PATH, oldText: "Status: pending", newText: "Status: complete" },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/Failed to persist progress-sync operation checkpoint/,
+	);
+
+	const recovered = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(recovered.snapshot.state, "VALIDATING");
+	assert.equal(recovered.writerLease, undefined);
+	assert.match(recovered.checkpoint.summary, /checkpoint failed before write/);
+	assert.deepEqual(harness.getActiveTools(), VALIDATION_ACTIVE_TOOLS);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: pending/);
+
+	const retried = await progress.execute(
+		"progress-checkpoint-retry",
+		{ target: TEST_PLAN_PATH, oldText: "Status: pending", newText: "Status: complete" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	assert.match(retried.content[0].text, /项目进度已同步/);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: complete/);
+});
+
+test("keeps validation evidence and permits an exact retry after a pre-write progress conflict", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_validate").execute("validate", {}, undefined, undefined, harness.ctx);
+	const before = readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8");
+
+	const progress = harness.tools.get("delivery_progress_sync");
+	await assert.rejects(
+		progress.execute(
+			"progress-stale",
+			{ target: TEST_PLAN_PATH, oldText: "Status: stale", newText: "Status: complete" },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/oldText was not found/,
+	);
+
+	assert.equal(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), before);
+	const conflicted = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(conflicted.snapshot.state, "VALIDATING");
+	assert.equal(conflicted.writerLease, undefined);
+	assert.equal(conflicted.validationStatus, "passed");
+	assert.equal(conflicted.validationEvidence.candidateDigest, conflicted.candidateDigest);
+	assert.deepEqual(harness.getActiveTools(), VALIDATION_ACTIVE_TOOLS);
+
+	const retried = await progress.execute(
+		"progress-retry",
+		{ target: TEST_PLAN_PATH, oldText: "Status: pending", newText: "Status: complete" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	assert.match(retried.content[0].text, /项目进度已同步/);
+	assert.match(readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8"), /Status: complete/);
+});
+
 test("blocks after a failed progress check without leaving write tools or lease", async () => {
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
@@ -2701,6 +3167,34 @@ test("blocks after a failed progress check without leaving write tools or lease"
 	await harness.commands.get("delivery-force-release-lease")?.handler("", harness.ctx);
 	assert.equal(harness.getConfirmCalls(), confirmations);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /没有写入租约/);
+});
+
+test("blocks a killed progress check even when the process reports exit code zero", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	harness.setExecResult({ stdout: "", stderr: "", code: 0, killed: true });
+
+	await assert.rejects(
+		harness.tools.get("delivery_progress_sync").execute(
+			"progress-killed",
+			{ target: TEST_PLAN_PATH, oldText: "Status: pending", newText: "Status: complete" },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/timed out/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "VALIDATING");
+	assert.equal(blocked.writerLease, undefined);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("retains the lease when progress-sync policy restoration cannot be proven", async () => {
@@ -2870,4 +3364,33 @@ test("temporary BLOCKED preserves completed validation evidence", async () => {
 		content: "/delivery-run",
 		options: { expandPromptTemplates: true },
 	});
+});
+
+test("resume keeps validation blocked when the frozen candidate changed", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_invalidate").execute(
+		"temporary-validation-block-before-drift",
+		{ target: "BLOCKED", reason: "temporary interruption" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	writeFileSync(path.join(repo, "tracked.txt"), "changed while blocked\n");
+	const sentBefore = harness.sentUserMessages.length;
+
+	await harness.commands.get("delivery-resume")?.handler("", harness.ctx);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "VALIDATING");
+	assert.equal(blocked.writerLease, undefined);
+	assert.match(blocked.blockingReason, /Candidate changed while delivery was blocked/);
+	assert.equal(harness.sentUserMessages.length, sentBefore);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });

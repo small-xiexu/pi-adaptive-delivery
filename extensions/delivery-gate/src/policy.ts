@@ -27,11 +27,11 @@ const WRITE_TOOLS = new Set(["edit", "write"]);
 const SAFE_CONTROL_TOOLS = new Set([
 	"delivery_runtime_status",
 	"delivery_invalidate",
-	"delivery_progress_sync",
 ]);
 const MANAGED_DELIVERY_TOOLS = new Set([
 	"delivery_begin",
 	...SAFE_CONTROL_TOOLS,
+	"delivery_progress_sync",
 	"delivery_delegate_readonly",
 	"delivery_delegate_worker",
 	"delivery_submit_candidate",
@@ -59,12 +59,20 @@ function resolveActiveTools(
 	baseline: readonly string[],
 	policy: DeliveryPolicy,
 	state?: DeliverySnapshot["state"],
+	context?: PolicyContext,
 ): string[] {
 	const active = baseline.filter((name) =>
 		READ_TOOLS.has(name) ||
 		SAFE_CONTROL_TOOLS.has(name) ||
 		(state === "IDLE" && name === "delivery_begin"),
 	);
+	if (
+		(state === "VALIDATING" || state === "BLOCKED") &&
+		context?.progressSyncAvailable === true &&
+		!context.writerLeaseHeld
+	) {
+		active.push(...baseline.filter((name) => name === "delivery_progress_sync"));
+	}
 
 	if (policy.sourceWrite || policy.writablePaths.length > 0) {
 		active.push(...baseline.filter((name) => WRITE_TOOLS.has(name)));
@@ -114,6 +122,7 @@ function requiredTools(policy: DeliveryPolicy): string[] {
 export class PolicyController {
 	private baselineTools: string[] = [];
 	private baselineCaptured = false;
+	private authorizedTools = new Set<string>();
 	private readonly host: PolicyHost;
 	private readonly baselineKey?: string;
 
@@ -156,6 +165,7 @@ export class PolicyController {
 		const activeTools = resolveActiveTools(this.baselineTools, policy);
 		try {
 			this.host.setActiveTools(activeTools);
+			this.authorizedTools = new Set(activeTools);
 			this.host.applySubagentAccess?.("none");
 			return { ok: true, policy, activeTools };
 		} catch (error) {
@@ -170,7 +180,7 @@ export class PolicyController {
 
 	apply(snapshot: DeliverySnapshot, context: PolicyContext): ApplyPolicyResult {
 		const policy = resolveDeliveryPolicy(snapshot, context);
-		const activeTools = resolveActiveTools(this.baselineTools, policy, snapshot.state);
+		const activeTools = resolveActiveTools(this.baselineTools, policy, snapshot.state, context);
 		const missingTools = requiredTools(policy).filter((name) => !activeTools.includes(name));
 		if (missingTools.length > 0) {
 			const fallback = this.forceReadOnly();
@@ -184,6 +194,7 @@ export class PolicyController {
 
 		try {
 			this.host.setActiveTools(activeTools);
+			this.authorizedTools = new Set(activeTools);
 			const observed = new Set(this.host.getActiveTools());
 			const inactiveTools = requiredTools(policy).filter((name) => !observed.has(name));
 			if (inactiveTools.length > 0) {
@@ -200,5 +211,9 @@ export class PolicyController {
 				reason: error instanceof Error ? error.message : String(error),
 			};
 		}
+	}
+
+	isToolAuthorized(name: string): boolean {
+		return this.authorizedTools.has(name);
 	}
 }

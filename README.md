@@ -108,6 +108,8 @@ pi
 
 不需要在命令里重复项目规则、测试命令和安全限制。Package 应自行读取项目事实；存在真正的产品或范围歧义时，只问一个关键问题。
 
+方案和计划阶段会先搜索定位，再读取必要切片。父 Pi 的单次 `read` 最多 500 行、同一次 agent run 累计最多 5000 行；达到上限后必须使用搜索结果成案或明确说明缺少的关键事实，不能靠反复整篇读取拖长流程。该限制不影响唯一 worker、fresh reviewer 或已批准固定验证。
+
 ### 方案追问
 
 Package 已把“方案追问”内置到 `adaptive-delivery`，不依赖额外的 `grilling` Skill。它会先查项目；只有存在会改变最终效果、范围、共享接口、数据、安全、费用或不可逆行为的选择时，才一次问你一个问题，并给出推荐答案和不同选择的实际影响。你可以只回复：
@@ -234,7 +236,7 @@ TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract
 6. Standard/High-Risk 使用 fresh reviewer 检查 runtime 提供的同一 candidate actual diff，并把结果绑定 candidate/diff digest；Tiny 默认省略。
 7. 把 accepted P0/P1 转成可验证关闭义务并批量返工。
 8. 复验后只做一次 closure review。
-9. Standard/High-Risk 在 writer-free 边界同步唯一进度台账；Tiny 不注册 progress target。
+9. Standard/High-Risk 在 writer-free 边界同步唯一进度台账；Tiny 不注册 progress target。progress target 必须是 Git root 内 canonical project-relative 非保留路径；`.git`、`.pi`、`node_modules`、绝对路径和非规范化路径不允许。同步使用当前 exact 非空文本：目标已唯一包含 `newText` 时按幂等成功处理；`oldText` 在写前缺失或不唯一时保持原阶段并允许重读后重试，不做模糊合并或删除。身份、路径、取消/超时、写后检查或 lease/策略证明失败仍进入 `BLOCKED`。
 10. 全部证据仍对应当前 candidate 时进入 `DELIVERED`。
 
 P2、推测性意见和与当前修改无关的历史问题只进入最终 notes，不会无限触发 review/fix。
@@ -297,7 +299,7 @@ resume 会重新校验批准、cwd、Git root、适用的规划文档或 Tiny ba
 
 临时 `BLOCKED` 会保留已经批准的方案、计划、两份规划文档、candidate 和已有验证证据，只释放当前 writer lease；因此解决运行时问题后通常可以直接 resume，不需要重新批准，也不会因为 create-only 文档已经存在而卡住。只有需求、范围、架构或计划确实要重做时，才使用 `/delivery-revise` 撤销相应批准。
 
-用户在 TUI 确认 resume 且状态、lease 和策略全部恢复成功后，Package 会自动继续当前阶段：恢复到 `PLANNING` 时生成实施计划，恢复到 `IMPLEMENTING`、`REWORKING` 或 `VALIDATING` 时继续 `/delivery-run`。如果自动发送失败，恢复本身仍然有效，界面会明确提示手工运行对应命令。
+用户在 TUI 确认 resume 且状态、lease、candidate/evidence 和策略全部恢复成功后，Package 会自动继续当前阶段：恢复到 `PLANNING` 时生成实施计划，恢复到 `IMPLEMENTING`、`REWORKING` 或 `VALIDATING` 时继续 `/delivery-run`。热恢复后仍为 `starting/running` 的 worker 没有可证明终态时会保留 lease 并继续 `BLOCKED`，不能直接 resume；需要先证明终态或由用户确认 force-release。如果自动发送失败，恢复本身仍然有效，界面会明确提示手工运行对应命令。
 
 ### 更新后旧 Session 报 plan contract malformed
 
@@ -359,6 +361,8 @@ Package 不支持：
 
 Package 和 Extension 以当前用户权限运行。writer lease 只约束加载兼容 Package 的受控 Pi 流程，不能阻止外部编辑器、未加载 Package 的进程或恶意同进程 Extension。candidate digest 用于发现变化，不证明代码一定正确。不可信仓库或 unattended automation 仍需容器、VM 或其他操作系统级隔离。
 
+Pi 的 active-tools 用于让模型看到当前阶段应使用的工具，但不是唯一授权边界。Package 还会在每次 `tool_call` 真正执行前拒绝最后一次成功阶段策略集合外的任意工具；内置 `edit/write` 继续执行实时 approval、lease、route 和 scope 校验。Standard/High-Risk 的 worker 路由中，即使工具因 Provider 或后加载 Extension 短暂出现，父 Pi 也不能据此修改项目或启动命令。
+
 真实 Provider、费用、生产数据、数据库迁移、发布和不可逆操作继续服从用户与项目自己的授权规则。
 
 ## Agent 与模型
@@ -395,6 +399,8 @@ Package 不硬编码 Provider 或模型。角色模型由用户级 `subagents.ag
 ```
 
 普通方案梳理由父 Pi 直接使用只读工具完成，不为提速启动 scout。Package 会在实施计划批准前做只读 preflight；没有任何可用 reviewer candidate 时，已经批准并同步的技术方案会保留，但不会创建实施计划、获取实施阶段 writer lease 或进入实现，因为后续 fresh review 无法完成。固定验证本身不再启动 reviewer 或依赖模型：`delivery_validate` 只执行已批准命令，并在当前工具卡显示当前命令、退出码和耗时。命令失败只表示批准验证未通过；父 Pi 必须再判断原因是候选代码、验证环境还是计划错误，不能一律修改源码。
+
+实施计划为每条验证固定 `timeoutMs`。长全量测试、构建和容器命令应使用同机器、同环境、同范围的最近耗时并留足余量；没有可比证据时使用保守值。若宿主 timeout 不能终止容器或其他外部后代进程，批准命令自身还必须提供可终止边界；非用户中断且 runtime 看到 `killed=true` 时按超时失败处理，即使外部进程稍后返回退出码 0。
 
 模型临时排除由 bundled `pi-subagents` runtime 管理。其默认 TTL 可在 `~/.pi/agent/extensions/subagent/config.json` 调整，例如把单次瞬时错误的冷却设为 5 分钟：
 

@@ -15,7 +15,8 @@ export interface ProgressSyncInput {
 	oldText: string;
 	newText: string;
 	checks: readonly ProgressCheck[];
-	runCheck: (check: ProgressCheck) => Promise<{ code: number; stdout: string; stderr: string }>;
+	signal?: AbortSignal;
+	runCheck: (check: ProgressCheck, signal?: AbortSignal) => Promise<{ code: number; stdout: string; stderr: string; killed?: boolean }>;
 	onWrite?: (evidence: ProgressWriteEvidence) => Promise<void>;
 	beforeOpen?: () => Promise<void>;
 	afterRecheckBeforeOpen?: () => Promise<void>;
@@ -30,6 +31,13 @@ export interface ProgressSyncResult {
 	target: string;
 	digest: string;
 	checks: Array<{ id: string; code: number }>;
+}
+
+export class ProgressSyncConflictError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ProgressSyncConflictError";
+	}
 }
 
 interface FileIdentity {
@@ -100,8 +108,10 @@ export async function resolveProgressTarget(
 }
 
 export async function syncProjectProgress(input: ProgressSyncInput): Promise<ProgressSyncResult> {
+	if (input.signal?.aborted) throw new Error("Progress sync was cancelled before it started");
 	const target = await resolveProgressTarget(input.gitRoot, input.approvedTargets, input.target);
 	if (!input.oldText) throw new Error("Progress sync oldText must be non-empty");
+	if (!input.newText) throw new Error("Progress sync newText must be non-empty");
 	return withFileMutationQueue(target.absolute, async () => {
 		await inspectPathComponents(target.root, target.absolute);
 		await input.beforeOpen?.();
@@ -121,15 +131,23 @@ export async function syncProjectProgress(input: ProgressSyncInput): Promise<Pro
 			await assertParentIdentities(target.identity.parents);
 			const current = await handle.readFile("utf8");
 			const first = current.indexOf(input.oldText);
-			if (first < 0) throw new Error("Progress sync oldText was not found");
-			if (current.indexOf(input.oldText, first + input.oldText.length) >= 0) {
-				throw new Error("Progress sync oldText is not unique");
+			if (first < 0) {
+				const applied = input.newText ? current.indexOf(input.newText) : -1;
+				if (applied < 0) throw new ProgressSyncConflictError("Progress sync oldText was not found");
+				if (current.indexOf(input.newText, applied + 1) >= 0) {
+					throw new ProgressSyncConflictError("Progress sync oldText was not found and newText is not unique");
+				}
+				next = current;
+			} else {
+				if (current.indexOf(input.oldText, first + 1) >= 0) {
+					throw new ProgressSyncConflictError("Progress sync oldText is not unique");
+				}
+				next = `${current.slice(0, first)}${input.newText}${current.slice(first + input.oldText.length)}`;
+				const bytes = Buffer.from(next, "utf8");
+				await handle.truncate(0);
+				await handle.write(bytes, 0, bytes.length, 0);
+				await handle.sync();
 			}
-			next = `${current.slice(0, first)}${input.newText}${current.slice(first + input.oldText.length)}`;
-			const bytes = Buffer.from(next, "utf8");
-			await handle.truncate(0);
-			await handle.write(bytes, 0, bytes.length, 0);
-			await handle.sync();
 		} finally {
 			await handle.close();
 		}
@@ -143,10 +161,14 @@ export async function syncProjectProgress(input: ProgressSyncInput): Promise<Pro
 			digest: createHash("sha256").update(next!).digest("hex"),
 		};
 		await input.onWrite?.(writeEvidence);
+		if (input.signal?.aborted) throw new Error("Progress sync was cancelled after the write");
 		const checkResults: Array<{ id: string; code: number }> = [];
 		for (const check of input.checks) {
-			const result = await input.runCheck(check);
+			if (input.signal?.aborted) throw new Error(`Progress check '${check.id}' was cancelled before it started`);
+			const result = await input.runCheck(check, input.signal);
 			checkResults.push({ id: check.id, code: result.code });
+			if (input.signal?.aborted) throw new Error(`Progress check '${check.id}' was cancelled`);
+			if (result.killed) throw new Error(`Progress check '${check.id}' timed out`);
 			if (result.code !== 0) {
 				throw new Error(`Progress check '${check.id}' failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
 			}

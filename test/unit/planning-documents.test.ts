@@ -8,6 +8,7 @@ import {
 	assertPlanningDocumentsExist,
 	assertSolutionDocumentCurrent,
 	digestPlanningDocumentContent,
+	documentContainsRequirementName,
 	extractPlanningDocumentContent,
 	parsePlanningDocumentEvidence,
 	parsePlanningDocumentRevisionIntent,
@@ -28,6 +29,13 @@ const documents = {
 } as const;
 
 const acknowledgeRevisionIntent = async () => {};
+
+test("matches requirement names across presentation whitespace but not different characters", () => {
+	assert.equal(documentContainsRequirementName("# Canvas 节点\n数据契约拆分实施计划", "Canvas节点数据契约拆分"), true);
+	assert.equal(documentContainsRequirementName("# Cafe\u0301 delivery", "Café delivery"), true);
+	assert.equal(documentContainsRequirementName("# Canvas边数据契约拆分实施计划", "Canvas节点数据契约拆分"), false);
+	assert.equal(documentContainsRequirementName("# Canvas点节数据契约拆分实施计划", "Canvas节点数据契约拆分"), false);
+});
 
 test("extracts exactly one marked solution and plan document", () => {
 	const content = [{
@@ -99,8 +107,8 @@ test("creates two requirement-named Markdown documents and records evidence", as
 
 test("writes the approved solution first and creates only the plan after its evidence is rechecked", async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-solution-first-"));
-	const solutionContent = "# Canvas写路径拆分技术方案\n\n保持公开行为不变。\n";
-	const planContent = "# Canvas写路径拆分实施计划\n\n运行固定验证。\n";
+	const solutionContent = "# Canvas 写路径拆分技术方案\n\n保持公开行为不变。\n";
+	const planContent = "# Canvas 写路径拆分实施计划\n\n运行固定验证。\n";
 	const solutionEvidence = await writeSolutionDocument({ gitRoot: root, documents, solutionContent });
 
 	assert.equal(await readFile(path.join(root, documents.solutionPath), "utf8"), solutionContent);

@@ -54,33 +54,55 @@ function isolatedRpcEnvironment(
 	};
 }
 
-async function startLocalOpenAiServer(): Promise<{ baseUrl: string; close(): Promise<void> }> {
+async function startLocalOpenAiServer(options: { callDeliveryBegin?: boolean } = {}): Promise<{
+	baseUrl: string;
+	requests: Array<Record<string, any>>;
+	close(): Promise<void>;
+}> {
+	const requests: Array<Record<string, any>> = [];
 	const server = createServer((request, response) => {
 		if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
 			response.writeHead(404).end();
 			return;
 		}
-		request.resume();
+		const chunks: Buffer[] = [];
+		request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
 		request.on("end", () => {
+			requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
 			response.writeHead(200, {
 				"content-type": "text/event-stream",
 				"cache-control": "no-cache",
 				connection: "keep-alive",
 			});
 			const created = Math.floor(Date.now() / 1000);
+			const shouldBegin = options.callDeliveryBegin === true && requests.length === 1;
 			response.write(`data: ${JSON.stringify({
 				id: "chatcmpl-adaptive-local",
 				object: "chat.completion.chunk",
 				created,
 				model: "fake-model",
-				choices: [{ index: 0, delta: { role: "assistant", content: "Fake read-only delegate completed." }, finish_reason: null }],
+				choices: [{
+					index: 0,
+					delta: shouldBegin
+						? {
+							role: "assistant",
+							tool_calls: [{
+								index: 0,
+								id: "local-delivery-begin",
+								type: "function",
+								function: { name: "delivery_begin", arguments: '{"goal":"Local payload probe"}' },
+							}],
+						}
+						: { role: "assistant", content: "Fake read-only delegate completed." },
+					finish_reason: null,
+				}],
 			})}\n\n`);
 			response.write(`data: ${JSON.stringify({
 				id: "chatcmpl-adaptive-local",
 				object: "chat.completion.chunk",
 				created,
 				model: "fake-model",
-				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				choices: [{ index: 0, delta: {}, finish_reason: shouldBegin ? "tool_calls" : "stop" }],
 			})}\n\n`);
 			response.end("data: [DONE]\n\n");
 		});
@@ -95,6 +117,7 @@ async function startLocalOpenAiServer(): Promise<{ baseUrl: string; close(): Pro
 	const address = server.address() as AddressInfo;
 	return {
 		baseUrl: `http://127.0.0.1:${address.port}/v1`,
+		requests,
 		close: () => new Promise<void>((resolve, reject) => {
 			server.close((error) => error ? reject(error) : resolve());
 		}),
@@ -107,7 +130,14 @@ class RpcHarness {
 	private readonly pending = new Map<string, { resolve(value: RpcRecord): void; reject(error: Error): void }>();
 	private stderr = "";
 
-	constructor(cwd: string, agentDir: string, options: { fakeProvider?: boolean; deliveryGate?: boolean; packageManifest?: boolean; env?: Record<string, string> } = {}) {
+	constructor(cwd: string, agentDir: string, options: {
+		fakeProvider?: boolean;
+		deliveryGate?: boolean;
+		packageManifest?: boolean;
+		env?: Record<string, string>;
+		model?: string;
+		extraExtensions?: string[];
+	} = {}) {
 		const root = process.cwd();
 		if (options.packageManifest) {
 			writeFileSync(path.join(agentDir, "settings.json"), `${JSON.stringify({ packages: [root] }, null, 2)}\n`);
@@ -123,6 +153,8 @@ class RpcHarness {
 		const deliveryGateArgs = options.deliveryGate === false || options.packageManifest
 			? []
 			: ["--extension", path.join(root, "extensions/delivery-gate/index.ts")];
+		const modelArgs = options.model ? ["--model", options.model] : [];
+		const extraExtensionArgs = (options.extraExtensions ?? []).flatMap((extension) => ["--extension", extension]);
 		const packageResourceArgs = options.packageManifest
 			? []
 			: [
@@ -152,6 +184,8 @@ class RpcHarness {
 				"--no-themes",
 				...packageResourceArgs,
 				...fakeProviderArgs,
+				...modelArgs,
+				...extraExtensionArgs,
 			],
 			{
 				cwd,
@@ -403,6 +437,85 @@ test("real Pi RPC runs the shaping tool lifecycle through a local fake provider"
 		);
 	} finally {
 		harness.stop();
+	}
+});
+
+test("real Pi filters tools injected by a later before-agent handler from the serialized provider payload", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-late-tools-repo-"));
+	execFileSync("git", ["init", "-q"], { cwd });
+	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-rpc-late-tools-agent-"));
+	const localProvider = await startLocalOpenAiServer({ callDeliveryBegin: true });
+	writeFileSync(path.join(agentDir, "models.json"), `${JSON.stringify({
+		providers: {
+			"adaptive-local": {
+				baseUrl: localProvider.baseUrl,
+				api: "openai-completions",
+				apiKey: "local-test-key",
+				compat: {
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: false,
+					supportsUsageInStreaming: false,
+				},
+				models: [{
+					id: "fake-model",
+					name: "Local Fake Model",
+					reasoning: false,
+					input: ["text"],
+					contextWindow: 100000,
+					maxTokens: 4096,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				}],
+			},
+		},
+	}, null, 2)}\n`);
+	const harness = new RpcHarness(cwd, agentDir, {
+		model: "adaptive-local/fake-model",
+		extraExtensions: [path.join(process.cwd(), "test/support/late-dynamic-tools.ts")],
+	});
+	try {
+		const response = await harness.send("prompt", { message: "/delivery-shape Add a safe feature" }, 30_000);
+		assert.equal(response.success, true);
+		await harness.waitFor((record) => record.type === "agent_settled", 30_000);
+		const probeStatus = await harness.send("prompt", { message: "/late-dynamic-tools-probe-status" });
+		assert.equal(probeStatus.success, true);
+		const probeNotification = await harness.waitFor(
+			(record: any) =>
+				record.type === "extension_ui_request" &&
+				record.method === "notify" &&
+				typeof record.message === "string" &&
+				record.message.includes("injectedActiveTools"),
+			10_000,
+		);
+		const probe = JSON.parse((probeNotification as any).message) as {
+			injected: boolean;
+			injectedActiveTools: string[];
+		};
+		assert.equal(probe.injected, true);
+		for (const toolName of ["exec_command", "write_stdin", "apply_patch", "view_image"]) {
+			assert.equal(probe.injectedActiveTools.includes(toolName), true, `probe activated ${toolName}`);
+		}
+		assert.equal(localProvider.requests.length >= 2, true);
+		const requestToolNames = localProvider.requests.map((request) =>
+			(request.tools ?? []).map((tool: any) => tool.function?.name ?? tool.name).filter(Boolean)
+		);
+		for (const names of requestToolNames) {
+			for (const toolName of ["exec_command", "write_stdin", "apply_patch", "view_image"]) {
+				assert.equal(names.includes(toolName), false, `${toolName} excluded from ${names.join(",")}`);
+			}
+		}
+		const finalNames = requestToolNames.at(-1) ?? [];
+		assert.equal(finalNames.includes("delivery_begin"), false);
+		assert.equal(finalNames.includes("delivery_progress_sync"), false);
+		assert.equal(finalNames.includes("read"), true);
+		assert.equal(
+			harness.records.some(
+				(record: any) => record.type === "tool_execution_end" && record.toolName === "delivery_begin" && record.isError === false,
+			),
+			true,
+		);
+	} finally {
+		harness.stop();
+		await localProvider.close();
 	}
 });
 

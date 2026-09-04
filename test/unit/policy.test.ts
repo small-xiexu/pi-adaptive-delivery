@@ -58,19 +58,32 @@ const BASE_TOOLS = [
 	"find",
 	"ls",
 	"delivery_runtime_status",
-	"delivery_progress_sync",
 	"delivery_invalidate",
 ];
 const IDLE_TOOLS = [...BASE_TOOLS.slice(0, 5), "delivery_begin", ...BASE_TOOLS.slice(5)];
 const READONLY_TOOLS = [...BASE_TOOLS, "delivery_delegate_readonly"];
 const WRITER_TOOLS = [...BASE_TOOLS, "edit", "write", "delivery_submit_candidate"];
 const DELEGATED_WRITER_TOOLS = [...BASE_TOOLS, "delivery_delegate_worker"];
+const VALIDATION_TOOLS = [
+	...BASE_TOOLS,
+	"delivery_progress_sync",
+	"delivery_validate",
+	"delivery_review_candidate",
+	"delivery_begin_rework",
+	"delivery_finalize",
+];
 
 const READ_ONLY_CONTEXT = {
 	approvalsValid: false,
 	writerLeaseHeld: false,
 	writerLeaseOwner: null,
 	reworkApproved: false,
+	progressSyncAvailable: false,
+} as const;
+
+const PROGRESS_SYNC_CONTEXT = {
+	...READ_ONLY_CONTEXT,
+	progressSyncAvailable: true,
 } as const;
 
 test("captures baseline and applies state policy to Pi tools", () => {
@@ -82,6 +95,9 @@ test("captures baseline and applies state policy to Pi tools", () => {
 	assert.equal(shaping.ok, true);
 	assert.deepEqual(host.activeTools, READONLY_TOOLS);
 	assert.equal(host.access.at(-1), "readonly");
+	assert.equal(controller.isToolAuthorized("read"), true);
+	assert.equal(controller.isToolAuthorized("edit"), false);
+	assert.equal(controller.isToolAuthorized("late_dynamic_write"), false);
 });
 
 test("exposes delivery_begin only while the runtime is IDLE", () => {
@@ -93,6 +109,37 @@ test("exposes delivery_begin only while the runtime is IDLE", () => {
 	assert.deepEqual(host.activeTools, IDLE_TOOLS);
 	assert.equal(controller.apply({ state: "VALIDATING" }, READ_ONLY_CONTEXT).ok, true);
 	assert.equal(host.activeTools.includes("delivery_begin"), false);
+});
+
+test("exposes progress sync only in writer-free validation and blocked states", () => {
+	const host = new FakePolicyHost();
+	const controller = new PolicyController(host);
+	controller.captureBaseline();
+
+	for (const state of ["SHAPING", "PLANNING", "IMPLEMENTING", "REWORKING"] as const) {
+		const context = state === "IMPLEMENTING" || state === "REWORKING"
+			? {
+					approvalsValid: true,
+					writerLeaseHeld: true,
+					writerLeaseOwner: "parent" as const,
+					reworkApproved: state === "REWORKING",
+				}
+			: READ_ONLY_CONTEXT;
+		assert.equal(controller.apply({ state }, context).ok, true);
+		assert.equal(host.activeTools.includes("delivery_progress_sync"), false, state);
+	}
+
+	assert.equal(controller.apply({ state: "VALIDATING" }, PROGRESS_SYNC_CONTEXT).ok, true);
+	assert.deepEqual(host.activeTools, VALIDATION_TOOLS);
+	assert.equal(controller.apply({ state: "BLOCKED", resumeState: "VALIDATING" }, PROGRESS_SYNC_CONTEXT).ok, true);
+	assert.equal(host.activeTools.includes("delivery_progress_sync"), true);
+	assert.equal(controller.apply(
+		{ state: "BLOCKED", resumeState: "VALIDATING" },
+		{ ...PROGRESS_SYNC_CONTEXT, writerLeaseHeld: true, writerLeaseOwner: "parent" },
+	).ok, true);
+	assert.equal(host.activeTools.includes("delivery_progress_sync"), false);
+	controller.forceReadOnly();
+	assert.equal(host.activeTools.includes("delivery_progress_sync"), false);
 });
 
 test("applies writer tools only when policy preconditions are proven", () => {
@@ -113,6 +160,7 @@ test("applies writer tools only when policy preconditions are proven", () => {
 	assert.equal(result.ok, true);
 	assert.deepEqual(host.activeTools, WRITER_TOOLS);
 	assert.equal(host.access.at(-1), "controlled-writer");
+	assert.equal(controller.isToolAuthorized("edit"), true);
 });
 
 test("worker implementation route removes parent mutation tools", () => {

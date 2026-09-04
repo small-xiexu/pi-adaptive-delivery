@@ -72,6 +72,22 @@ test("rejects unknown fields, duplicate validation ids, and unsafe bounds", () =
 		undefined,
 	);
 	assert.equal(parsePlanContractValue({ ...valid, progressTargets: [] }), undefined);
+	for (const target of [
+		".git/config",
+		".pi/state.json",
+		"node_modules/package/index.js",
+		"docs/../tracked.txt",
+		"/tmp/progress.md",
+		"C:/temp/progress.md",
+		"docs\\progress.md",
+		" docs/progress.md ",
+	]) {
+		assert.equal(
+			parsePlanContractValue({ ...valid, progressTargets: [valid.documents.planPath, target] }),
+			undefined,
+			target,
+		);
+	}
 	assert.equal(
 		parsePlanContractValue({
 			...valid,

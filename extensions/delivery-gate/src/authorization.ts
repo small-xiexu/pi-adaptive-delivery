@@ -75,7 +75,7 @@ export function validateAuthorizationBundle(
 	const targetState = effectiveState(state);
 	const needsSolution = ["PLANNING", "PLAN_PENDING_APPROVAL"].includes(targetState);
 	const needsImplementationBundle =
-		requirement === "implementation" || ["IMPLEMENTING", "VALIDATING", "REWORKING"].includes(targetState);
+		requirement === "implementation" || ["IMPLEMENTING", "VALIDATING", "REWORKING", "DELIVERED"].includes(targetState);
 	if (needsSolution && !state.approvals?.solution) {
 		return { ok: false, reason: "A valid solution approval is required before planning" };
 	}

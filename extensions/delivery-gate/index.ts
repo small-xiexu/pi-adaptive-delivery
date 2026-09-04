@@ -30,7 +30,7 @@ import {
 	validateAuthorizationBundle,
 	type AuthorizationRequirement,
 } from "./src/authorization.ts";
-import { resolveProgressTarget, syncProjectProgress } from "./src/progress-sync.ts";
+import { ProgressSyncConflictError, resolveProgressTarget, syncProjectProgress } from "./src/progress-sync.ts";
 import {
 	formatDeliveryState,
 	resolveDeliveryPolicy,
@@ -104,6 +104,16 @@ import {
 } from "./src/validation.ts";
 
 const STATUS_KEY = "adaptive-delivery";
+const PLANNING_READ_MAX_LINES = 500;
+const PLANNING_READ_BUDGET_LINES = 5_000;
+const RAW_DELIVERY_TOOLS = new Set([
+	"bash",
+	"powershell",
+	"exec_command",
+	"write_stdin",
+	"apply_patch",
+	"subagent",
+]);
 const SERIALIZED_DELIVERY_TOOLS = new Set([
 	"delivery_begin",
 	"delivery_delegate_worker",
@@ -116,11 +126,87 @@ const SERIALIZED_DELIVERY_TOOLS = new Set([
 	"delivery_invalidate",
 ]);
 
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: undefined;
+}
+
+function providerToolName(value: unknown): string | undefined {
+	const tool = recordValue(value);
+	if (!tool) return undefined;
+	if (typeof tool.name === "string") return tool.name;
+	for (const key of ["function", "custom"] as const) {
+		const nested = recordValue(tool[key]);
+		if (typeof nested?.name === "string") return nested.name;
+	}
+	return undefined;
+}
+
+function filterProviderToolDefinitions(definitions: unknown[], allowedTools: ReadonlySet<string>): unknown[] {
+	return definitions.flatMap((definition) => {
+		const tool = recordValue(definition);
+		if (!tool) return [];
+		for (const key of ["functionDeclarations", "function_declarations"] as const) {
+			const declarations = tool[key];
+			if (!Array.isArray(declarations)) continue;
+			const filtered = declarations.filter((candidate) => {
+				const name = providerToolName(candidate);
+				return name !== undefined && allowedTools.has(name);
+			});
+			return filtered.length > 0 ? [{ ...tool, [key]: filtered }] : [];
+		}
+		const name = providerToolName(tool);
+		return name !== undefined && allowedTools.has(name) ? [definition] : [];
+	});
+}
+
+function filterProviderRequestTools(payload: unknown, allowedTools: ReadonlySet<string>): unknown {
+	const request = recordValue(payload);
+	if (!request) return payload;
+	let changed = false;
+	const next = { ...request };
+	if (Array.isArray(request.functions)) {
+		const functions = request.functions.filter((definition) => {
+			const name = providerToolName(definition);
+			return name !== undefined && allowedTools.has(name);
+		});
+		changed ||= functions.length !== request.functions.length;
+		next.functions = functions;
+	}
+	if (Array.isArray(request.tools)) {
+		const tools = filterProviderToolDefinitions(request.tools, allowedTools);
+		changed ||= tools.length !== request.tools.length;
+		changed ||= JSON.stringify(tools) !== JSON.stringify(request.tools);
+		next.tools = tools;
+	}
+	const context = recordValue(request.context);
+	if (context && Array.isArray(context.tools)) {
+		const tools = filterProviderToolDefinitions(context.tools, allowedTools);
+		changed ||= tools.length !== context.tools.length;
+		changed ||= JSON.stringify(tools) !== JSON.stringify(context.tools);
+		next.context = { ...context, tools };
+	}
+	if (Array.isArray(request.messages)) {
+		const messages = request.messages.map((message) => {
+			const record = recordValue(message);
+			if (!record || !Array.isArray(record.tools)) return message;
+			const tools = filterProviderToolDefinitions(record.tools, allowedTools);
+			if (tools.length !== record.tools.length) changed = true;
+			if (JSON.stringify(tools) !== JSON.stringify(record.tools)) changed = true;
+			return { ...record, tools };
+		});
+		next.messages = messages;
+	}
+	return changed ? next : payload;
+}
+
 export default function deliveryGate(pi: ExtensionAPI): void {
 	let state = createInitialRuntimeState();
 	let currentContext: ExtensionContext | undefined;
 	let leaseValid = false;
 	let deliveryBeginArmed = false;
+	let planningReadLines = 0;
 	const activeMutationTools = new Map<string, string>();
 	const pendingDiagramEntries: DiagramEntryData[] = [];
 	let activeDeliveryBarrier: { toolCallId: string; toolName: string } | undefined;
@@ -220,7 +306,18 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			writerLeaseHeld: false,
 			writerLeaseOwner: null,
 			reworkApproved: false,
+			progressSyncAvailable: progressSyncToolAvailable(),
 		} as const;
+	}
+
+	function progressSyncToolAvailable(): boolean {
+		return Boolean(
+			!state.tinyContract &&
+				state.planContract?.progressTargets.length &&
+				(state.approvals?.plan || state.approvals?.combined) &&
+				!state.writerLease &&
+				!leaseValid,
+		);
 	}
 
 	function setBlocked(reason: string, resumeState?: DeliverySnapshot["resumeState"]): void {
@@ -521,13 +618,21 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			leaseValid = await writerLeases.isCurrentOwner(state.writerLease);
 			if (!leaseValid) approvalError = approvalError ?? "Writer lease cannot be proven for the current process";
 		}
-		const applied = policy.apply(state.snapshot, state.writerLease ? approvalPolicyContext() : readOnlyContext());
-		const restorationValid = restored.ok && !approvalError && applied.ok && !applied.policy.reason;
+		const workerTerminalUnknown = state.workerStatus === "starting" || state.workerStatus === "running";
+		const applied = workerTerminalUnknown
+			? policy.forceReadOnly()
+			: policy.apply(state.snapshot, state.writerLease ? approvalPolicyContext() : readOnlyContext());
+		const restorationValid = restored.ok && !approvalError && !workerTerminalUnknown && applied.ok && !applied.policy.reason;
 		if (!restorationValid) {
 			const reason = !restored.ok
 				? restored.reason
-				: approvalError ?? applied.reason ?? applied.policy.reason ?? "Failed to apply delivery policy";
-			setBlocked(reason, resumableState(state.snapshot.state));
+				: approvalError ?? (workerTerminalUnknown
+					? "Worker terminal status is unknown after session restore"
+					: applied.reason ?? applied.policy.reason ?? "Failed to apply delivery policy");
+			const resumeState = state.snapshot.state === "BLOCKED"
+				? state.snapshot.resumeState
+				: resumableState(state.snapshot.state);
+			setBlocked(reason, resumeState);
 			persistCurrentState();
 		} else if (!restored.found) {
 			persistCurrentState();
@@ -569,6 +674,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			reworkApproved: state.reworkApproved === true,
 			implementationWriter: implementationWriter(),
 			tinyWritablePaths: state.tinyContract?.changeScope,
+			progressSyncAvailable: progressSyncToolAvailable(),
 		};
 	}
 
@@ -692,6 +798,31 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		return current.digest;
 	}
 
+	async function validateResumeCandidateEvidence(
+		ctx: ExtensionContext,
+		resumeState: ResumeState,
+	): Promise<string | undefined> {
+		if (state.workerStatus === "starting" || state.workerStatus === "running") {
+			return "Worker terminal status is still unknown; prove termination or force-release the lease before resuming";
+		}
+		if (resumeState !== "VALIDATING" && resumeState !== "REWORKING") return undefined;
+		if (!state.candidateDigest) return "A frozen candidate is required before validation or rework can resume";
+		if (resumeState === "VALIDATING") {
+			const current = await recomputeCandidate(ctx);
+			if (current.digest !== state.candidateDigest) return "Candidate changed while delivery was blocked";
+		}
+		if (state.validationEvidence && state.validationEvidence.candidateDigest !== state.candidateDigest) {
+			return "Validation evidence is not bound to the current candidate";
+		}
+		if (state.reviewEvidence && state.reviewEvidence.candidateDigest !== state.candidateDigest) {
+			return "Review evidence is not bound to the current candidate";
+		}
+		if (state.tinyScopeEvidence && state.tinyScopeEvidence.candidateDigest !== state.candidateDigest) {
+			return "Tiny scope evidence is not bound to the current candidate";
+		}
+		return undefined;
+	}
+
 	async function requireAuthorization(
 		ctx: ExtensionContext,
 		requirement: AuthorizationRequirement = "state",
@@ -703,6 +834,31 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			updateStatus(ctx);
 			throw new Error(reason);
 		}
+	}
+
+	async function revalidateRuntimeFacts(
+		ctx: ExtensionContext,
+		requirement: AuthorizationRequirement = "state",
+	): Promise<string | undefined> {
+		const approvalError = await validateStoredApprovals(ctx, requirement);
+		if (approvalError) {
+			leaseValid = false;
+			return approvalError;
+		}
+		if (!state.writerLease) {
+			leaseValid = false;
+			return undefined;
+		}
+		const ownsLease = await writerLeases.isCurrentOwner(state.writerLease);
+		leaseValid = ownsLease;
+		return ownsLease ? undefined : "当前 Session 已无法证明 writer lease 仍归自己所有";
+	}
+
+	function blockForRuntimeProofFailure(ctx: ExtensionContext, reason: string): void {
+		leaseValid = false;
+		setBlocked(reason, resumableState(state.snapshot.state));
+		persistCurrentState();
+		updateStatus(ctx);
 	}
 
 	async function approveTiny(
@@ -1281,6 +1437,21 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				message: `恢复到 ${formatDeliveryState(state.snapshot.resumeState)}？`,
 			});
 			if (!confirmed) return;
+			const resumeState = state.snapshot.resumeState;
+			let resumeError: string | undefined;
+			try {
+				resumeError = await validateStoredApprovals(ctx);
+				resumeError ??= await validateResumeCandidateEvidence(ctx, resumeState);
+			} catch (error) {
+				resumeError = error instanceof Error ? error.message : String(error);
+			}
+			if (resumeError) {
+				setBlocked(`Resume proof failed: ${resumeError}`, resumeState);
+				persistCurrentState();
+				updateStatus(ctx);
+				ctx.ui.notify(`无法恢复：${formatRuntimeText(resumeError)}`, "error");
+				return;
+			}
 			const transition = transitionDelivery(state.snapshot, { type: "RESUME" });
 			if (!transition.ok) {
 				ctx.ui.notify(formatRuntimeText(transition.reason) ?? "交付状态恢复失败", "error");
@@ -1482,8 +1653,17 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (state.workerStatus === "starting" || state.workerStatus === "running") {
 				throw new Error("A controlled worker is already active or lacks terminal proof");
 			}
-			await requireAuthorization(ctx, "implementation");
-			if (!state.writerLease || !leaseValid) throw new Error("Worker delegation requires a proven parent-custodied writer lease");
+			let proofError: string | undefined;
+			try {
+				proofError = await revalidateRuntimeFacts(ctx, "implementation");
+			} catch (error) {
+				proofError = error instanceof Error ? error.message : String(error);
+			}
+			if (proofError || !state.writerLease || !leaseValid) {
+				const reason = proofError ?? "Worker delegation has no current parent-custodied writer lease";
+				blockForRuntimeProofFailure(ctx, `Worker delegation stopped because runtime authorization could not be reproved: ${reason}`);
+				throw new Error(`Worker delegation requires current authorization and writer lease: ${reason}`);
+			}
 			if (activeMutationTools.size > 0) throw new Error("Worker delegation cannot start beside an active parent mutation tool");
 
 			const sourceState = state.snapshot.state;
@@ -2180,9 +2360,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			target: Type.String({ minLength: 1, maxLength: 512 }),
 			oldText: Type.String({ minLength: 1, maxLength: 20000 }),
-			newText: Type.String({ maxLength: 20000 }),
+			newText: Type.String({ minLength: 1, maxLength: 20000 }),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (state.snapshot.state !== "VALIDATING" && state.snapshot.state !== "BLOCKED") {
 				throw new Error("Progress sync is allowed only at VALIDATING or BLOCKED writer-free boundaries");
 			}
@@ -2201,6 +2381,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				pid: process.pid,
 			});
 			if (!acquired.ok) throw new Error(acquired.reason);
+			const stateBeforeProgressSync = state;
 			leaseValid = true;
 			state = checkpointRuntimeState(state, {
 				writerLease: acquired.reference,
@@ -2210,11 +2391,36 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				},
 			});
 			if (!persistCurrentState()) {
-				await writerLeases.release(acquired.reference, {
-					kind: "parent-owner",
-					processToken: writerLeases.processToken,
-				});
-				leaseValid = false;
+				let released = false;
+				try {
+					await writerLeases.release(acquired.reference, {
+						kind: "parent-owner",
+						processToken: writerLeases.processToken,
+					});
+					leaseValid = false;
+					released = true;
+				} catch {
+					// Keep the reference in the blocked state when release cannot be proven.
+				}
+				if (released) {
+					state = checkpointRuntimeState(stateBeforeProgressSync, {
+						writerLease: undefined,
+						checkpoint: {
+							summary: `Progress sync checkpoint failed before write: ${target.relative}`,
+							nextReadyAction: "Retry delivery_progress_sync with the same exact replacement",
+						},
+					});
+					const restored = policy.apply(state.snapshot, readOnlyContext());
+					if (!restored.ok || restored.policy.reason) {
+						setBlocked(
+							`Progress sync checkpoint failed and base policy could not be restored: ${restored.reason ?? restored.policy.reason ?? "unknown error"}`,
+							stateBeforeProgressSync.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined,
+						);
+						state = checkpointRuntimeState(state, { writerLease: undefined });
+					}
+					persistCurrentState();
+				}
+				updateStatus(ctx);
 				throw new Error("Failed to persist progress-sync operation checkpoint");
 			}
 			const progressPolicy = policy.apply(state.snapshot, {
@@ -2254,8 +2460,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					target: params.target,
 					oldText: params.oldText,
 					newText: params.newText,
-						checks: planContract.progressChecks,
-						onWrite: async (evidence) => {
+					checks: planContract.progressChecks,
+					signal,
+					onWrite: async (evidence) => {
 							if (!state.planningDocuments || state.planningDocuments.planPath !== evidence.target) return;
 							const planningDocuments = await refreshPlanDocumentEvidence(
 								identity.gitRoot,
@@ -2266,13 +2473,19 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 							if (!persistCurrentState()) {
 								throw new Error("Progress target changed but its planning document evidence checkpoint failed");
 							}
-						},
-						runCheck: async (check) => {
+					},
+					runCheck: async (check, checkSignal) => {
 						const checkResult = await pi.exec(check.command, [...check.args], {
 							cwd: identity.workspacePath,
 							timeout: check.timeoutMs,
+							signal: checkSignal,
 						});
-						return { code: checkResult.code, stdout: checkResult.stdout, stderr: checkResult.stderr };
+						return {
+							code: checkResult.code,
+							stdout: checkResult.stdout,
+							stderr: checkResult.stderr,
+							killed: checkResult.killed,
+						};
 					},
 				});
 				const restored = policy.apply(state.snapshot, readOnlyContext());
@@ -2291,6 +2504,10 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 						nextReadyAction: state.snapshot.state === "VALIDATING" ? "Continue candidate validation" : "Resolve the blocking condition",
 					},
 				});
+				const availablePolicy = policy.apply(state.snapshot, readOnlyContext());
+				if (!availablePolicy.ok || availablePolicy.policy.reason) {
+					throw new Error(availablePolicy.reason ?? availablePolicy.policy.reason ?? "Failed to expose writer-free validation tools");
+				}
 				if (!persistCurrentState()) throw new Error("Project progress changed but final checkpoint failed");
 				updateStatus(ctx);
 				return {
@@ -2299,16 +2516,45 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				};
 			} catch (error) {
 				const restored = policy.apply(state.snapshot, readOnlyContext());
-				if (restored.ok && !restored.policy.reason) {
+				let releaseProven = !state.writerLease && !leaseValid;
+				if (!releaseProven && restored.ok && !restored.policy.reason) {
 					try {
 						await writerLeases.release(acquired.reference, {
 							kind: "parent-owner",
 							processToken: writerLeases.processToken,
 						});
 						leaseValid = false;
+						releaseProven = true;
 					} catch {
 						// Keep the reference and block below when release cannot be proven.
 					}
+				}
+				if (error instanceof ProgressSyncConflictError && releaseProven) {
+					state = checkpointRuntimeState(state, {
+						writerLease: undefined,
+						checkpoint: {
+							summary: `Progress sync input conflicted before write: ${target.relative}`,
+							nextReadyAction: "Re-read the current exact progress block and retry delivery_progress_sync",
+						},
+					});
+					const retryPolicy = policy.apply(state.snapshot, readOnlyContext());
+					if (!retryPolicy.ok || retryPolicy.policy.reason) {
+						setBlocked(
+							`Progress sync input conflicted but retry tools could not be restored: ${retryPolicy.reason ?? retryPolicy.policy.reason ?? "unknown error"}`,
+							state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined,
+						);
+						persistCurrentState();
+						updateStatus(ctx);
+						throw new Error("Progress sync input conflicted but retry tools could not be restored");
+					}
+					if (persistCurrentState()) {
+						updateStatus(ctx);
+						throw error;
+					}
+					setBlocked("Progress sync input conflicted and its released-lease checkpoint failed", state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined);
+					persistCurrentState();
+					updateStatus(ctx);
+					throw new Error("Progress sync input conflicted and its released-lease checkpoint failed");
 				}
 				setBlocked(`Progress sync failed: ${error instanceof Error ? error.message : String(error)}`, state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined);
 				state = checkpointRuntimeState(state, {
@@ -2402,6 +2648,38 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		if (activeDeliveryBarrier?.toolCallId === event.toolCallId) activeDeliveryBarrier = undefined;
 	});
 	pi.on("tool_call", async (event, ctx) => {
+		if (RAW_DELIVERY_TOOLS.has(event.toolName)) {
+			return { block: true, reason: `Raw ${event.toolName} is not allowed by Adaptive Delivery` };
+		}
+		if (event.toolName === "delivery_begin" && state.snapshot.state !== "IDLE") {
+			return { block: true, reason: "delivery_begin is only allowed while Adaptive Delivery is IDLE" };
+		}
+		if (
+			event.toolName === "delivery_progress_sync" &&
+			state.snapshot.state !== "VALIDATING" &&
+			state.snapshot.state !== "BLOCKED"
+		) {
+			return { block: true, reason: "delivery_progress_sync is only allowed in writer-free VALIDATING or BLOCKED states" };
+		}
+		if (event.toolName !== "edit" && event.toolName !== "write" && !policy.isToolAuthorized(event.toolName)) {
+			return { block: true, reason: `${event.toolName} is not authorized by the current Adaptive Delivery policy` };
+		}
+		if (event.toolName === "read" && (state.snapshot.state === "SHAPING" || state.snapshot.state === "PLANNING")) {
+			const input = event.input as Record<string, unknown>;
+			const remaining = PLANNING_READ_BUDGET_LINES - planningReadLines;
+			if (remaining <= 0) {
+				return {
+					block: true,
+					reason: "SHAPING/PLANNING read budget is exhausted; use grep/find/ls and form the current solution or plan",
+				};
+			}
+			const requested = typeof input.limit === "number" && Number.isInteger(input.limit) && input.limit > 0
+				? input.limit
+				: PLANNING_READ_MAX_LINES;
+			const allowed = Math.min(requested, PLANNING_READ_MAX_LINES, remaining);
+			input.limit = allowed;
+			planningReadLines += allowed;
+		}
 		if (SERIALIZED_DELIVERY_TOOLS.has(event.toolName)) {
 			if (activeMutationTools.size > 0) {
 				return { block: true, reason: `${event.toolName} cannot run in a tool batch that already contains a writer` };
@@ -2422,6 +2700,17 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					reason: `${activeDeliveryBarrier.toolName} is a serialization barrier; sibling writes are blocked`,
 				};
 			}
+			let proofError: string | undefined;
+			try {
+				proofError = await revalidateRuntimeFacts(ctx, "implementation");
+			} catch (error) {
+				proofError = error instanceof Error ? error.message : String(error);
+			}
+			if (proofError || !state.writerLease || !leaseValid) {
+				const reason = proofError ?? "Current delivery state has no proven writer lease";
+				blockForRuntimeProofFailure(ctx, `Source write stopped because runtime authorization could not be reproved: ${reason}`);
+				return { block: true, reason };
+			}
 			const runtimePolicy = resolveDeliveryPolicy(state.snapshot, approvalPolicyContext());
 			if (!runtimePolicy.sourceWrite || !leaseValid) {
 				return { block: true, reason: "Current delivery state or writer lease does not allow source writes" };
@@ -2440,9 +2729,6 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				}
 			}
 		}
-		if (event.toolName === "bash" || event.toolName === "subagent") {
-			return { block: true, reason: `Raw ${event.toolName} is not allowed by Adaptive Delivery` };
-		}
 	});
 	pi.on("input", async (event) => {
 		deliveryBeginArmed =
@@ -2451,7 +2737,50 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
+	pi.on("before_agent_start", async (_event, ctx) => {
+		let proofError: string | undefined;
+		try {
+			proofError = await revalidateRuntimeFacts(ctx);
+		} catch (error) {
+			proofError = error instanceof Error ? error.message : String(error);
+		}
+		if (proofError) {
+			blockForRuntimeProofFailure(ctx, `Runtime authorization changed before the agent run: ${proofError}`);
+			return;
+		}
+		const applied = policy.apply(state.snapshot, state.writerLease ? approvalPolicyContext() : readOnlyContext());
+		if (applied.ok && !applied.policy.reason) return;
+		setBlocked(
+			`Failed to reapply delivery policy before the agent run: ${applied.reason ?? applied.policy.reason ?? "unknown error"}`,
+			resumableState(state.snapshot.state),
+		);
+		persistCurrentState();
+		updateStatus(ctx);
+	});
+	pi.on("before_provider_request", async (event, ctx) => {
+		let proofError: string | undefined;
+		try {
+			proofError = await revalidateRuntimeFacts(ctx);
+		} catch (error) {
+			proofError = error instanceof Error ? error.message : String(error);
+		}
+		if (proofError) {
+			blockForRuntimeProofFailure(ctx, `Runtime authorization changed before the provider request: ${proofError}`);
+		}
+		let applied = proofError
+			? policy.forceReadOnly()
+			: policy.apply(state.snapshot, state.writerLease ? approvalPolicyContext() : readOnlyContext());
+		if (!applied.ok || applied.policy.reason) {
+			blockForRuntimeProofFailure(
+				ctx,
+				`Failed to prove delivery policy for the provider request: ${applied.reason ?? applied.policy.reason ?? "unknown error"}`,
+			);
+			applied = policy.forceReadOnly();
+		}
+		return filterProviderRequestTools(event.payload, new Set(applied.activeTools));
+	});
 	pi.on("agent_start", async () => {
+		planningReadLines = 0;
 		pendingDiagramEntries.length = 0;
 	});
 	pi.on("message_end", async (event) => {
@@ -2488,6 +2817,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		currentContext = undefined;
 		deliveryBeginArmed = false;
+		planningReadLines = 0;
 		pendingDiagramEntries.length = 0;
 		policy.forceReadOnly();
 		subagents.dispose();

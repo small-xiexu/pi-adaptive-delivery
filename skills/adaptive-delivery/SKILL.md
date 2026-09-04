@@ -63,6 +63,8 @@ Tiny 回复只需用大白话说明“将修改什么、明确不修改什么、
 
 普通 SHAPING/PLANNING 取证由父 Pi 直接使用 `read`、`grep`、`find`、`ls`。公开只读委派只提供高风险 `oracle`，不向模型暴露 scout 或 reviewer；reviewer 仅由 plan 预检和 validation 后的固定审查入口使用。runtime owner、preflight 或终态证明失败后不得重试同一委派，父 Pi 应继续只读取证或明确报告阻塞，避免重复费用。
 
+取证先搜索定位，再读取必要切片；不默认整篇读取大型文件，也不在项目目录猜测或重读当前已加载的 Skill。SHAPING/PLANNING 的父 Pi `read` 每次最多 500 行、同一次 agent run 累计最多 5000 行，runtime 会缩减或拒绝超额调用。SHAPING 在用户效果、边界、风险、验收和高影响歧义均有事实支撑后立即成案。PLANNING 沿用批准方案，不重新穷举源码和测试，只补齐项目计划规则、里程碑、固定验证命令和停止条件所需证据。
+
 ## 技术方案图表
 
 图表用于减少理解成本，不作为装饰，也不能替代文字规则、失败表现和验收标准：
@@ -91,6 +93,8 @@ docs/<需求短名称>-实施计划.md
 
 solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标记内，并包含唯一 `adaptive-delivery-documents` v1 fence；`/delivery-approve-solution` 在 TUI 中显示并冻结需求名、路径和来源，首次确认后立即 create-only 写入技术方案，但仍保持只读。plan 正文和唯一 `adaptive-delivery-plan` v2 fence 放在唯一 `<!-- adaptive-delivery:plan:start|end -->` 标记内，plan 的 `documents` 必须与已批准 solution 契约逐字段一致，`documents.planPath` 必须同时进入 `progressTargets`。用户批准 plan 后，Extension 复验技术方案摘要并在首次批准时只 create-only 写入实施计划；两份文档成功并记录摘要后才进入 `IMPLEMENTING`。已同步两份文档后执行 `/delivery-revise` 时保留原 evidence，重新批准只允许更新路径、文件身份和现场摘要仍匹配的同一份 Package 文档；人工改动或 symlink 漂移必须拒绝覆盖。Session entry 仍是批准主体，文件不能反向授予权限。
 
+两份可见正文都要显式写出契约中的需求短名称；标题可以为可读性加入空白。Extension 对正文身份只把 Unicode NFC 后的空白视为等价，任何非空白字符或字序不同仍拒绝写入；结构化契约、批准摘要、路径和文件 identity 不做宽松匹配。
+
 显示 Standard/High-Risk plan 批准对话前，Extension 必须用 pi-subagents 公开 preflight 证明 builtin reviewer 至少有一个可用 model candidate，且只读工具、`denyExtensions`、output 和 cwd 边界成立。preflight 不启动 child 或调用 Provider。无可用 reviewer/fallback 时保持待批准和只读，先让用户修复模型配置；不得先实现再等验证资源。Tiny 不 preflight reviewer。
 
 这些 marker 和 JSON fence 只属于内部协议；Extension 在 TUI 显示和规划文档落盘时隐藏它们。父会话仍需输出完整协议供原始 Session 解析，但面向用户的正文不能要求用户阅读或解释内部 JSON。
@@ -110,6 +114,8 @@ solution 正文放在唯一 `<!-- adaptive-delivery:solution:start|end -->` 标�
 技术方案回答“为什么改、改成什么”，必须基于当前项目事实，并包含目标、非目标、验收、设计、取舍和风险。
 
 实施计划回答“如何落地和证明完成”，必须包含有序里程碑、边界、测试、停止条件，并给出唯一 `adaptive-delivery-plan` v2 JSON fence。该 fence 只承载批准的风险分类、需求级文档路径、验证命令和 progress target/check，不定义项目进度格式。
+
+计划修订不会保留 runtime candidate、validation 或 review evidence。磁盘 diff 可以作为现场继续存在，但 worker 路由必须重新取得唯一 worker terminal proof、执行批准 repair、冻结 candidate 并完整验证；plan-v2 `single` 与 Tiny 路由必须由父 Pi 重新走各自完整的候选提交和验证流程。所有路由都不能把旧 evidence 写成可沿用事实。验证命令必须按项目真实根目录和工作目录暴露测试依赖的 docs、fixtures、schema、template 等仓库资源；只挂载源码子目录不能证明仓库级测试有效。
 
 ## 子 Agent 契约
 
@@ -131,8 +137,8 @@ Delivery 工具按状态动态开放。任何时候不确定当前阶段时，�
 - 后续阶段工具提前不可见不是运行时故障，不得以此为由撤销批准或删除规划文档。
 - 当前阶段必需工具确实缺失时可以 `delivery_invalidate(target=BLOCKED)` 暂停；该动作只释放 writer 并保留批准链、规划文档、candidate 和 evidence。恢复权限仍必须由 TUI 用户执行 `/delivery-resume`。
 - 只有需求、范围、架构或计划真的失效时，才使用 `SHAPING` 或 `PLANNING` 目标撤销相应批准。
-- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 Delivery Contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；TUI validation 窗口隐藏默认高频 spinner并使用低频进度更新。父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。
-- validation terminal checkpoint 保存绑定 candidate 的批次 ID 和逐命令摘要。命令无法启动、工具中断或 terminal checkpoint 缺失按 infrastructure failure；真实非零退出或超时只证明批准命令未通过。父会话必须再区分候选代码、验证环境和已批准计划，只有代码问题调用 `delivery_begin_rework`，计划错误使用 `/delivery-revise`。
+- `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 Delivery Contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；TUI validation 窗口隐藏默认高频 spinner并使用低频进度更新。父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。计划中的 timeout 优先使用同环境、同范围最近耗时并留足余量；缺少证据的长全量或容器命令使用保守值。宿主 timeout 不能保证终止外部后代进程时，批准命令自身必须提供可终止边界，不能假设 `pi.exec` 会清理全部外部进程。
+- validation terminal checkpoint 保存绑定 candidate 的批次 ID 和逐命令摘要。命令无法启动、工具中断或 terminal checkpoint 缺失按 infrastructure failure；真实非零退出或超时只证明批准命令未通过。父会话必须再区分候选代码、验证环境和已批准计划。只有代码问题才调用 `delivery_begin_rework({ reason: "包含全部已接受问题、证据、修复断言和边界的单个字符串" })`；不要传入 `acceptedFindings` 或其他未定义字段。计划错误使用 `/delivery-revise`。
 
 ```text
 tiny: 父 Pi exact-scope 实现 -> delivery_submit_candidate -> delivery_validate -> delivery_finalize
@@ -157,9 +163,9 @@ standard/high-risk: 唯一 worker 实现 -> terminal proof -> 自动冻结 candi
 
 ## 进度与恢复
 
-Extension checkpoint 是运行时恢复事实；项目自己的计划、Issue 或 TODO 是项目进度事实。二者冲突时进入 BLOCKED，不自动覆盖。
+Extension checkpoint 是运行时恢复事实；项目自己的计划、Issue 或 TODO 是项目进度事实。身份、路径、写后现场或检查冲突时进入 BLOCKED，不自动覆盖。仅当 exact 文本前置条件在写前冲突且策略恢复与 lease 释放均可证明时，保持原状态并允许重读后重试；这不表示项目进度已经一致。
 
-只在无活跃 writer 且 lease 状态可证明时同步项目进度。断线恢复先只读校验批准、lease、candidate 和 evidence，再从 `nextReadyAction` 继续；不得重放结果未知的写入或命令。
+只在无活跃 writer 且 lease 状态可证明时同步项目进度。target 必须是批准的 canonical project-relative 非保留路径；每次同步前读取目标的当前 exact 区块，不复用较早调用前的 `oldText`，`oldText/newText` 均须非空且当前入口不支持删除；exact `newText` 已唯一存在时可作为幂等成功。断线恢复先只读校验批准、未知 worker、lease、candidate 和 evidence，再从 `nextReadyAction` 继续；不得重放结果未知的写入或命令。
 
 ## 停止条件
 
