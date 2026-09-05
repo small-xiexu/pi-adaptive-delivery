@@ -20,6 +20,7 @@ import {
 	createInitialRuntimeState,
 	parseRuntimeState,
 } from "../../extensions/delivery-gate/src/runtime-state.ts";
+import { WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 
 const ORIGINAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
 const TEST_AGENT_DIR = mkdtempSync(path.join(os.tmpdir(), "adaptive-extension-agent-"));
@@ -122,6 +123,7 @@ function createHarness(
 	let workerResponseStatus = "completed";
 	let workerIncludeTerminalDigest = true;
 	let workerIncludeTerminalRunId = true;
+	let workerOmitToolEndUpdate = false;
 	let workerExecution: (() => void) | undefined;
 	let failSendUserMessage = false;
 	let failNextWorkingVisibilityAfterEffect = false;
@@ -331,17 +333,20 @@ function createHarness(
 			status?: string;
 			includeDigest?: boolean;
 			includeRunId?: boolean;
+			omitToolEndUpdate?: boolean;
 			execute?: () => void;
 		}) => {
 			workerResponseStatus = options.status ?? "completed";
 			workerIncludeTerminalDigest = options.includeDigest ?? true;
 			workerIncludeTerminalRunId = options.includeRunId ?? true;
+			workerOmitToolEndUpdate = options.omitToolEndUpdate ?? false;
 			workerExecution = options.execute;
 		},
 		getWorkerResponse: () => ({
 			status: workerResponseStatus,
 			includeDigest: workerIncludeTerminalDigest,
 			includeRunId: workerIncludeTerminalRunId,
+			omitToolEndUpdate: workerOmitToolEndUpdate,
 			execute: workerExecution,
 		}),
 		failAutomaticContinuation: () => {
@@ -390,9 +395,23 @@ function installSubagentRpcResponder(harness: ReturnType<typeof createHarness>):
 					ownerRunId: payload.ownerRunId,
 					nodeId: payload.nodeId,
 					runId: "worker-run",
-					currentTool: "edit",
+					currentTool: "\u202eedit\n",
 					toolCount: 1,
+					durationMs: 12_000,
+					recentOutput: "updated worker-change.txt",
+					recentOutputLines: ["updated worker-change.txt"],
 				});
+				if (!workerResponse.omitToolEndUpdate) {
+					handler({
+						requestId: payload.requestId,
+						ownerRunId: payload.ownerRunId,
+						nodeId: payload.nodeId,
+						runId: "worker-run",
+						toolCount: 1,
+						durationMs: 13_000,
+						recentOutput: "updated worker-change.txt",
+					});
+				}
 			}
 			workerResponse.execute?.();
 			for (const handler of harness.eventListeners.get("prompt-template:subagent:response") ?? []) {
@@ -886,6 +905,28 @@ test("blocks before a new agent run when an approved planning document changed",
 	assert.equal(blocked.snapshot.state, "BLOCKED");
 	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
 	assert.match(blocked.blockingReason, /plan document/i);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
+test("preserves the original resume state across repeated runtime proof failures", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	writeFileSync(path.join(repo, TEST_PLAN_PATH), "manually changed between provider requests\n");
+
+	await emitWithResults(harness, "before_provider_request", { payload: { tools: [] } });
+	let blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+
+	await emitWithResults(harness, "before_provider_request", { payload: { tools: [] } });
+	blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.match(blocked.blockingReason, /provider request/);
 	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
@@ -1530,6 +1571,7 @@ test("standard route delegates one worker and freezes its terminal candidate", a
 	harness.setConfirmResult(true);
 	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
 	harness.configureWorkerResponse({
+		omitToolEndUpdate: true,
 		execute: () => writeFileSync(path.join(repo, "worker-change.txt"), "implemented by worker\n"),
 	});
 	installSubagentRpcResponder(harness);
@@ -1560,11 +1602,12 @@ test("standard route delegates one worker and freezes its terminal candidate", a
 		/requires the controlled worker/,
 	);
 
+	const workerUpdates: any[] = [];
 	const result = await harness.tools.get("delivery_delegate_worker").execute(
 		"worker-tool",
 		{},
 		undefined,
-		undefined,
+		(update: any) => workerUpdates.push(update),
 		harness.ctx,
 	);
 
@@ -1583,8 +1626,169 @@ test("standard route delegates one worker and freezes its terminal candidate", a
 	const statusText = harness.ui.notifications.at(-1)?.[0] ?? "";
 	assert.match(statusText, /开发方式：唯一 worker/);
 	assert.match(statusText, /开发执行者：已完成（运行 ID：worker-run）/);
+	assert.match(statusText, /Worker 最近动作：edit/);
+	assert.match(statusText, /Worker 进度：12 秒，1 次工具调用/);
+	assert.match(statusText, /Worker 最近输出：updated worker-change\.txt/);
+	assert.equal(
+		harness.ui.statuses.some(([, value]) => /worker edit · 12 秒 · 1 次工具/.test(value ?? "")),
+		true,
+	);
+	assert.match(workerUpdates[0]?.content[0]?.text ?? "", /唯一 worker 正在执行：edit/);
+	assert.equal(workerUpdates[0]?.content[0]?.text.includes("\u202e"), false);
+	assert.equal(workerUpdates[0]?.details.currentTool, "edit");
+	const runtimeAfterWorker = await harness.tools.get("delivery_runtime_status").execute(
+		"worker-progress-status",
+		{},
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	assert.match(runtimeAfterWorker.content[0].text, /Worker 最近输出：updated worker-change\.txt/);
+	assert.equal(runtimeAfterWorker.details.workerProgress.currentTool, undefined);
+	assert.equal(runtimeAfterWorker.details.workerProgress.recentTool, "edit");
 	await harness.commands.get("delivery-force-release-lease")?.handler("", harness.ctx);
 	assert.match(harness.ui.notifications.at(-1)?.[0] ?? "", /没有写入租约/);
+});
+
+test("blocks before repair and candidate freeze when a worker changes a protected progress artifact", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard");
+	addApprovedRepairCommand(branch);
+	harness.setBranch(branch);
+	harness.configureWorkerResponse({
+		execute: () => writeFileSync(path.join(repo, TEST_PLAN_PATH), "worker changed parent-owned progress\n"),
+	});
+	harness.setExecExecution(() => writeFileSync(path.join(repo, "repair-ran.txt"), "unexpected\n"));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute(
+			"worker-protected-progress",
+			{},
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/Controlled worker modified protected path/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.workerStatus, "completed");
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.equal(blocked.writerLease, undefined);
+	assert.equal(harness.execCalls.length, 0);
+	assert.equal(existsSync(path.join(repo, "repair-ran.txt")), false);
+	assert.match(blocked.blockingReason, /protected planning or progress artifact/i);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+	const workerRequest = harness.emittedEvents.find((entry) => entry.event === "prompt-template:subagent:request");
+	assert.match(workerRequest?.payload.task ?? "", new RegExp(`Protected paths: .*${TEST_PLAN_PATH.replaceAll(".", "\\.")}`));
+});
+
+test("blocks before candidate freeze when an approved repair changes a protected progress artifact", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard");
+	addApprovedRepairCommand(branch);
+	harness.setBranch(branch);
+	harness.setExecExecution(() => writeFileSync(path.join(repo, TEST_PLAN_PATH), "repair changed parent-owned progress\n"));
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute(
+			"repair-protected-progress",
+			{},
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/Approved deterministic repair changed a protected planning or progress artifact/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.workerStatus, "completed");
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.equal(blocked.writerLease, undefined);
+	assert.equal(harness.execCalls.length, 1);
+	assert.match(blocked.blockingReason, /Approved deterministic repair changed a protected planning or progress artifact/);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
+test("rejects a same-content inode replacement of a worker-protected artifact", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	harness.configureWorkerResponse({
+		execute: () => {
+			const planPath = path.join(repo, TEST_PLAN_PATH);
+			const replacement = path.join(repo, "docs", "replacement-plan.md");
+			writeFileSync(replacement, readFileSync(planPath));
+			renameSync(replacement, planPath);
+		},
+	});
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute(
+			"worker-protected-identity",
+			{},
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/Controlled worker modified protected path/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.equal(blocked.writerLease, undefined);
+});
+
+test("reports no held lease when protected drift occurs after canonical ownership is lost", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	harness.configureWorkerResponse({
+		execute: () => {
+			writeFileSync(path.join(repo, TEST_PLAN_PATH), "worker changed protected plan\n");
+			harness.invalidateWriterLease();
+		},
+	});
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute("protected-drift-lost-lease", {}, undefined, undefined, harness.ctx),
+		/Controlled worker changed a protected planning or progress artifact/,
+	);
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.ok(blocked.writerLease?.leaseId);
+	const runtimeStatus = await harness.tools.get("delivery_runtime_status").execute(
+		"protected-drift-lost-lease-status",
+		{},
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	assert.equal(runtimeStatus.details.writerLeaseHeld, false);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("reproves the writer lease before launching the controlled worker", async () => {
@@ -1738,6 +1942,62 @@ test("does not run an approved repair when lease ownership changed after worker 
 	assert.equal(blocked.candidateDigest, undefined);
 	assert.equal(harness.execCalls.length, 0);
 	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+	const runtimeStatus = await harness.tools.get("delivery_runtime_status").execute(
+		"lost-lease-runtime-status",
+		{},
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	assert.equal(runtimeStatus.details.writerLeaseHeld, false);
+});
+
+test("fails closed when repair lease ownership verification throws after worker terminal", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	const branch = approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard");
+	addApprovedRepairCommand(branch);
+	harness.setBranch(branch);
+	harness.configureWorkerResponse({
+		execute: () => writeFileSync(path.join(repo, "worker-change.txt"), "needs formatting\n"),
+	});
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+
+	const originalIsCurrentOwner = WriterLeaseManager.prototype.isCurrentOwner;
+	let ownershipChecks = 0;
+	WriterLeaseManager.prototype.isCurrentOwner = async function (reference) {
+		ownershipChecks += 1;
+		if (ownershipChecks === 1) return originalIsCurrentOwner.call(this, reference);
+		throw new Error("lease read failed");
+	};
+	try {
+		await assert.rejects(
+			harness.tools.get("delivery_delegate_worker").execute("worker-corrupt-lease", {}, undefined, undefined, harness.ctx),
+			/cannot be verified before approved deterministic repair: lease read failed/,
+		);
+	} finally {
+		WriterLeaseManager.prototype.isCurrentOwner = originalIsCurrentOwner;
+	}
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "IMPLEMENTING");
+	assert.equal(blocked.workerStatus, "completed");
+	assert.ok(blocked.writerLease?.leaseId);
+	assert.equal(blocked.candidateDigest, undefined);
+	assert.equal(harness.execCalls.length, 0);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+	const runtimeStatus = await harness.tools.get("delivery_runtime_status").execute(
+		"corrupt-lease-runtime-status",
+		{},
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	assert.equal(runtimeStatus.details.writerLeaseHeld, false);
 });
 
 test("standard route blocks before source work when worker preflight is shadowed", async () => {
@@ -1813,6 +2073,57 @@ test("standard route returns accepted review rework to one worker", async () => 
 	assert.equal(state.workerStatus, "completed");
 	assert.equal(state.reworkApproved, false);
 	assert.equal(state.reviewEvidence, undefined);
+});
+
+test("preserves frozen evidence so protected-artifact drift can resume rework after restoration", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setReviewText("Concrete P1 finding\nMerge verdict: BLOCK");
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd, "standard"));
+	harness.configureWorkerResponse({
+		execute: () => writeFileSync(path.join(repo, "worker-change.txt"), "first candidate\n"),
+	});
+	installSubagentRpcResponder(harness);
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_delegate_worker").execute("initial-worker", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_validate").execute("validate-before-review", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_review_candidate").execute("review", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_begin_rework").execute(
+		"begin-worker-rework",
+		{ reason: "Fix accepted P1" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	const beforeDrift = harness.appendedEntries.at(-1)?.data as any;
+	const approvedPlan = readFileSync(path.join(repo, TEST_PLAN_PATH), "utf8");
+	harness.configureWorkerResponse({
+		execute: () => writeFileSync(path.join(repo, TEST_PLAN_PATH), "worker changed parent-owned plan\n"),
+	});
+
+	await assert.rejects(
+		harness.tools.get("delivery_delegate_worker").execute("rework-protected-drift", {}, undefined, undefined, harness.ctx),
+		/Controlled worker changed a protected planning or progress artifact/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "REWORKING");
+	assert.equal(blocked.candidateDigest, beforeDrift.candidateDigest);
+	assert.equal(blocked.validationEvidence.candidateDigest, beforeDrift.candidateDigest);
+	assert.equal(blocked.reviewEvidence.candidateDigest, beforeDrift.candidateDigest);
+	assert.equal(blocked.writerLease, undefined);
+	writeFileSync(path.join(repo, TEST_PLAN_PATH), approvedPlan);
+	await harness.commands.get("delivery-resume")?.handler("", harness.ctx);
+
+	const resumed = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(resumed.snapshot.state, "REWORKING");
+	assert.equal(resumed.candidateDigest, beforeDrift.candidateDigest);
+	assert.ok(resumed.writerLease?.leaseId);
+	assert.deepEqual(harness.getActiveTools(), DELEGATED_WRITER_ACTIVE_TOOLS);
+	await harness.commands.get("delivery-cancel")?.handler("", harness.ctx);
 });
 
 test("standard route serializes the foreground worker against sibling parent writes", async () => {
@@ -2505,6 +2816,7 @@ test("resume does not auto-continue after TUI cancellation or a failed policy co
 	await failed.commands.get("delivery-resume")?.handler("", failed.ctx);
 	assert.equal(failed.sentUserMessages.length, 0);
 	assert.deepEqual(failed.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
+	assert.equal((failed.appendedEntries.at(-1)?.data as any).snapshot.resumeState, "PLANNING");
 });
 
 test("force-release requires TUI confirmation and leaves the flow blocked", async () => {
@@ -3244,6 +3556,32 @@ test("model-callable invalidation can only downgrade", async () => {
 	assert.deepEqual(harness.ui.statuses.at(-1), ["adaptive-delivery", "已阻塞 [BLOCKED]"]);
 });
 
+test("invalidation policy failure preserves an existing blocked resume state", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	const branch = approvalBranch("BLOCKED", harness.sessionId, harness.ctx.cwd);
+	(branch.at(-1) as any).data.snapshot = { state: "BLOCKED", resumeState: "PLANNING" };
+	harness.setBranch(branch);
+	await emit(harness, "session_start");
+	harness.failSetActiveToolsOnFutureCalls([1]);
+
+	await assert.rejects(
+		harness.tools.get("delivery_invalidate").execute(
+			"blocked-invalidate-policy-failure",
+			{ target: "BLOCKED", reason: "keep the existing recovery point" },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/Read-only policy could not be proven/,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "PLANNING");
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
+});
+
 test("temporary BLOCKED invalidation preserves the approved implementation bundle and resumes", async () => {
 	const repo = candidateRepo();
 	const harness = createHarness(repo);
@@ -3364,6 +3702,41 @@ test("temporary BLOCKED preserves completed validation evidence", async () => {
 		content: "/delivery-run",
 		options: { expandPromptTemplates: true },
 	});
+});
+
+test("execute-time authorization failure preserves an existing BLOCKED resume state", async () => {
+	const repo = candidateRepo();
+	const harness = createHarness(repo);
+	harness.setConfirmResult(true);
+	harness.setBranch(approvalBranch("PLAN_PENDING_APPROVAL", harness.sessionId, harness.ctx.cwd));
+	await emit(harness, "session_start");
+	await harness.commands.get("delivery-approve-plan")?.handler("", harness.ctx);
+	await harness.tools.get("delivery_submit_candidate").execute("submit", {}, undefined, undefined, harness.ctx);
+	await harness.tools.get("delivery_invalidate").execute(
+		"temporary-validation-block-before-authorization-drift",
+		{ target: "BLOCKED", reason: "temporary interruption" },
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+	writeFileSync(path.join(repo, TEST_PLAN_PATH), "approval drift\n");
+
+	await assert.rejects(
+		harness.tools.get("delivery_progress_sync").execute(
+			"blocked-progress-authorization-drift",
+			{ target: TEST_PLAN_PATH, oldText: "Status: pending", newText: "Status: complete" },
+			undefined,
+			undefined,
+			harness.ctx,
+		),
+		/identity changed|content changed|does not match|invalid/i,
+	);
+
+	const blocked = harness.appendedEntries.at(-1)?.data as any;
+	assert.equal(blocked.snapshot.state, "BLOCKED");
+	assert.equal(blocked.snapshot.resumeState, "VALIDATING");
+	assert.equal(blocked.writerLease, undefined);
+	assert.deepEqual(harness.getActiveTools(), BASE_ACTIVE_TOOLS);
 });
 
 test("resume keeps validation blocked when the frozen candidate changed", async () => {

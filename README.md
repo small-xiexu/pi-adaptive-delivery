@@ -230,7 +230,7 @@ TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract
 
 1. 复验已批准技术方案文档并创建实施计划文档。
 2. 获取当前 Git worktree 的唯一 writer lease。
-3. Tiny 由父 Pi 在 exact scope 内直接实现；Standard/High-Risk 默认由一个受控 foreground worker 实现，兼容的 plan-v2 `single` 路径仍保留父 Pi 实现。worker 不持有 shell；计划中可选的、明确批准的 formatter/generator 修复命令由 Delivery Gate 在 worker 结束后、candidate freeze 前执行。
+3. Tiny 由父 Pi 在 exact scope 内直接实现；Standard/High-Risk 默认由一个受控 foreground worker 实现，兼容的 plan-v2 `single` 路径仍保留父 Pi 实现。worker 不持有 shell，也不得修改已批准的 solution、plan 或任何 progress target；Package 在 worker terminal 后、repair 前复验这些受保护制品，批准 repair 完成后、candidate freeze 前再复验一次。计划中可选的、明确批准的 formatter/generator 修复命令由 Delivery Gate 只在首次复验通过后执行。
 4. 冻结包含 HEAD、staged、tracked、untracked、submodule 和批准记录的 candidate digest。
 5. 由 Delivery Gate 通过 Pi 的公开命令 API 顺序执行批准的验证命令。
 6. Standard/High-Risk 使用 fresh reviewer 检查 runtime 提供的同一 candidate actual diff，并把结果绑定 candidate/diff digest；Tiny 默认省略。
@@ -261,7 +261,7 @@ P2、推测性意见和与当前修改无关的历史问题只进入最终 notes
 | `已交付 [DELIVERED]` | 当前候选已通过门禁 | 做用户验收，另行决定是否提交或发布 |
 | `已取消 [CANCELLED]` | 当前流程已结束 | 新任务使用新 Session |
 
-`/delivery-status` 会用中文显示恢复状态、写入者、候选版本、验证、审查、规划文档和进度同步。`当前有效` 表示证据仍对应当前工作区，`已过期` 表示工作区已经变化，`不可证明` 表示当前无法确认。路径、digest、运行 ID 和 `[STATE]` 会保留原始诊断值。
+`/delivery-status` 会用中文显示恢复状态、写入者、候选版本、验证、审查、规划文档和进度同步。worker 运行期间，状态栏和状态命令还会显示当前工具、已运行时间、工具调用数及最近一条有界输出；这些内容只用于当前进程展示，不作为批准或恢复证据。`当前有效` 表示证据仍对应当前工作区，`已过期` 表示工作区已经变化，`不可证明` 表示当前无法确认。路径、digest、运行 ID 和 `[STATE]` 会保留原始诊断值。
 
 ## 常见恢复
 
@@ -359,7 +359,7 @@ Package 不支持：
 - 自动训练或自主修改 Package
 - 操作系统级沙箱
 
-Package 和 Extension 以当前用户权限运行。writer lease 只约束加载兼容 Package 的受控 Pi 流程，不能阻止外部编辑器、未加载 Package 的进程或恶意同进程 Extension。candidate digest 用于发现变化，不证明代码一定正确。不可信仓库或 unattended automation 仍需容器、VM 或其他操作系统级隔离。
+Package 和 Extension 以当前用户权限运行。writer lease 只约束加载兼容 Package 的受控 Pi 流程，不能阻止外部编辑器、未加载 Package 的进程或恶意同进程 Extension。公开 structured delegation API 只提供工具名能力上限，不提供 child 路径级预写入拦截；因此 Package 通过明确 worker 契约和 terminal 后第一边界复验保护 planning/progress 制品，发现漂移即不形成 candidate并只读阻塞。candidate digest 用于发现变化，不证明代码一定正确。不可信仓库或 unattended automation 仍需容器、VM 或其他操作系统级隔离。
 
 Pi 的 active-tools 用于让模型看到当前阶段应使用的工具，但不是唯一授权边界。Package 还会在每次 `tool_call` 真正执行前拒绝最后一次成功阶段策略集合外的任意工具；内置 `edit/write` 继续执行实时 approval、lease、route 和 scope 校验。Standard/High-Risk 的 worker 路由中，即使工具因 Provider 或后加载 Extension 短暂出现，父 Pi 也不能据此修改项目或启动命令。
 

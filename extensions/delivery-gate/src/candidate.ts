@@ -49,6 +49,8 @@ export interface ProgressArtifactSnapshot {
 	type: "file" | "symlink";
 	size: number;
 	digest: string;
+	dev: number;
+	ino: number;
 }
 
 function sha256(value: string | Buffer): string {
@@ -172,6 +174,18 @@ export async function snapshotProgressArtifact(gitRoot: string, relativePath: st
 		{ key: "", cwdPath: root, workspacePath: root, gitRoot: root },
 		[relativePath],
 	);
-	const digest = await fileDigest(root, paths[0]!);
-	return digest;
+	const relative = paths[0]!;
+	const absolute = path.join(root, relative);
+	const before = await lstat(absolute);
+	const digest = await fileDigest(root, relative);
+	const after = await lstat(absolute);
+	if (
+		before.dev !== after.dev ||
+		before.ino !== after.ino ||
+		before.mode !== after.mode ||
+		before.size !== after.size
+	) {
+		throw new Error(`Progress artifact changed while it was being snapshotted: ${relative}`);
+	}
+	return { ...digest, dev: after.dev, ino: after.ino };
 }

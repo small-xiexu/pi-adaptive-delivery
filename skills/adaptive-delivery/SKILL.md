@@ -132,10 +132,12 @@ Delivery 工具按状态动态开放。任何时候不确定当前阶段时，�
 
 - `IMPLEMENTING` 和授权 `REWORKING` 根据 plan route 二选一：`single` 只给父 Pi 源码写入工具与 `delivery_submit_candidate`；`standard/high-risk` 从父 Pi 移除源码写入，只给 `delivery_delegate_worker`。
 - `delivery_delegate_worker` 使用 builtin fresh foreground worker。父进程在 child 运行期间保管 workspace lease，但没有写工具、没有并行下一回合，且 tool-batch barrier 拒绝 sibling write；匹配 run ID 和 `launchContractDigest` 的 terminal response 到达后才自动冻结 candidate 与释放 lease。proof 缺失时保留 lease并 BLOCKED。
+- worker 无条件不得修改已批准 solution、plan 或任何 `progressTargets`；这些控制面制品由父会话在 writer-free 边界统一同步。Package 在 worker terminal 后、repair 前复验其内容与身份，批准 repair 完成后、candidate freeze 前再次复验；任一处漂移都不形成 candidate并只读阻塞。公开委派 API 不提供 child 路径级操作系统沙箱。
 - builtin worker 不获得 shell、ambient Extension 或 MCP。确需 formatter/generator 确定性改写时，plan v2 的对应 validation item 必须同时声明用户批准的 `repairCommand` 和 `repairTimeoutMs`；Delivery Gate 只在可信 worker terminal 后、candidate freeze 前、同一 lease 内执行。Tiny 不支持 repair command，调用者不能临时传入命令，失败时不得冻结 candidate。
 - 候选提交成功、状态切到 `VALIDATING` 后，验证、审查、返工和完成工具才会在下一次模型请求中出现。
 - 后续阶段工具提前不可见不是运行时故障，不得以此为由撤销批准或删除规划文档。
 - 当前阶段必需工具确实缺失时可以 `delivery_invalidate(target=BLOCKED)` 暂停；该动作只释放 writer 并保留批准链、规划文档、candidate 和 evidence。恢复权限仍必须由 TUI 用户执行 `/delivery-resume`。
+- 已处于 `BLOCKED` 时重复发生 runtime proof failure 必须保留原 `resumeState`，不能把可恢复断点覆盖为无恢复状态。
 - 只有需求、范围、架构或计划真的失效时，才使用 `SHAPING` 或 `PLANNING` 目标撤销相应批准。
 - `delivery_validate` 不启动 AI child。Extension 只通过 Pi 公开 `pi.exec` 顺序执行已批准 Delivery Contract 中的命令，并在同一个工具调用中显示当前命令、退出码和耗时；TUI validation 窗口隐藏默认高频 spinner并使用低频进度更新。父 Pi 只调用一次，不得定时轮询 `delivery_runtime_status`。计划中的 timeout 优先使用同环境、同范围最近耗时并留足余量；缺少证据的长全量或容器命令使用保守值。宿主 timeout 不能保证终止外部后代进程时，批准命令自身必须提供可终止边界，不能假设 `pi.exec` 会清理全部外部进程。
 - validation terminal checkpoint 保存绑定 candidate 的批次 ID 和逐命令摘要。命令无法启动、工具中断或 terminal checkpoint 缺失按 infrastructure failure；真实非零退出或超时只证明批准命令未通过。父会话必须再区分候选代码、验证环境和已批准计划。只有代码问题才调用 `delivery_begin_rework({ reason: "包含全部已接受问题、证据、修复断言和边界的单个字符串" })`；不要传入 `acceptedFindings` 或其他未定义字段。计划错误使用 `/delivery-revise`。

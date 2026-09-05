@@ -104,6 +104,8 @@ test("prompt templates have descriptions and preserve phase boundaries", async (
 	assert.match(prompts[2]!.body, /delivery_runtime_status/);
 	assert.match(prompts[2]!.body, /implementationWriter=parent/);
 	assert.match(prompts[2]!.body, /delivery_delegate_worker/);
+	assert.match(prompts[2]!.body, /worker 无条件不得修改已批准 solution、plan 或任何 `progressTargets`/);
+	assert.match(prompts[2]!.body, /不要把进度文档交给 worker 修改/);
 	assert.match(prompts[2]!.body, /工具按阶段开放/);
 	assert.match(prompts[2]!.body, /当前不可见是正常行为/);
 	assert.match(prompts[2]!.body, /只调用一次 `delivery_validate`/);
@@ -178,6 +180,10 @@ test("skill uses valid Agent Skills identity and centralizes orchestration rules
 	assert.match(skill.body, /不得定时轮询 `delivery_runtime_status`/);
 	assert.match(skill.body, /`standard\/high-risk` 从父 Pi 移除源码写入/);
 	assert.match(skill.body, /terminal response 到达后才自动冻结 candidate/);
+	assert.match(skill.body, /worker 无条件不得修改已批准 solution、plan 或任何 `progressTargets`/);
+	assert.match(skill.body, /worker terminal 后、repair 前复验/);
+	assert.match(skill.body, /repair 完成后、candidate freeze 前再次复验/);
+	assert.match(skill.body, /重复发生 runtime proof failure 必须保留原 `resumeState`/);
 	assert.doesNotMatch(skill.body, /默认最多三轮/);
 	assert.match(skill.body, /不得重放结果未知/);
 });

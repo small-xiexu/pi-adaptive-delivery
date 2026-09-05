@@ -143,6 +143,8 @@ test("excludes project progress from candidate but snapshots it at delivery", as
 
 	assert.equal(first.digest, second.digest);
 	assert.notEqual(progressBefore.digest, progressAfter.digest);
+	assert.equal(progressBefore.dev > 0, true);
+	assert.equal(progressBefore.ino > 0, true);
 	assert.deepEqual(second.manifest.controlPlaneExclusions, ["progress.md"]);
 });
 

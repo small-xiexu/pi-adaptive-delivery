@@ -176,6 +176,8 @@ export interface WorkerDelegationResult {
 	model?: string;
 }
 
+export type WorkerDelegationUpdate = SubagentDelegationUpdate;
+
 function terminalContractError(
 	response: SubagentDelegationTerminalResponse,
 	contract: SubagentLaunchContract,

@@ -14,7 +14,11 @@ import {
 	type ApprovalKind,
 	type ApprovalRecord,
 } from "./src/approvals.ts";
-import { createCandidateSnapshot, snapshotProgressArtifact } from "./src/candidate.ts";
+import {
+	createCandidateSnapshot,
+	snapshotProgressArtifact,
+	type ProgressArtifactSnapshot,
+} from "./src/candidate.ts";
 import {
 	createCandidateReviewPacket,
 	parseStructuredReviewResult,
@@ -88,6 +92,8 @@ import {
 	SubagentBoundary,
 	validatePublicPreflightStability,
 	type ReadonlyDelegateRole,
+	type WorkerDelegationResult,
+	type WorkerDelegationUpdate,
 } from "./src/subagents.ts";
 import {
 	DELIVERY_STATE_CUSTOM_TYPE,
@@ -125,6 +131,17 @@ const SERIALIZED_DELIVERY_TOOLS = new Set([
 	"delivery_progress_sync",
 	"delivery_invalidate",
 ]);
+
+interface WorkerProgressView {
+	active: boolean;
+	startedAt: number;
+	runId?: string;
+	currentTool?: string;
+	recentTool?: string;
+	recentOutput?: string;
+	durationMs?: number;
+	toolCount?: number;
+}
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -207,6 +224,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	let leaseValid = false;
 	let deliveryBeginArmed = false;
 	let planningReadLines = 0;
+	let workerProgress: WorkerProgressView | undefined;
 	const activeMutationTools = new Map<string, string>();
 	const pendingDiagramEntries: DiagramEntryData[] = [];
 	let activeDeliveryBarrier: { toolCallId: string; toolName: string } | undefined;
@@ -232,7 +250,15 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 
 	function updateStatus(ctx: ExtensionContext): void {
 		const label = formatDeliveryState(state.snapshot.state);
-		ctx.ui.setStatus(STATUS_KEY, state.snapshot.state === "BLOCKED" ? ctx.ui.theme.fg("warning", label) : label);
+		const progress = workerProgress?.active
+			? [
+				workerProgress.currentTool ? `worker ${workerProgress.currentTool}` : "worker 运行中",
+				formatDurationMs(observedWorkerDuration(workerProgress)),
+				typeof workerProgress.toolCount === "number" ? `${workerProgress.toolCount} 次工具` : undefined,
+			].filter((value): value is string => Boolean(value)).join(" · ")
+			: undefined;
+		const status = progress ? `${label} · ${progress}` : label;
+		ctx.ui.setStatus(STATUS_KEY, state.snapshot.state === "BLOCKED" ? ctx.ui.theme.fg("warning", status) : status);
 	}
 
 	function textFromMessageContent(content: unknown): string {
@@ -415,11 +441,69 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 	}
 
-	function formatElapsed(startedAt: number): string {
-		const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+	function formatDurationMs(durationMs: number): string {
+		const seconds = Math.max(0, Math.floor(durationMs / 1000));
 		if (seconds < 60) return `${seconds} 秒`;
 		const minutes = Math.floor(seconds / 60);
 		return `${minutes} 分 ${seconds % 60} 秒`;
+	}
+
+	function formatElapsed(startedAt: number): string {
+		return formatDurationMs(Date.now() - startedAt);
+	}
+
+	function compactWorkerText(value: unknown, maxLength: number): string | undefined {
+		if (typeof value !== "string") return undefined;
+		const compact = value
+			.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
+			.replace(/\s+/g, " ")
+			.trim();
+		if (!compact) return undefined;
+		return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact;
+	}
+
+	function compactWorkerOutput(update: WorkerDelegationUpdate): string | undefined {
+		const lines = Array.isArray(update.recentOutputLines) ? update.recentOutputLines : undefined;
+		return compactWorkerText(update.recentOutput ?? lines?.at(-1), 200);
+	}
+
+	function observedWorkerDuration(progress: WorkerProgressView): number {
+		const reported = progress.durationMs ?? 0;
+		return progress.active
+			? Math.max(reported, Date.now() - progress.startedAt)
+			: reported;
+	}
+
+	function recordWorkerProgress(update: WorkerDelegationUpdate, ctx: ExtensionContext): void {
+		const previous = workerProgress ?? { active: true, startedAt: Date.now() };
+		const { currentTool: _previousCurrentTool, ...withoutCurrentTool } = previous;
+		const currentTool = compactWorkerText(update.currentTool, 80);
+		const recentOutput = compactWorkerOutput(update);
+		workerProgress = {
+			...withoutCurrentTool,
+			active: true,
+			...(update.runId ? { runId: update.runId } : {}),
+			...(currentTool ? { currentTool, recentTool: currentTool } : {}),
+			...(recentOutput ? { recentOutput } : {}),
+			...(typeof update.durationMs === "number" && Number.isFinite(update.durationMs) && update.durationMs >= 0
+				? { durationMs: update.durationMs }
+				: {}),
+			...(typeof update.toolCount === "number" && Number.isInteger(update.toolCount) && update.toolCount >= 0
+				? { toolCount: update.toolCount }
+				: {}),
+		};
+		updateStatus(ctx);
+	}
+
+	function finishWorkerProgress(runId?: string): void {
+		if (!workerProgress) return;
+		const { currentTool: _currentTool, ...finished } = workerProgress;
+		workerProgress = {
+			...finished,
+			active: false,
+			...(runId ? { runId } : {}),
+			durationMs: Math.max(workerProgress.durationMs ?? 0, Date.now() - workerProgress.startedAt),
+		};
 	}
 
 	function renderProgress(update: () => void): void {
@@ -474,9 +558,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			pi.appendEntry(DELIVERY_STATE_CUSTOM_TYPE, state);
 			return true;
 		} catch (error) {
+			const resumeState = state.snapshot.state === "BLOCKED"
+				? state.snapshot.resumeState
+				: resumableState(state.snapshot.state);
 			state = {
 				...state,
-				snapshot: { state: "BLOCKED" },
+				snapshot: { state: "BLOCKED", ...(resumeState ? { resumeState } : {}) },
 				blockingReason: `Failed to persist delivery checkpoint: ${error instanceof Error ? error.message : String(error)}`,
 				updatedAt: new Date().toISOString(),
 			};
@@ -591,6 +678,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	async function restore(ctx: ExtensionContext): Promise<void> {
 		currentContext = ctx;
 		deliveryBeginArmed = false;
+		workerProgress = undefined;
 		subagents.bindSession(ctx.sessionManager.getSessionId());
 		const restored = restoreRuntimeState(ctx.sessionManager.getBranch());
 		state = restored.state;
@@ -599,7 +687,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		} catch (error) {
 			setBlocked(
 				`Failed to capture the original Pi tool baseline: ${error instanceof Error ? error.message : String(error)}`,
-				resumableState(state.snapshot.state),
+				resumeStateForBlock(),
 			);
 			persistCurrentState();
 			updateStatus(ctx);
@@ -679,10 +767,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	}
 
 	function workerTask(ctx: ExtensionContext, additionalInstructions?: string): string {
+		const protectedPaths = workerProtectedPaths();
 		return [
 			"Implement the currently approved Adaptive Delivery plan in the current repository.",
 			"You are the sole implementation worker for this foreground handoff. Modify only project/source files allowed by the approved plan.",
-			"Read and follow project AGENTS.md. Do not start subagents, change product/scope/architecture decisions, update progress documents, commit, push, publish, deploy, access credentials, or call real providers unless the approved plan explicitly authorizes it.",
+			"Read and follow project AGENTS.md. Do not start subagents, change product/scope/architecture decisions, commit, push, publish, deploy, access credentials, or call real providers unless the approved plan explicitly authorizes it.",
+			`Never modify the approved solution, implementation plan, or any progress target. These files are parent-owned control-plane artifacts even when the approved plan lists them as delivery outputs. Protected paths: ${protectedPaths.join(", ")}.`,
 			"Run no unapproved release or production action. Stop and report when an unapproved decision is required.",
 			state.goal ? `Goal: ${state.goal}` : undefined,
 			`Approved solution and implementation plan:\n${approvedContextText(ctx) || "(approved entries unavailable)"}`,
@@ -691,11 +781,96 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		].filter((value): value is string => Boolean(value)).join("\n\n");
 	}
 
+	function workerProtectedPaths(): string[] {
+		if (!state.planContract) return [];
+		return [...new Set([
+			state.planContract.documents.solutionPath,
+			state.planContract.documents.planPath,
+			...state.planContract.progressTargets,
+		])].sort((left, right) => left.localeCompare(right, "en"));
+	}
+
+	async function snapshotWorkerProtectedArtifacts(gitRoot: string): Promise<ProgressArtifactSnapshot[]> {
+		const snapshots: ProgressArtifactSnapshot[] = [];
+		for (const protectedPath of workerProtectedPaths()) {
+			try {
+				snapshots.push(await snapshotProgressArtifact(gitRoot, protectedPath));
+			} catch (error) {
+				throw new Error(`Cannot snapshot protected worker path '${protectedPath}': ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		return snapshots;
+	}
+
+	async function assertWorkerProtectedArtifactsCurrent(
+		gitRoot: string,
+		baseline: readonly ProgressArtifactSnapshot[],
+	): Promise<void> {
+		for (const previous of baseline) {
+			let current: ProgressArtifactSnapshot;
+			try {
+				current = await snapshotProgressArtifact(gitRoot, previous.path);
+			} catch (error) {
+				throw new Error(`Protected worker path '${previous.path}' cannot be reproved: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			if (
+				current.type !== previous.type ||
+				current.size !== previous.size ||
+				current.digest !== previous.digest ||
+				current.dev !== previous.dev ||
+				current.ino !== previous.ino
+			) {
+				throw new Error(`Controlled worker modified protected path '${previous.path}'`);
+			}
+		}
+	}
+
+	async function reproveWorkerProtectedArtifacts(
+		ctx: ExtensionContext,
+		gitRoot: string,
+		baseline: readonly ProgressArtifactSnapshot[],
+		result: WorkerDelegationResult,
+		sourceState: "IMPLEMENTING" | "REWORKING",
+		phase: "worker" | "repair",
+	): Promise<void> {
+		try {
+			await assertWorkerProtectedArtifactsCurrent(gitRoot, baseline);
+			return;
+		} catch (error) {
+			let released = false;
+			let releaseError: string | undefined;
+			try {
+				released = await releaseParentLeaseIfOwned();
+			} catch (releaseFailure) {
+				releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
+			}
+			const actor = phase === "worker" ? "Controlled worker" : "Approved deterministic repair";
+			const reason = `${actor} changed a protected planning or progress artifact: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; lease release failed: ${releaseError}` : ""}`;
+			setBlocked(reason, sourceState);
+			state = checkpointRuntimeState(state, {
+				workerRunId: result.runId,
+				workerStatus: result.status === "completed" ? "completed" : "failed",
+				workerLaunchContractDigest: result.launchContractDigest,
+				...(released ? { writerLease: undefined } : {}),
+				checkpoint: {
+					summary: `Protected ${phase} artifact drift detected after worker ${result.runId}`,
+					nextReadyAction: "Restore or explicitly revise the protected document before retrying implementation",
+				},
+			});
+			persistCurrentState();
+			updateStatus(ctx);
+			throw new Error(reason);
+		}
+	}
+
 	function commitSnapshot(next: DeliverySnapshot, ctx: ExtensionContext, widening: boolean): boolean {
 		if (!widening) {
 			const locked = policy.forceReadOnly();
 			if (!locked.ok) {
-				setBlocked(`Cannot commit state transition because read-only policy failed: ${locked.reason ?? "unknown error"}`);
+				setBlocked(
+					`Cannot commit state transition because read-only policy failed: ${locked.reason ?? "unknown error"}`,
+					resumeStateForBlock(),
+				);
 				persistCurrentState();
 				updateStatus(ctx);
 				return false;
@@ -767,12 +942,30 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	}
 
 	async function releaseParentLeaseIfOwned(): Promise<boolean> {
-		if (!state.writerLease) return true;
-		if (!(await writerLeases.isCurrentOwner(state.writerLease))) return false;
-		await writerLeases.release(state.writerLease, {
-			kind: "parent-owner",
-			processToken: writerLeases.processToken,
-		});
+		if (!state.writerLease) {
+			leaseValid = false;
+			return true;
+		}
+		let ownsLease: boolean;
+		try {
+			ownsLease = await writerLeases.isCurrentOwner(state.writerLease);
+		} catch (error) {
+			leaseValid = false;
+			throw error;
+		}
+		if (!ownsLease) {
+			leaseValid = false;
+			return false;
+		}
+		try {
+			await writerLeases.release(state.writerLease, {
+				kind: "parent-owner",
+				processToken: writerLeases.processToken,
+			});
+		} catch (error) {
+			leaseValid = false;
+			throw error;
+		}
 		leaseValid = false;
 		state = checkpointRuntimeState(state, { writerLease: undefined });
 		return true;
@@ -829,9 +1022,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 	): Promise<void> {
 		const reason = await validateStoredApprovals(ctx, requirement);
 		if (reason) {
-			setBlocked(`Authorization bundle is invalid: ${reason}`, resumableState(state.snapshot.state));
-			persistCurrentState();
-			updateStatus(ctx);
+			blockForRuntimeProofFailure(ctx, `Authorization bundle is invalid: ${reason}`);
 			throw new Error(reason);
 		}
 	}
@@ -856,9 +1047,16 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 
 	function blockForRuntimeProofFailure(ctx: ExtensionContext, reason: string): void {
 		leaseValid = false;
-		setBlocked(reason, resumableState(state.snapshot.state));
+		const resumeState = resumeStateForBlock();
+		setBlocked(reason, resumeState);
 		persistCurrentState();
 		updateStatus(ctx);
+	}
+
+	function resumeStateForBlock(): ResumeState | undefined {
+		return state.snapshot.state === "BLOCKED"
+			? state.snapshot.resumeState
+			: resumableState(state.snapshot.state);
 	}
 
 	async function approveTiny(
@@ -1126,7 +1324,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		const widening = transition.snapshot.state === "IMPLEMENTING";
 		if (widening) {
 			if (!planContract || !planningDocumentContent) {
-				setBlocked("Planning document contract is missing", resumableState(state.snapshot.state));
+				setBlocked("Planning document contract is missing", resumeStateForBlock());
 				persistCurrentState();
 				updateStatus(ctx);
 				return;
@@ -1181,7 +1379,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
 				}
 				const reason = `Planning document synchronization failed: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; ${releaseError}` : ""}`;
-				setBlocked(reason, resumableState(state.snapshot.state));
+				setBlocked(reason, resumeStateForBlock());
 				persistCurrentState();
 				updateStatus(ctx);
 				ctx.ui.notify(formatRuntimeText(reason) ?? "规划文档同步失败", "error");
@@ -1277,6 +1475,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			)
 				? formatRuntimeText(progressSummary)
 				: "未运行";
+			const workerDuration = workerProgress
+				? observedWorkerDuration(workerProgress)
+				: undefined;
 			const lines = [
 				`状态：${formatDeliveryState(state.snapshot.state)}`,
 				`交付等级：${isTinyDelivery() ? "TINY" : state.planContract && selectDeliveryRoute(state.planContract) === "high-risk" ? "HIGH_RISK" : state.planContract ? "STANDARD" : "待确定"}`,
@@ -1284,6 +1485,11 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				`恢复状态：${state.snapshot.resumeState ? formatDeliveryState(state.snapshot.resumeState) : "无"}`,
 				`开发方式：${plannedImplementationWriter() === "worker" ? "唯一 worker" : plannedImplementationWriter() === "parent" ? "父 Pi 直接实现" : "待实施计划决定"}`,
 				`开发执行者：${state.workerStatus ? `${formatWorkerStatus(state.workerStatus)}${state.workerRunId ? `（运行 ID：${state.workerRunId}）` : ""}` : "未启动"}`,
+				...(workerProgress ? [
+					`Worker ${workerProgress.currentTool ? "当前" : "最近"}动作：${workerProgress.currentTool ?? workerProgress.recentTool ?? "等待工具更新"}`,
+					`Worker 进度：${workerDuration === undefined ? "不可证明" : formatDurationMs(workerDuration)}${typeof workerProgress.toolCount === "number" ? `，${workerProgress.toolCount} 次工具调用` : ""}`,
+					...(workerProgress.recentOutput ? [`Worker 最近输出：${workerProgress.recentOutput}`] : []),
+				] : []),
 				`写入者：${writerOwner}`,
 				`候选版本：${state.candidateDigest ? `${state.candidateDigest}（${formatEvidenceValidity(candidateValidity)}）` : "不可证明"}`,
 				`验证：${state.validationStatus ? `${formatValidationStatus(state.validationStatus)}（${formatEvidenceValidity(evidenceValidity)}）${state.validationFailureKind === "infrastructure" ? "（本机执行未完成）" : state.validationFailureKind === "candidate" ? "（批准命令未通过）" : state.validationStatus === "failed" ? "（失败类型不可证明）" : ""}` : "不可证明"}${state.validationRunId ? `（批次 ID：${state.validationRunId}）` : ""}`,
@@ -1526,12 +1732,20 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const deliveryTools = activeTools.filter((name) => name.startsWith("delivery_"));
 			const nextReadyAction = formatRuntimeText(state.checkpoint?.nextReadyAction);
 			const guidance = runtimePhaseGuidance();
+			const workerDuration = workerProgress
+				? observedWorkerDuration(workerProgress)
+				: undefined;
 			const lines = [
 				`当前状态：${formatDeliveryState(state.snapshot.state)}`,
 				...(state.snapshot.resumeState ? [`可恢复到：${formatDeliveryState(state.snapshot.resumeState)}`] : []),
 				`当前可用交付工具：${deliveryTools.join(", ") || "无"}`,
 				...(nextReadyAction ? [`已记录下一步：${nextReadyAction}`] : []),
 				...(state.blockingReason ? [`阻塞原因：${formatRuntimeText(state.blockingReason)}`] : []),
+				...(workerProgress ? [
+					`Worker ${workerProgress.currentTool ? "当前" : "最近"}动作：${workerProgress.currentTool ?? workerProgress.recentTool ?? "等待工具更新"}`,
+					`Worker 进度：${workerDuration === undefined ? "不可证明" : formatDurationMs(workerDuration)}${typeof workerProgress.toolCount === "number" ? `，${workerProgress.toolCount} 次工具调用` : ""}`,
+					...(workerProgress.recentOutput ? [`Worker 最近输出：${workerProgress.recentOutput}`] : []),
+				] : []),
 				`阶段说明：${guidance}`,
 			];
 			return {
@@ -1552,6 +1766,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					workerRunId: state.workerRunId,
 					workerStatus: state.workerStatus,
 					workerLaunchContractDigest: state.workerLaunchContractDigest,
+					workerProgress,
 					candidateDigest: state.candidateDigest,
 					validationRunId: state.validationRunId,
 					validationStatus: state.validationStatus,
@@ -1668,6 +1883,26 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 
 			const sourceState = state.snapshot.state;
 			const identity = await resolveWorkspaceIdentity(ctx.cwd);
+			let protectedArtifacts: ProgressArtifactSnapshot[];
+			try {
+				protectedArtifacts = await snapshotWorkerProtectedArtifacts(identity.gitRoot);
+			} catch (error) {
+				let released = false;
+				let releaseError: string | undefined;
+				try {
+					released = await releaseParentLeaseIfOwned();
+				} catch (releaseFailure) {
+					releaseError = releaseFailure instanceof Error ? releaseFailure.message : String(releaseFailure);
+				}
+				setBlocked(
+					`Protected worker artifacts cannot be frozen before delegation: ${error instanceof Error ? error.message : String(error)}${releaseError ? `; lease release failed: ${releaseError}` : ""}`,
+					sourceState,
+				);
+				state = checkpointRuntimeState(state, { ...(released ? { writerLease: undefined } : {}) });
+				persistCurrentState();
+				updateStatus(ctx);
+				throw error;
+			}
 			const task = workerTask(ctx, params.instructions);
 			const contract = await subagents.preflightWorker(task, ctx, identity.gitRoot);
 			state = checkpointRuntimeState(state, {
@@ -1682,11 +1917,14 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			if (!persistCurrentState()) throw new Error("Worker preflight passed but its starting checkpoint could not be persisted");
 
 			let workerCheckpointFailed = false;
+			workerProgress = { active: true, startedAt: Date.now() };
+			renderProgress(() => updateStatus(ctx));
 			let result;
 			try {
 				result = await subagents.delegateWorker(task, ctx, contract, {
 					signal,
 					onRunId: (runId) => {
+						workerProgress = { ...(workerProgress ?? { active: true, startedAt: Date.now() }), active: true, runId };
 						state = checkpointRuntimeState(state, {
 							workerRunId: runId,
 							workerStatus: "running",
@@ -1696,20 +1934,34 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 							},
 						});
 						if (!persistCurrentState()) workerCheckpointFailed = true;
+						renderProgress(() => updateStatus(ctx));
 					},
 					onUpdate: (update) => {
-						renderProgress(() => onUpdate?.({
-							content: [{
-								type: "text",
-								text: update.currentTool
-									? `唯一 worker 正在执行：${update.currentTool}`
-									: "唯一 worker 正在执行已批准计划...",
-							}],
-							details: { runId: update.runId, toolCount: update.toolCount },
-						}));
+						renderProgress(() => {
+							recordWorkerProgress(update, ctx);
+							const progress = workerProgress!;
+							onUpdate?.({
+								content: [{
+									type: "text",
+									text: [
+										progress.currentTool ? `唯一 worker 正在执行：${progress.currentTool}` : "唯一 worker 正在执行已批准计划...",
+										`已运行 ${formatDurationMs(observedWorkerDuration(progress))}`,
+										typeof progress.toolCount === "number" ? `${progress.toolCount} 次工具调用` : undefined,
+										progress.recentOutput ? `最近输出：${progress.recentOutput}` : undefined,
+									].filter((value): value is string => Boolean(value)).join("；"),
+								}],
+								details: {
+									runId: progress.runId,
+									currentTool: progress.currentTool,
+									toolCount: progress.toolCount,
+									durationMs: observedWorkerDuration(progress),
+								},
+							});
+						});
 					},
 				});
 			} catch (error) {
+				finishWorkerProgress();
 				setBlocked(
 					`Controlled worker terminal proof is unavailable: ${error instanceof Error ? error.message : String(error)}`,
 					sourceState,
@@ -1718,6 +1970,9 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 				updateStatus(ctx);
 				throw error;
 			}
+			finishWorkerProgress(result.runId);
+			renderProgress(() => updateStatus(ctx));
+			await reproveWorkerProtectedArtifacts(ctx, identity.gitRoot, protectedArtifacts, result, sourceState, "worker");
 			try {
 				const recheckedContract = await subagents.preflightWorker(task, ctx, identity.gitRoot);
 				const stable = validatePublicPreflightStability(contract, recheckedContract);
@@ -1793,21 +2048,29 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 
 			const repairCommands = approvedRepairCommands();
 			if (repairCommands.length > 0) {
-				if (!state.writerLease || !(await writerLeases.isCurrentOwner(state.writerLease))) {
+				let repairLeaseError: string | undefined;
+				try {
+					if (!state.writerLease || !(await writerLeases.isCurrentOwner(state.writerLease))) {
+						repairLeaseError = "Writer lease ownership changed before approved deterministic repair";
+					}
+				} catch (error) {
+					repairLeaseError = `Writer lease ownership cannot be verified before approved deterministic repair: ${error instanceof Error ? error.message : String(error)}`;
+				}
+				if (repairLeaseError) {
 					leaseValid = false;
-					setBlocked("Writer lease ownership changed before approved deterministic repair", sourceState);
+					setBlocked(repairLeaseError, sourceState);
 					state = checkpointRuntimeState(state, {
 						workerRunId: result.runId,
 						workerStatus: "completed",
 						workerLaunchContractDigest: result.launchContractDigest,
 						checkpoint: {
-							summary: `Writer lease ownership changed before repair after worker ${result.runId}`,
+							summary: `Writer lease ownership cannot be proven before repair after worker ${result.runId}`,
 							nextReadyAction: "Resolve the writer lease before retrying implementation",
 						},
 					});
 					if (!persistCurrentState()) throw new Error("Writer lease changed and the blocked checkpoint could not be persisted");
 					updateStatus(ctx);
-					throw new Error("Writer lease ownership changed before approved deterministic repair");
+					throw new Error(repairLeaseError);
 				}
 				leaseValid = true;
 				renderProgress(() => onUpdate?.({
@@ -1849,6 +2112,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					updateStatus(ctx);
 					throw new Error(`Approved deterministic repair failed: ${failedIds.join(", ") || repairResult.error || "unknown failure"}`);
 				}
+				await reproveWorkerProtectedArtifacts(ctx, identity.gitRoot, protectedArtifacts, result, sourceState, "repair");
 			}
 
 			let candidate;
@@ -2414,7 +2678,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					if (!restored.ok || restored.policy.reason) {
 						setBlocked(
 							`Progress sync checkpoint failed and base policy could not be restored: ${restored.reason ?? restored.policy.reason ?? "unknown error"}`,
-							stateBeforeProgressSync.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined,
+							resumeStateForBlock(),
 						);
 						state = checkpointRuntimeState(state, { writerLease: undefined });
 					}
@@ -2446,7 +2710,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					leaseValid = false;
 					state = checkpointRuntimeState(state, { writerLease: undefined });
 				}
-				setBlocked(`Progress sync failed: ${reason}`, state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined);
+				setBlocked(`Progress sync failed: ${reason}`, resumeStateForBlock());
 				persistCurrentState();
 				updateStatus(ctx);
 				throw new Error(reason);
@@ -2541,7 +2805,7 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 					if (!retryPolicy.ok || retryPolicy.policy.reason) {
 						setBlocked(
 							`Progress sync input conflicted but retry tools could not be restored: ${retryPolicy.reason ?? retryPolicy.policy.reason ?? "unknown error"}`,
-							state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined,
+							resumeStateForBlock(),
 						);
 						persistCurrentState();
 						updateStatus(ctx);
@@ -2551,12 +2815,12 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 						updateStatus(ctx);
 						throw error;
 					}
-					setBlocked("Progress sync input conflicted and its released-lease checkpoint failed", state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined);
+					setBlocked("Progress sync input conflicted and its released-lease checkpoint failed", resumeStateForBlock());
 					persistCurrentState();
 					updateStatus(ctx);
 					throw new Error("Progress sync input conflicted and its released-lease checkpoint failed");
 				}
-				setBlocked(`Progress sync failed: ${error instanceof Error ? error.message : String(error)}`, state.snapshot.state === "VALIDATING" ? "VALIDATING" : undefined);
+				setBlocked(`Progress sync failed: ${error instanceof Error ? error.message : String(error)}`, resumeStateForBlock());
 				state = checkpointRuntimeState(state, {
 					...(leaseValid ? {} : { writerLease: undefined }),
 				});
@@ -2579,13 +2843,16 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 			const priorSnapshot = state.snapshot;
 			const locked = policy.forceReadOnly();
 			if (!locked.ok) {
-				setBlocked(`Cannot invalidate because read-only policy failed: ${locked.reason ?? "unknown error"}`);
+				setBlocked(
+					`Cannot invalidate because read-only policy failed: ${locked.reason ?? "unknown error"}`,
+					resumeStateForBlock(),
+				);
 				persistCurrentState();
 				updateStatus(ctx);
 				throw new Error("Read-only policy could not be proven");
 			}
 			if (state.writerLease && !(await releaseParentLeaseIfOwned())) {
-				setBlocked("Cannot invalidate while writer lease ownership is unproven", resumableState(state.snapshot.state));
+				setBlocked("Cannot invalidate while writer lease ownership is unproven", resumeStateForBlock());
 				persistCurrentState();
 				updateStatus(ctx);
 				throw new Error("Writer lease ownership is unproven");
@@ -2750,12 +3017,10 @@ export default function deliveryGate(pi: ExtensionAPI): void {
 		}
 		const applied = policy.apply(state.snapshot, state.writerLease ? approvalPolicyContext() : readOnlyContext());
 		if (applied.ok && !applied.policy.reason) return;
-		setBlocked(
+		blockForRuntimeProofFailure(
+			ctx,
 			`Failed to reapply delivery policy before the agent run: ${applied.reason ?? applied.policy.reason ?? "unknown error"}`,
-			resumableState(state.snapshot.state),
 		);
-		persistCurrentState();
-		updateStatus(ctx);
 	});
 	pi.on("before_provider_request", async (event, ctx) => {
 		let proofError: string | undefined;
