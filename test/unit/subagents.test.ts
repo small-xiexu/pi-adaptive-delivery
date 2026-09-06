@@ -1,477 +1,101 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, symlink } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import test from "node:test";
+import { ChildRpc, delegateReadOnly } from "../../extensions/delivery-gate/src/subagents.ts";
 
-import { resolveCurrentSubagentCapabilityCeiling } from "pi-subagents/capability-ceiling";
-import type { SubagentLaunchContract } from "pi-subagents/preflight";
-
-import {
-	SubagentBoundary,
-	pathIsInside,
-	validatePublicPreflightStability,
-	validateReadOnlyContract,
-	validateWorkerContract,
-} from "../../extensions/delivery-gate/src/subagents.ts";
-
-function contract(overrides: Record<string, unknown> = {}): SubagentLaunchContract {
-	const base = {
-		version: 2,
-		runId: "run-1",
-		agent: {
-			name: "oracle",
-			source: "builtin",
-			filePath: "<builtin:oracle>",
-			definitionProjectionVersion: 1,
-			definitionDigest: "digest",
-			shadowedCandidates: [],
-		},
-		context: "fresh",
-		modelCandidates: [],
-		systemPromptMode: "replace",
-		inheritProjectContext: true,
-		inheritGlobalContext: false,
-		inheritSkills: false,
-		skills: { requested: [], resolved: [], missing: [] },
-		tools: {
-			requestedBuiltin: ["read", "grep", "find", "ls"],
-			declaredBuiltin: ["read", "grep", "find", "ls"],
-			effectiveAllowlist: ["read", "grep", "find", "ls"],
-			explicitAllowlist: true,
-			requiredChildTools: [],
-			internalTools: [],
-			mcp: [],
-			effectiveMcpTools: [],
-			toolExtensionPaths: [],
-			runtimeExtensions: [],
-			configuredExtensions: [],
-			extensionArgs: [],
-			disableAmbientExtensions: true,
-			fanoutAuthorized: false,
-			capabilityAudit: { extensionsDenied: true },
-		},
-		roots: { cwd: "/repo" },
-		protocol: { lifecycleArtifactVersion: 1, packageVersion: "0.64.0" },
-		diagnostics: [],
-		launchContractDigest: "launch-digest",
-		digest: "contract-digest",
-	};
-	return { ...base, ...overrides } as unknown as SubagentLaunchContract;
+function fixture() {
+	const process = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+		pid: 123, kill: (_signal: string) => { process.emit("close", 0, null); return true; } });
+	const rpc = new ChildRpc(process as unknown as ChildProcessWithoutNullStreams);
+	const requests: any[] = [];
+	process.stdin.on("data", (chunk) => requests.push(JSON.parse(chunk.toString())));
+	return { rpc, process, requests, emit: (data: unknown) => process.stdout.write(`${JSON.stringify(data)}\n`) };
 }
 
-function createEventPi() {
-	const listeners = new Map<string, Set<(payload: unknown) => void>>();
-	const emitted: Array<{ event: string; payload: any }> = [];
-	const events = {
-		on(event: string, handler: (payload: unknown) => void) {
-			const set = listeners.get(event) ?? new Set();
-			set.add(handler);
-			listeners.set(event, set);
-			return () => set.delete(handler);
-		},
-		emit(event: string, payload: any) {
-			emitted.push({ event, payload });
-			for (const handler of listeners.get(event) ?? []) handler(payload);
-		},
-	};
-	return { pi: { events } as any, events, emitted };
-}
+test("严格 JSONL 保留跨 Buffer 的 UTF-8 与 Unicode 分隔符", async () => {
+	const { rpc, process, requests } = fixture();
+	const result = rpc.request<{ text: string }>({ type: "get_last_assistant_text" });
+	const text = "中文✅\u2028不分行\u2029";
+	const bytes = Buffer.from(`${JSON.stringify({ type: "response", command: "get_last_assistant_text", id: requests[0].id, success: true, data: { text } })}\n`);
+	for (const byte of bytes) process.stdout.write(Buffer.from([byte]));
+	assert.deepEqual(await result, { text });
+	process.emit("close", 0, null);
+});
 
-function installPingResponder(events: ReturnType<typeof createEventPi>["events"]): void {
-	events.on("subagents:rpc:v1:request", (payload: any) => {
-		if (payload.method !== "ping") return;
-		events.emit(`subagents:rpc:v1:reply:${payload.requestId}`, {
-			version: 1,
-			requestId: payload.requestId,
-			success: true,
-			data: { version: 1, methods: ["ping"], capabilities: { asyncSpawn: true } },
-		});
+test("无关响应不能完成当前请求，匹配响应中的失败必须抛出", async () => {
+	const { rpc, process, requests, emit } = fixture();
+	let finished = false;
+	const result = rpc.request({ type: "get_state" }).finally(() => { finished = true; });
+	emit({ type: "response", id: "unrelated", command: "get_state", success: true });
+	await Promise.resolve();
+	assert.equal(finished, false);
+	const rejection = assert.rejects(result, /拒绝/);
+	emit({ type: "response", id: requests[0].id, command: "get_state", success: false, error: "fixture" });
+	await rejection;
+	process.emit("close", 0, null);
+});
+
+for (const kind of ["malformed", "mismatch", "truncated", "exit", "error"]) {
+	test(`协议或连接异常 ${kind} 不返回成功`, async () => {
+		const { rpc, process, requests, emit } = fixture();
+		const rejection = assert.rejects(rpc.request({ type: "get_state" }));
+		if (kind === "malformed") process.stdout.write("invalid\n");
+		if (kind === "mismatch") emit({ type: "response", id: requests[0].id, command: "prompt", success: true });
+		if (kind === "truncated") { process.stdout.write('{"type":'); process.emit("close", 0, null); }
+		if (kind === "exit") process.emit("close", 3, null);
+		if (kind === "error") process.emit("error", new Error("spawn pi ENOENT"));
+		await rejection;
+		if (!rpc.exit) process.emit("close", 0, null);
 	});
 }
 
-test("applies and disposes session-scoped capability ceilings", () => {
-	const { pi } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	const sessionId = `session-${crypto.randomUUID()}`;
-	boundary.bindSession(sessionId);
-
-	boundary.applyAccess("readonly");
-	const readonly = resolveCurrentSubagentCapabilityCeiling(sessionId);
-	assert.deepEqual(readonly?.allowedAgents, ["oracle", "reviewer"]);
-	assert.equal(readonly?.denyExtensions, true);
-	assert.equal(readonly?.allowedTools?.includes("bash"), false);
-	assert.equal(readonly?.allowedTools?.includes("read"), true);
-
-	boundary.applyAccess("validation");
-	assert.deepEqual(resolveCurrentSubagentCapabilityCeiling(sessionId)?.allowedAgents, ["reviewer"]);
-
-	boundary.dispose();
-	assert.equal(resolveCurrentSubagentCapabilityCeiling(sessionId), undefined);
-});
-
-test("recognizes canonical path containment", () => {
-	assert.equal(pathIsInside("/repo", "/repo"), true);
-	assert.equal(pathIsInside("/repo", "/repo/file"), true);
-	assert.equal(pathIsInside("/repo", "/repo-other/file"), false);
-	assert.equal(pathIsInside("/repo", "/outside"), false);
-});
-
-test("keeps the public security projection stable while allowing candidate exclusions", () => {
-	const initial = contract({
-		modelCandidates: ["provider/primary:high", "provider/fallback:high"],
-	});
-	assert.deepEqual(
-		validatePublicPreflightStability(initial, contract({ modelCandidates: ["provider/fallback:high"] })),
-		{ ok: true },
-	);
-	assert.equal(
-		validatePublicPreflightStability(initial, contract({
-			modelCandidates: ["provider/primary:high", "provider/new:high"],
-		})).ok,
-		false,
-	);
-	assert.equal(
-		validatePublicPreflightStability(initial, contract({
-			modelCandidates: initial.modelCandidates,
-			tools: { ...initial.tools, effectiveAllowlist: ["read", "write"] },
-		})).ok,
-		false,
-	);
-});
-
-test("accepts only builtin fresh contracts with approved tools", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-contract-root-"));
-	const managed = await mkdtemp(path.join(os.tmpdir(), "adaptive-contract-managed-"));
-	const output = path.join(managed, "outputs", "scout.md");
-	const safe = contract({
-		roots: { cwd: root, artifactsDir: managed, outputPath: output },
-	});
-
-	assert.deepEqual(await validateReadOnlyContract(safe, "oracle", root), { ok: true });
-
-	for (const unsafe of [
-		contract({ ...safe, agent: { ...safe.agent, source: "project" } }),
-		contract({ ...safe, context: "fork" }),
-		contract({ ...safe, tools: { ...safe.tools, effectiveAllowlist: ["read", "bash"] } }),
-		contract({ ...safe, tools: { ...safe.tools, fanoutAuthorized: true } }),
-		contract({ ...safe, tools: { ...safe.tools, disableAmbientExtensions: false } }),
-		contract({ ...safe, tools: { ...safe.tools, capabilityAudit: { extensionsDenied: false } } }),
-		contract({ ...safe, tools: { ...safe.tools, effectiveMcpTools: ["mcp_write"] } }),
-	]) {
-		assert.equal((await validateReadOnlyContract(unsafe, "oracle", root)).ok, false);
-	}
-});
-
-test("rejects project, arbitrary external, and symlink-escaped output paths", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-output-root-"));
-	const managed = await mkdtemp(path.join(os.tmpdir(), "adaptive-output-managed-"));
-	const arbitrary = await mkdtemp(path.join(os.tmpdir(), "adaptive-output-arbitrary-"));
-	await mkdir(path.join(root, "docs"));
-	await symlink(arbitrary, path.join(managed, "escaped"));
-
-	const cases = [
-		contract({ roots: { cwd: root, artifactsDir: managed, outputPath: path.join(root, "report.md") } }),
-		contract({ roots: { cwd: root, artifactsDir: managed, outputPath: path.join(arbitrary, "report.md") } }),
-		contract({ roots: { cwd: root, artifactsDir: managed, outputPath: path.join(managed, "escaped", "report.md") } }),
-		contract({ roots: { cwd: root, outputPath: path.join(arbitrary, "report.md") } }),
-	];
-
-	for (const value of cases) {
-		assert.equal((await validateReadOnlyContract(value, "oracle", root)).ok, false);
-	}
-});
-
-test("accepts only the builtin fresh worker with the bounded mutation tools", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "adaptive-worker-root-"));
-	const managed = await mkdtemp(path.join(os.tmpdir(), "adaptive-worker-managed-"));
-	const safe = contract({
-		agent: {
-			...contract().agent,
-			name: "worker",
-			filePath: "<builtin:worker>",
-		},
-		tools: {
-			...contract().tools,
-			requestedBuiltin: ["read", "grep", "find", "ls", "edit", "write"],
-			declaredBuiltin: ["read", "grep", "find", "ls", "edit", "write"],
-			effectiveAllowlist: ["read", "grep", "find", "ls", "edit", "write"],
-		},
-		roots: { cwd: root, artifactsDir: managed, outputPath: path.join(managed, "worker.md") },
-	});
-
-	assert.deepEqual(await validateWorkerContract(safe, root), { ok: true });
-	for (const unsafe of [
-		contract({ ...safe, agent: { ...safe.agent, source: "project" } }),
-		contract({ ...safe, context: "fork" }),
-		contract({ ...safe, tools: { ...safe.tools, effectiveAllowlist: ["read", "edit", "write", "bash"] } }),
-		contract({ ...safe, tools: { ...safe.tools, effectiveAllowlist: ["read", "edit"] } }),
-		contract({ ...safe, tools: { ...safe.tools, capabilityAudit: { extensionsDenied: false } } }),
-	]) {
-		assert.equal((await validateWorkerContract(unsafe, root)).ok, false);
-	}
-});
-
-test("validates RPC ping and structured delegation response", async () => {
-	const agentDir = await mkdtemp(path.join(os.tmpdir(), "adaptive-delegation-agent-"));
-	const repo = await mkdtemp(path.join(os.tmpdir(), "adaptive-delegation-repo-"));
-	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-	process.env.PI_CODING_AGENT_DIR = agentDir;
-	const { pi, events } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	const sessionId = `session-${crypto.randomUUID()}`;
-	const model = {
-		id: "adaptive-test-model",
-		name: "Adaptive Test Model",
-		provider: "adaptive-test",
-		api: "openai-responses",
-		baseUrl: "http://127.0.0.1",
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 100000,
-		maxTokens: 4096,
-	};
-	const ctx = {
-		cwd: repo,
-		model,
-		modelRegistry: { getAvailable: () => [model] },
-		sessionManager: {
-			getSessionId: () => sessionId,
-			getSessionFile: () => undefined,
-			getLeafId: () => undefined,
-		},
-	} as any;
-
-	try {
-		boundary.bindSession(sessionId);
-		boundary.applyAccess("readonly");
-		installPingResponder(events);
-		const task = "Inspect code";
-		const initialContract = await boundary.preflight("oracle", task, ctx, repo);
-		const terminalContract = await boundary.preflight("oracle", task, ctx, repo, "child-run");
-		assert.equal(initialContract.launchContractDigest, terminalContract.launchContractDigest);
-		assert.equal(initialContract.roots.outputPath, undefined);
-		assert.equal(terminalContract.roots.outputPath, undefined);
-		const runtimeDigest = "b".repeat(64);
-
-		events.on("prompt-template:subagent:request", (payload: any) => {
-			events.emit("prompt-template:subagent:response", {
-				requestId: payload.requestId,
-				ownerRunId: payload.ownerRunId,
-				nodeId: payload.nodeId,
-				status: "completed",
-				runId: "child-run",
-				agent: "oracle",
-				model: terminalContract.modelCandidates[0],
-				thinking: terminalContract.thinking,
-				launchContractDigest: runtimeDigest,
-				result: { kind: "text", text: "read-only result" },
-			});
-		});
-
-		const result = await boundary.delegate("oracle", task, ctx, initialContract, repo);
-		assert.deepEqual(result, {
-			text: "read-only result",
-			runId: "child-run",
-			launchContractDigest: runtimeDigest,
-			preflightLaunchContractDigest: initialContract.launchContractDigest,
-		});
-	} finally {
-		boundary.dispose();
-		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-	}
-});
-
-test("requires exact run and launch proof for a controlled worker terminal response", async () => {
-	const successHarness = createEventPi();
-	installPingResponder(successHarness.events);
-	const boundary = new SubagentBoundary(successHarness.pi);
-	const runIds: string[] = [];
-	const workerContract = contract({
-		agent: { ...contract().agent, name: "worker", filePath: "<builtin:worker>" },
-		modelCandidates: ["adaptive-test/worker-model:high"],
-		thinking: "high",
-		launchContractDigest: "a".repeat(64),
-	});
-	const runtimeDigest = "b".repeat(64);
-	successHarness.events.on("prompt-template:subagent:request", (payload: any) => {
-		successHarness.events.emit("prompt-template:subagent:update", {
-			requestId: payload.requestId,
-			ownerRunId: payload.ownerRunId,
-			nodeId: payload.nodeId,
-			runId: "worker-run",
-			currentTool: "edit",
-		});
-		successHarness.events.emit("prompt-template:subagent:response", {
-			requestId: payload.requestId,
-			ownerRunId: payload.ownerRunId,
-			nodeId: payload.nodeId,
-			status: "completed",
-			runId: "worker-run",
-			agent: "worker",
-			model: workerContract.modelCandidates[0],
-			thinking: workerContract.thinking,
-			launchContractDigest: runtimeDigest,
-			result: { kind: "text", text: "implemented" },
-		});
-	});
-	const result = await boundary.delegateWorker(
-		"Implement approved scope",
-		{ cwd: "/repo", sessionManager: { getSessionId: () => "session" } } as any,
-		workerContract,
-		{ onRunId: (runId) => runIds.push(runId) },
-	);
-	assert.equal(result.status, "completed");
-	assert.equal(result.runId, "worker-run");
-	assert.equal(result.text, "implemented");
-	assert.equal(result.launchContractDigest, runtimeDigest);
-	assert.equal(result.preflightLaunchContractDigest, workerContract.launchContractDigest);
-	assert.deepEqual(runIds, ["worker-run"]);
-
-	const missingProofHarness = createEventPi();
-	installPingResponder(missingProofHarness.events);
-	const missingProofBoundary = new SubagentBoundary(missingProofHarness.pi);
-	missingProofHarness.events.on("prompt-template:subagent:request", (payload: any) => {
-		missingProofHarness.events.emit("prompt-template:subagent:response", {
-			requestId: payload.requestId,
-			ownerRunId: payload.ownerRunId,
-			nodeId: payload.nodeId,
-			status: "failed",
-			runId: "worker-run",
-			agent: "worker",
-			model: workerContract.modelCandidates[0],
-			thinking: workerContract.thinking,
-			error: "worker failed",
-		});
-	});
-	await assert.rejects(
-		missingProofBoundary.delegateWorker(
-			"Implement approved scope",
-			{ cwd: "/repo", sessionManager: { getSessionId: () => "session" } } as any,
-			workerContract,
-		),
-		/runtime launch contract digest is missing or malformed/,
-	);
-});
-
-test("fails closed for duplicate or failed delegation responses", async () => {
-	for (const status of ["duplicate_node", "failed"] as const) {
-		const { pi, events } = createEventPi();
-		const boundary = new SubagentBoundary(pi);
-		installPingResponder(events);
-		events.on("prompt-template:subagent:request", (payload: any) => {
-			events.emit("prompt-template:subagent:response", {
-				requestId: payload.requestId,
-				ownerRunId: payload.ownerRunId,
-				nodeId: payload.nodeId,
-				status,
-				error: `${status} error`,
-			});
-		});
-
-		await assert.rejects(
-			boundary.delegate(
-				"oracle",
-				"Inspect",
-				{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-				contract(),
-				process.cwd(),
-			),
-			new RegExp(`${status} error`),
-		);
-	}
-});
-
-test("rejects a completed read-only response without the preflight digest", async () => {
-	const { pi, events } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	installPingResponder(events);
-	events.on("prompt-template:subagent:request", (payload: any) => {
-		events.emit("prompt-template:subagent:response", {
-			requestId: payload.requestId,
-			ownerRunId: payload.ownerRunId,
-			nodeId: payload.nodeId,
-			status: "completed",
-			runId: "child-run",
-			result: { kind: "text", text: "unsafe result" },
-		});
-	});
-	await assert.rejects(
-		boundary.delegate(
-			"oracle",
-			"Inspect",
-			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-			contract({ launchContractDigest: "a".repeat(64) }),
-			process.cwd(),
-		),
-		/digest is missing/,
-	);
-});
-
-test("aborts and times out delegation with an exact cancellation identity", async () => {
-	const abortedHarness = createEventPi();
-	installPingResponder(abortedHarness.events);
-	const abortedBoundary = new SubagentBoundary(abortedHarness.pi);
+test("取消中断等待；收尾按 clear_queue→abort，并等待真实 close", async () => {
+	const { rpc, process, requests, emit } = fixture();
 	const controller = new AbortController();
-	controller.abort();
-	await assert.rejects(
-		abortedBoundary.delegate(
-			"oracle",
-			"Inspect",
-			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-			contract(),
-			process.cwd(),
-			controller.signal,
-		),
-		/aborted/,
-	);
-	assert.equal(
-		abortedHarness.emitted.some((entry) => entry.event === "prompt-template:subagent:cancel"),
-		true,
-	);
-
-	const timeoutHarness = createEventPi();
-	installPingResponder(timeoutHarness.events);
-	const timeoutBoundary = new SubagentBoundary(timeoutHarness.pi);
-	await assert.rejects(
-		timeoutBoundary.delegate(
-			"oracle",
-			"Inspect",
-			{ cwd: process.cwd(), sessionManager: { getSessionId: () => "session" } } as any,
-			contract(),
-			process.cwd(),
-			undefined,
-			5,
-		),
-		/timed out/,
-	);
-	assert.equal(
-		timeoutHarness.emitted.some((entry) => entry.event === "prompt-template:subagent:cancel"),
-		true,
-	);
-});
-
-test("ping fails closed when no runtime owner answers", async () => {
-	const { pi } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	await assert.rejects(boundary.ping(5), /did not answer/);
-});
-
-test("ping fails before delegation when multiple runtime owners answer", async () => {
-	const { pi, events } = createEventPi();
-	const boundary = new SubagentBoundary(pi);
-	events.on("subagents:rpc:v1:request", (payload: any) => {
-		if (payload.method !== "ping") return;
-		for (let index = 0; index < 2; index += 1) {
-			events.emit(`subagents:rpc:v1:reply:${payload.requestId}`, {
-				version: 1,
-				requestId: payload.requestId,
-				success: true,
-				data: { version: 1, methods: ["ping"] },
-			});
-		}
+	const waiting = assert.rejects(rpc.waitSettled(controller.signal), /fixture cancel/);
+	controller.abort(new Error("fixture cancel"));
+	await waiting;
+	process.stdin.on("data", (chunk) => {
+		const request = JSON.parse(chunk.toString());
+		emit({ type: "response", id: request.id, command: request.type, success: true });
 	});
-	await assert.rejects(boundary.ping(100), /多个 pi-subagents runtime owner/);
+	const exit = await rpc.stop();
+	assert.deepEqual(requests.map((request) => request.type), ["clear_queue", "abort"]);
+	assert.deepEqual(exit, { code: 0, signal: null });
+});
+
+test("取消和无只读能力在启动进程前拒绝", async () => {
+	const controller = new AbortController();
+	const input = { id: "test", task: "read", cwd: "/not-used", entryPath: "/not-used", parentSessionId: "parent",
+		model: { provider: "fake", id: "fake" }, thinking: "off", tools: [], projectTrusted: false };
+	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}), /没有已启用/);
+	controller.abort(new Error("fixture before launch"));
+	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}), /fixture before launch/);
+});
+
+test("内部命令来源不符时不能执行，即使名字相同", async () => {
+	const { rpc, process, requests, emit } = fixture();
+	process.stdin.on("data", (chunk) => {
+		const request = JSON.parse(chunk.toString());
+		emit({ type: "response", id: request.id, command: request.type, success: true,
+			data: { commands: [{ name: "delivery-child-ready", sourceInfo: { path: "/foreign.ts" } }] } });
+	});
+	await assert.rejects(rpc.control("delivery-child-ready", "/owned.ts"), /实现来源未核实/);
+	assert.deepEqual(requests.map((request) => request.type), ["get_commands"]);
+	process.emit("close", 0, null);
+});
+
+test("正常关闭使用来源已核实的控制命令并等待 close，不靠发送信号宣称完成", async () => {
+	const { rpc, process, requests, emit } = fixture();
+	process.kill = () => { throw new Error("不应发送信号"); };
+	process.stdin.on("data", (chunk) => {
+		const request = JSON.parse(chunk.toString());
+		emit({ type: "response", id: request.id, command: request.type, success: true,
+			data: { commands: [{ name: "delivery-child-stop", sourceInfo: { path: "/owned.ts" } }] } });
+		if (request.type === "prompt") queueMicrotask(() => process.emit("close", 0, null));
+	});
+	assert.deepEqual(await rpc.stop("/owned.ts"), { code: 0, signal: null });
+	assert.deepEqual(requests.map((request) => request.type), ["clear_queue", "abort", "get_commands", "prompt"]);
 });

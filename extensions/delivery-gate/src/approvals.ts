@@ -1,189 +1,157 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
+import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { resolveWorkspaceIdentity } from "./workspace.ts";
 
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+export const APPROVAL_TOOL = "delivery_approval";
+export const PROPOSAL_ENTRY = "delivery-approval-proposal";
+export const APPROVAL_ENTRY = "delivery-approval";
 
-export const APPROVAL_RECORD_VERSION = 1 as const;
-export const APPROVAL_KINDS = ["solution", "plan", "combined"] as const;
-export type ApprovalKind = (typeof APPROVAL_KINDS)[number];
+const parameters = Type.Object({
+	stage: StringEnum(["documents", "design", "implementation"] as const),
+	body: Type.String({ minLength: 1, description: "本任务待确认的完整正文，不是全文台账或摘要 ID。实施阶段应包含计划、验证方式与停止条件。" }),
+	paths: Type.Array(Type.String({ minLength: 1 }), { description: "documents 为确切 Markdown 路径；design 为空；implementation 为允许修改的文件或目录。路径按 cwd 解析，不是 glob。" }),
+	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
+}, { additionalProperties: false });
 
-export interface ApprovalRecord {
-	version: typeof APPROVAL_RECORD_VERSION;
-	kind: ApprovalKind;
-	sessionId: string;
-	entryId: string;
-	contentDigest: string;
-	branchAnchorEntryId: string;
-	canonicalCwd: string;
-	gitRoot?: string;
-	approvedAt: string;
-}
-
-export interface ApprovalMessageEntry {
-	type: "message";
+type Request = Static<typeof parameters>;
+interface Proposal {
 	id: string;
-	message: {
-		role: string;
-		content: unknown;
-	};
-}
-
-export interface ApprovalTarget {
 	sessionId: string;
-	entry: ApprovalMessageEntry;
-	branchAnchorEntryId: string;
-	canonicalCwd: string;
-	gitRoot?: string;
+	workspaceKey: string;
+	cwd: string;
+	stage: Request["stage"];
+	body: string;
+	paths: string[];
+	validationCommands: string[];
+	designApprovalId?: string;
 }
-
-export interface ApprovalValidationContext {
+interface Approval {
+	id: string;
+	proposalId: string;
 	sessionId: string;
-	branch: readonly unknown[];
-	canonicalCwd: string;
-	gitRoot?: string;
+	workspaceKey: string;
+	source: { mode: "tui"; interaction: "select"; toolCallId: string };
 }
 
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.sort()
-		.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
+const titles = { documents: "规划文档编辑授权", design: "方案确认", implementation: "实施确认" };
+const permissions = {
+	documents: "仅授权列明的 Markdown 文档编辑，不包含源码修改或实施批准。",
+	design: "只确认方案；已有文档授权范围内可编制计划，不包含实施批准。",
+	implementation: "仅授权列明范围内的本地开发、自检、验证、审查与返工。提交、推送、PR、发布、部署、生产及其他外部写入不在本次授权内。",
+};
+
+function presentation(proposal: Proposal): string {
+	return `${titles[proposal.stage]} [${proposal.id}]\n工作目录：${JSON.stringify(proposal.cwd)}\n\n${proposal.body}\n\n`
+		+ `操作边界：${permissions[proposal.stage]}\n路径：${JSON.stringify(proposal.paths)}\n验收命令：${JSON.stringify(proposal.validationCommands)}`
+		+ (proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : "")
+		+ "\n当前版本仅记录批准，所有文件写入仍关闭。";
 }
 
-export function digestApprovalContent(content: unknown): string {
-	return createHash("sha256").update(canonicalJson(content)).digest("hex");
+// 只读取 Pi 的原生文件。内存条目即使可见，也不能证明 appendEntry 已经落盘。
+async function persisted<T>(ctx: ExtensionContext, customType: string, id: string): Promise<CustomEntry<T>> {
+	const file = ctx.sessionManager.getSessionFile();
+	if (!file) throw new Error("当前 Session 不持久化，不能记录批准");
+	const content = await readFile(file, "utf8");
+	if (!content.endsWith("\n")) throw new Error("Session 记录不完整，批准不可用");
+	const rows = content.trimEnd().split("\n").map((line) => JSON.parse(line));
+	if (rows[0]?.type !== "session" || rows[0]?.id !== ctx.sessionManager.getSessionId()) throw new Error("Session 文件归属不符");
+	const matches = rows.filter((row) => row.type === "custom" && row.customType === customType && row.data?.id === id);
+	if (matches.length !== 1) throw new Error("批准相关条目未唯一落盘");
+	const entry = matches[0] as CustomEntry<T>;
+	const original = ctx.sessionManager.getBranch().find((row) => row.id === entry.id);
+	if (!original) throw new Error("批准相关条目不在当前分支");
+	if (!isDeepStrictEqual(original, entry)) throw new Error("批准记录已变化或未完整落盘");
+	return entry;
 }
 
-export function isApprovalKind(value: unknown): value is ApprovalKind {
-	return typeof value === "string" && (APPROVAL_KINDS as readonly string[]).includes(value);
-}
-
-export function findLatestAssistantEntry(branch: readonly unknown[]): ApprovalMessageEntry | undefined {
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const entry = branch[index];
-		if (!entry || typeof entry !== "object") continue;
-		const candidate = entry as Record<string, unknown>;
-		if (candidate.type !== "message" || typeof candidate.id !== "string") continue;
-		if (!candidate.message || typeof candidate.message !== "object") continue;
-		const message = candidate.message as Record<string, unknown>;
-		if (message.role !== "assistant") continue;
-		return candidate as unknown as ApprovalMessageEntry;
-	}
-	return undefined;
-}
-
-export function createApprovalRecord(
-	kind: ApprovalKind,
-	target: ApprovalTarget,
-	now: Date = new Date(),
-): ApprovalRecord {
-	if (target.entry.message.role !== "assistant") {
-		throw new Error("Approval target must be an assistant message");
-	}
-	if (!target.sessionId || !target.entry.id || !target.branchAnchorEntryId || !target.canonicalCwd) {
-		throw new Error("Approval target identity is incomplete");
-	}
-
-	return {
-		version: APPROVAL_RECORD_VERSION,
-		kind,
-		sessionId: target.sessionId,
-		entryId: target.entry.id,
-		contentDigest: digestApprovalContent(target.entry.message.content),
-		branchAnchorEntryId: target.branchAnchorEntryId,
-		canonicalCwd: target.canonicalCwd,
-		...(target.gitRoot ? { gitRoot: target.gitRoot } : {}),
-		approvedAt: now.toISOString(),
+export function installApprovals(pi: ExtensionAPI): void {
+	// 只记住本次运行亲自完成的方案确认引用；不从模型、摘要或旧 Session 恢复批准。
+	let design: Approval | undefined;
+	let pending: AbortController | undefined;
+	const invalidate = () => {
+		design = undefined;
+		pending?.abort(new Error("会话发生切换、重载或分支导航，批准请求已失效"));
 	};
-}
-
-function requiredString(record: Record<string, unknown>, key: string): string | undefined {
-	const value = record[key];
-	return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-export function parseApprovalRecord(value: unknown): ApprovalRecord | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const input = value as Record<string, unknown>;
-	if (input.version !== APPROVAL_RECORD_VERSION || !isApprovalKind(input.kind)) return undefined;
-	const sessionId = requiredString(input, "sessionId");
-	const entryId = requiredString(input, "entryId");
-	const contentDigest = requiredString(input, "contentDigest");
-	const branchAnchorEntryId = requiredString(input, "branchAnchorEntryId");
-	const canonicalCwd = requiredString(input, "canonicalCwd");
-	const approvedAt = requiredString(input, "approvedAt");
-	const gitRoot = input.gitRoot === undefined ? undefined : requiredString(input, "gitRoot");
-	if (
-		!sessionId ||
-		!entryId ||
-		!contentDigest ||
-		!branchAnchorEntryId ||
-		!canonicalCwd ||
-		!approvedAt ||
-		Number.isNaN(Date.parse(approvedAt)) ||
-		(input.gitRoot !== undefined && !gitRoot)
-	) {
-		return undefined;
-	}
-	if (!/^[a-f0-9]{64}$/.test(contentDigest)) return undefined;
-
-	return {
-		version: APPROVAL_RECORD_VERSION,
-		kind: input.kind,
-		sessionId,
-		entryId,
-		contentDigest,
-		branchAnchorEntryId,
-		canonicalCwd,
-		...(gitRoot ? { gitRoot } : {}),
-		approvedAt,
-	};
-}
-
-export function validateApprovalRecord(
-	record: ApprovalRecord,
-	context: ApprovalValidationContext,
-): { ok: true } | { ok: false; reason: string } {
-	if (record.sessionId !== context.sessionId) return { ok: false, reason: "Approval session does not match" };
-	if (record.canonicalCwd !== context.canonicalCwd) return { ok: false, reason: "Approval cwd does not match" };
-	if ((record.gitRoot ?? undefined) !== (context.gitRoot ?? undefined)) {
-		return { ok: false, reason: "Approval Git root does not match" };
-	}
-
-	const ids = new Set<string>();
-	let target: ApprovalMessageEntry | undefined;
-	for (const entry of context.branch) {
-		if (!entry || typeof entry !== "object") continue;
-		const candidate = entry as Record<string, unknown>;
-		if (typeof candidate.id === "string") ids.add(candidate.id);
-		if (candidate.id === record.entryId && candidate.type === "message") {
-			const message = candidate.message;
-			if (message && typeof message === "object" && (message as Record<string, unknown>).role === "assistant") {
-				target = candidate as unknown as ApprovalMessageEntry;
+	pi.on("session_start", invalidate);
+	pi.on("session_shutdown", invalidate);
+	pi.on("session_tree", invalidate);
+	pi.registerEntryRenderer<Proposal>(PROPOSAL_ENTRY, (entry) => new Text(presentation(entry.data!), 0, 0));
+	pi.registerTool({
+		name: APPROVAL_TOOL, label: "请求交付批准",
+		description: "在父 Pi 的真实 TUI 中请求规划文档编辑授权、方案确认或实施确认。只在用户已准备确认时调用；两次阶段确认分开。模型提供的正文和字段不是批准，RPC/JSON/print 不接受批准。当前只记录原生 Session 证据，不开放文件写入。",
+		parameters,
+		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
+			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("批准只接受父 Pi 的真实 TUI 交互；当前模式不接受批准");
+			if (pending) throw new Error("已有批准请求等待处理，不并发显示第二个请求");
+			const controller = new AbortController();
+			pending = controller;
+			const operation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+			try {
+				operation.throwIfAborted();
+				const sessionId = ctx.sessionManager.getSessionId();
+				const cwd = ctx.cwd;
+				const workspace = await resolveWorkspaceIdentity(cwd);
+				const paths = request.paths.map((value) => path.resolve(workspace.cwdPath, value));
+				if (!request.body.trim() || request.paths.some((value) => !value.trim()) || request.validationCommands.some((value) => !value.trim())) {
+					throw new Error("批准正文、路径或验收命令不能为空白");
+				}
+				if (paths.some((value) => { const relative = path.relative(workspace.workspacePath, value); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); })) {
+					throw new Error("批准路径必须在当前 worktree 内");
+				}
+				if (request.stage === "design" ? paths.length > 0 : paths.length === 0) throw new Error("方案确认不授予路径权限；文档与实施授权必须列明路径");
+				if (request.stage === "documents" && paths.some((value) => path.extname(value).toLowerCase() !== ".md")) throw new Error("规划文档授权只接受确切 Markdown 路径");
+				if (request.stage !== "implementation" && request.validationCommands.length) throw new Error("本阶段不授予命令执行权限");
+				let approvedDesign: Proposal | undefined;
+				if (request.stage === "implementation") {
+					if (!design || design.sessionId !== sessionId || design.workspaceKey !== workspace.key) throw new Error("当前会话与工作区尚无可信方案确认，不能请求实施确认");
+					const entry = await persisted<Approval>(ctx, APPROVAL_ENTRY, design.id);
+					if (!isDeepStrictEqual(entry.data, design)) throw new Error("方案批准记录已变化");
+					approvedDesign = (await persisted<Proposal>(ctx, PROPOSAL_ENTRY, design.proposalId)).data;
+					if (!approvedDesign || approvedDesign.stage !== "design" || approvedDesign.sessionId !== sessionId || approvedDesign.workspaceKey !== workspace.key) throw new Error("方案批准正文归属不符");
+				}
+				const proposal: Proposal = { id: randomUUID(), sessionId, workspaceKey: workspace.key, cwd: workspace.cwdPath,
+					stage: request.stage, body: request.body, paths, validationCommands: [...request.validationCommands],
+					...(approvedDesign ? { designApprovalId: design!.id } : {}) };
+				const current = () => {
+					operation.throwIfAborted();
+					if (ctx.sessionManager.getSessionId() !== sessionId || ctx.cwd !== cwd) throw new Error("确认期间会话或目录已变化");
+				};
+				current();
+				// 实施确认重新展示已批准的方案正文；不用活动文档内容替换原批准依据。
+				if (approvedDesign) ctx.ui.notify(presentation(approvedDesign), "info");
+				pi.appendEntry(PROPOSAL_ENTRY, proposal);
+				const displayed = await persisted<Proposal>(ctx, PROPOSAL_ENTRY, proposal.id);
+				if (!isDeepStrictEqual(displayed.data, proposal)) throw new Error("展示正文与持久记录不一致");
+				current();
+				const accept = `确认${titles[request.stage]}`;
+				const choice = await ctx.ui.select(`${titles[request.stage]} [${proposal.id}]`, ["暂不批准", accept], { signal: operation });
+				current();
+				if (choice !== accept) return { content: [{ type: "text", text: "本次未批准，权限未扩大；暂停推进，不自动重复请求批准。" }], details: { approved: false }, terminate: true };
+				// 用户等待期间正文可能被外部改动；确认的是刚才展示的正文，不是后来替换的文件。
+				await persisted(ctx, PROPOSAL_ENTRY, proposal.id);
+				if (approvedDesign) {
+					await persisted(ctx, APPROVAL_ENTRY, proposal.designApprovalId!);
+					await persisted(ctx, PROPOSAL_ENTRY, approvedDesign.id);
+				}
+				current();
+				const approval: Approval = { id: randomUUID(), proposalId: proposal.id, sessionId, workspaceKey: workspace.key,
+					source: { mode: "tui", interaction: "select", toolCallId } };
+				pi.appendEntry(APPROVAL_ENTRY, approval);
+				const saved = await persisted<Approval>(ctx, APPROVAL_ENTRY, approval.id);
+				if (!isDeepStrictEqual(saved.data, approval)) throw new Error("确认记录与持久记录不一致");
+				current();
+				if (request.stage === "design") design = approval;
+				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。当前版本仍不开放文件写入。` }],
+					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
+			} finally {
+				pending = undefined;
 			}
-		}
-	}
-
-	if (!ids.has(record.branchAnchorEntryId)) return { ok: false, reason: "Approval branch anchor is absent" };
-	if (!target) return { ok: false, reason: "Approved assistant entry is absent" };
-	if (digestApprovalContent(target.message.content) !== record.contentDigest) {
-		return { ok: false, reason: "Approved assistant entry content changed" };
-	}
-
-	return { ok: true };
-}
-
-export interface PrivilegeConfirmationRequest {
-	title: string;
-	message: string;
-}
-
-export async function requireTuiUserConfirmation(
-	ctx: Pick<ExtensionCommandContext, "mode" | "ui">,
-	request: PrivilegeConfirmationRequest,
-): Promise<boolean> {
-	if (ctx.mode !== "tui") return false;
-	return ctx.ui.confirm(request.title, request.message);
+		},
+	});
 }

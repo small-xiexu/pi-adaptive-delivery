@@ -16,7 +16,7 @@
 
 - 同一个 cwd/worktree 同时只允许一个 writer。
 - 保持 Package 最小，不实现第二套计划系统、子 Agent runtime、CI 或发布系统。
-- 只使用 Pi 和 `pi-subagents` 的公开 API，不导入其内部路径。
+- 只使用标准 Pi 的公开 API，不导入其内部路径，不依赖、包装或调用 `pi-subagents`。
 - 权限、路径、批准来源、lease 和恢复判断失败时默认关闭权限。
 - 测试默认禁网，使用临时目录和 fake provider，不读取用户凭证或调用真实模型。
 - 不修改与当前任务无关的用户文件和本地 IDE 元数据。

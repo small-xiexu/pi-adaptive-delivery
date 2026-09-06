@@ -1,463 +1,54 @@
 # Pi Adaptive Delivery
 
-一个安装到 [Pi](https://pi.dev) 的开发交付 Package。它先和你对齐“最终要做成什么样”，得到明确批准后再写代码，并按风险完成真实验证、必要的独立审查和交付收口。
+基于标准 Pi 的轻量交付编排，不依赖或包装 `pi-subagents`。
 
-你只需要说明需求、检查方案并做必要批准，不需要自己组织多个 Agent、复制审查提示词或记住后续命令。
+**当前处于重构中，不是完整可用版本。** 新入口开放原生只读工具、受控只读委派及父 TUI 的分阶段批准记录；文档写入、开发委派、验证返工与恢复仍按实施计划建设。批准正向交互目前只有模拟 TUI 单测，真实用户操作仍待验收。中间版本只在隔离实例验证，不安装到用户全局或真实项目。
 
-> 当前版本为 `0.1.0` 私有开发版。请先在受信任的测试 Git 仓库中验收，不要用于无人值守开发、生产操作或自动发布。
+## 目标流程
 
-## 最终效果
+需求澄清与持续讨论 → 方案确认 → 详细计划 → 实施确认 → 按需委派、验证与独立审查 → 范围内返工 → 可验证节点记账 → 交付。
 
-Standard/High-Risk 任务按下面的顺序完成：
+- 父 Pi 负责业务判断、证据裁决和唯一 Markdown 进度台账。
+- Prompt 与 Skill 提供协作方法，不代替真实用户批准。
+- 窄 Extension 管理批准、权限、单 writer、有限委派与必要记录。
+- 标准 Pi 负责模型、工具、资源加载、Session、历史、压缩和中止。
+- 独立 Agent 用于质疑和取证，不是固定团队或提速配额。
 
-```text
-你用一句话提出需求
-  -> Package 读取用户规则、项目 AGENTS.md、代码、测试和计划
-  -> 用大白话说明最终效果、范围、非目标和验收方式
-  -> 你批准技术方案
-  -> Package 立即创建按需求命名的技术方案文档
-  -> Package 自动生成实施计划
-  -> 你批准实施计划
-  -> Package 创建按需求命名的实施计划文档
-  -> 单 writer 实现
-  -> 运行已批准的真实验证命令
-  -> fresh reviewer 检查当前 candidate
-  -> 必要时批量返工并做一次 closure review
-  -> 交付并报告残余风险和未执行动作
-```
+## 当前入口
 
-Package 不会自动 commit、push、创建 PR、发布 npm、部署或操作生产环境。这些动作始终需要单独授权。
+`/delivery-status` 查看能力与工作区。`/delivery-shape`、`/delivery-plan`、`/delivery-run` 是轻量协作提示；当前只读限制不会因提示或模型声明而解除。
 
-真正的 Tiny 修改使用更短但仍由 runtime 强制的路径：
+父模型可使用 `delivery_readonly` 委派一次独立只读分析。父 Extension 管理标准 `pi --mode rpc` 子进程，只开放父会话已启用的原生 `read/grep/find/ls`；子角色不注册父协调工具，不递归委派。结果从正常关闭后的原生 Session 读取并附记录路径，仍须父会话判断证据，不能当作项目完成。
 
-```text
-读取必要事实 -> 精确 scope + focused validation 摘要 -> 一次 TUI 批准
-  -> clean baseline -> parent single writer + lease -> exact-scope 实现
-  -> candidate freeze -> runtime validation -> DELIVERED
-```
+用户准备确认时，父模型可通过 `delivery_approval` 分别请求规划文档编辑授权、方案确认和实施确认。正文、路径及操作边界显示在 Pi 原生记录中，由父 TUI 的用户单独选择；确认记录引用当次正文。没有本轮可信方案确认时不能请求实施确认；RPC、JSON、print、子模型或一句“已批准”不能替代该交互。即使记录成功，当前版本的文件写权限也不会开放。
 
-Tiny 不创建需求级技术方案/实施计划 Markdown，不启动 worker/reviewer，也不做 progress sync；authorization、exact scope、baseline、lease、candidate digest、validation evidence binding 和 stale detection 不会省略。
+正文和确认必须真正写入 Session；无持久 Session 或记录失败不报告成功。当前不会从旧记录自动恢复批准，重载、换会话或分支导航后保持关闭；完整恢复待 P5。`paths` 目前只是明确记录的授权范围，真实路径、工具行为与 writer 检查仍待 P2.3 接入，不能当作已生效的写权限。
 
-## 安装
+P2.2 已补充内部文档变更底层及定向单测，复用 Pi 原生编辑并检查明确 Markdown 路径与已有父 writer；尚未连接可信批准和正式入口，也未完成 writer 生命周期验收。因此当前仍不能通过本 Package 编辑文档。
 
-安装前先运行 `pi list`。本 Package 已内置并加载唯一的 `pi-subagents` runtime；若用户或项目设置中已经单独启用了 `npm:pi-subagents`，应先移除该独立 Package，再安装 Adaptive Delivery。两份 runtime 同时存在时，Package 会在启动 child 前明确阻止，不会继续产生子 Agent 费用。
+本阶段不承诺任意插件或父临时运行态重建，需要交互的子任务会被拒绝并暂停。缺 Pi、缺只读能力、协议错误、取消或持久结果缺失不报告成功；开发写权限始终关闭。门禁约束模型工具及 RPC bash，不是对插件自身代码的操作系统沙箱。完整环境、外部进程清理与恢复边界仍待后续阶段验收。
 
-### 推荐：只安装到一个项目
+旧命令、机器契约、Session 和制品不提供兼容、迁移或回退。不要在运行中的旧任务上切换版本。图表显示复用 Pi，不附带第二套渲染系统。
 
-进入目标 Git 项目：
+## 开发验证
 
-```bash
-cd /path/to/your-project
+当前真实 Pi 证据覆盖 macOS、Node `25.2.1`、Pi `0.85.1`。其他平台和版本未验收；开发依赖类型基线不等于运行兼容认证。
 
-pi install -l git:github.com/small-xiexu/pi-adaptive-delivery
-```
+已有离线依赖时：
 
-本地开发 Package 时使用绝对路径：
-
-```bash
-pi install -l /absolute/path/to/pi-adaptive-delivery
-```
-
-项目级安装会创建 `.pi/settings.json`，只影响当前项目。`.pi/npm/.gitignore` 用于避免提交下载的 npm 依赖。
-
-如果 `pi-subagents` 已作为全局 Package 启用，项目级过滤不能保证卸载 project-trust 阶段已经启动的全局 Extension。此时应先在隔离的 `PI_CODING_AGENT_DIR` 测试，或把全局独立 `pi-subagents` 迁移为全局 Adaptive Delivery，不能让两个 owner 共存。
-
-### 安装到所有 Pi 项目
-
-```bash
-pi install git:github.com/small-xiexu/pi-adaptive-delivery
-```
-
-全局安装后，每个 Git 项目都会从只读 `IDLE` 开始；修改任务需要经过 Adaptive Delivery 批准流程。
-
-安装或更新后重启 Pi。使用本地路径开发 Package 时，也可以在没有活动写入的安全状态执行 `/reload`。首次加载项目级资源时，按 Pi 提示确认 project trust。
-
-## 第一次使用
-
-在目标项目启动 Pi：
-
-```bash
-pi
-```
-
-确认 Package 已加载：
-
-```text
-/delivery-status
-```
-
-预期看到：
-
-```text
-状态：空闲 [IDLE]
-```
-
-然后用一句话提出修改需求，例如：
-
-```text
-/delivery-shape 修复订单重复扣款，并补充对应测试。
-```
-
-只有明确输入 `/delivery-shape` 才会启动交付状态。普通问答、项目梳理、状态盘点、诊断和代码评审保持 `IDLE`，不会因为模型误判而调用 `delivery_begin`。
-
-对于已经有计划的项目，也可以写：
-
-```text
-/delivery-shape 继续 P6.1 后端集中服务拆分，选择下一个最小且可独立验证的切片。
-```
-
-不需要在命令里重复项目规则、测试命令和安全限制。Package 应自行读取项目事实；存在真正的产品或范围歧义时，只问一个关键问题。
-
-方案和计划阶段会先搜索定位，再读取必要切片。父 Pi 的单次 `read` 最多 500 行、同一次 agent run 累计最多 5000 行；达到上限后必须使用搜索结果成案或明确说明缺少的关键事实，不能靠反复整篇读取拖长流程。该限制不影响唯一 worker、fresh reviewer 或已批准固定验证。
-
-### 方案追问
-
-Package 已把“方案追问”内置到 `adaptive-delivery`，不依赖额外的 `grilling` Skill。它会先查项目；只有存在会改变最终效果、范围、共享接口、数据、安全、费用或不可逆行为的选择时，才一次问你一个问题，并给出推荐答案和不同选择的实际影响。你可以只回复：
-
-```text
-按推荐
-```
-
-所有关键选择确认后，Package 会立即停止提问并生成方案。满足严格低风险、exact-scope、clean-baseline 和确定性 focused validation 条件的 Tiny 默认不追问，只给出简短 Delivery Contract；任一条件不能证明就升级 Standard/High-Risk。
-
-需要主动把方案问透时，可以直接在需求后补一句：
-
-```text
-/delivery-shape <需求>，请开启方案追问
-```
-
-实现偏好、命名、未来扩展以及能从代码和文档查明的内容不会拿来反复询问你。
-
-### 技术方案图表
-
-技术方案遇到多步骤流程、跨模块调用、状态变化、模块关系、数据流或高风险信任边界时，会按需生成 Mermaid 流程图、时序图或状态图等。极小单步骤需求不会为了形式强制画图；中大型任务通常使用最有帮助的 1 至 3 张，高风险任务必须画清适用的关键路径。
-
-复杂流程不会全部塞进一张大图。Package 会让父 Pi 按阶段拆成 2 至 3 张图，每张只说明一个主要问题，并使用简短节点文字，避免 TUI 为了显示完整画布把文字缩得过小。图片可以占用可滚动的终端高度，不要求同屏看完整张图。
-
-你不需要执行额外命令。Package 会保留技术方案中的标准 Mermaid 源码，并在 assistant 回合结束后自动展示：
-
-- Kitty、iTerm2、Ghostty、WezTerm、Warp：显示本地生成的高密度 PNG，使用当前终端全部可用宽度并保持原始比例；长图通过终端滚动查看。
-- 不支持图片协议的终端：显示 Unicode 字符图。
-- 不支持的图形或渲染失败：显示中文原因和原始源码。
-
-当前保证六类图：流程图、时序图、状态图、类图、ER 图和 XY 图。渲染完全在本机内存中完成，不使用 `mmdc`/Chromium，不上传源码，也不写入目标 Git 工作区。原始 Mermaid 仍会写入需求技术方案 Markdown，因此 GitHub 或支持 Mermaid 的 IDE 也可以继续渲染。
-
-## 你需要做的批准
-
-### 标准任务
-
-技术方案出现后，先检查 AI 对最终效果、范围和文档名称的理解。正确时执行：
-
-```text
-/delivery-approve-solution
-```
-
-Package 会在对话区显示批准摘要，立即把已批准技术方案写入项目，然后自动生成实施计划。计划正确时执行：
-
-```text
-/delivery-approve-plan
-```
-
-随后 Package 会创建实施计划文档并开始实现，不需要再输入 `/delivery-run`。
-
-### Tiny 任务
-
-Package 会显示 exact change scope、明确非目标和 focused validation。确认后只需执行：
-
-```text
-/delivery-approve-plan
-```
-
-### 不应批准的情况
-
-遇到以下情况先用自然语言纠正，不要执行 approve：
-
-- AI 说的最终效果不是你想要的。
-- 增加了你没有要求的功能、兼容层或重构。
-- 把项目明确禁止的 Provider、生产、费用或发布操作纳入计划。
-- 技术方案和实施计划使用了不同的需求名称或文档路径。
-- 验收标准不能直接判断成功与失败。
-- 项目已有唯一台账，但 AI 又创建了重复进度系统。
-
-需求、范围、架构或验收需要重新讨论时使用：
-
-```text
-/delivery-revise
-```
-
-只调整实施顺序或施工计划时使用：
-
-```text
-/delivery-revise plan
-```
-
-## 需求级规划文档
-
-Planning contract 不等于 project documentation。Tiny 的 contract 保存在当前 Session/runtime state，不创建需求级规划 Markdown；本节其余规则只适用于 Standard/High-Risk。
-
-Package 先服从当前用户要求、目标项目最近的 `AGENTS.md` 与文档路由、用户全局规则；Package 默认只在前面没有约定时补空白。
-
-已有总技术方案或总计划默认只作为背景事实，不因为文件存在就继续堆入每个新需求。没有其他规则时创建：
-
-```text
-docs/<需求短名称>-技术方案.md
-docs/<需求短名称>-实施计划.md
-```
-
-例如：
-
-```text
-docs/避免重复扣款-技术方案.md
-docs/避免重复扣款-实施计划.md
-```
-
-需求短名称描述稳定的用户目标，不使用日期、`final-v2`、代码行号或可能变化的实现细节。
-
-路径会在技术方案批准时冻结，实施计划不能静默改名。Standard/High-Risk 首次批准 solution 后，Extension 先以 create-only 方式创建技术方案；首次批准 plan 后只创建实施计划：
-
-- 首次创建不覆盖已有同名文件；修订只覆盖 runtime evidence 仍匹配的 Package 文档。
-- 拒绝绝对路径、`..`、symlink、非 Markdown 和同一目标。
-- 技术方案批准后立即落盘，但不开放源码写入；两份文档都成功后才进入实现。
-- 项目实施计划同时作为本任务的 progress target。
-
-TUI 和项目文档只显示正常方案正文。内部 marker 和 JSON contract 保留在 Session 原始消息中用于批准、恢复和校验，但默认不会显示给用户。
-
-当前版本不会合并或覆盖无法证明来源的需求文档。执行 `/delivery-revise` 时，Package 保留已落盘技术方案和实施计划的路径、摘要及文件/父目录身份；重新批准后，只有现场仍与 Package 上次同步 evidence 完全一致时，才通过同目录临时文件和原子替换更新。替换前会持久化同时绑定完整旧态和新态的 revision intent；若在 rename 或目录同步附近中断，恢复只接受其中一个完整状态。人工改过、同内容替换、身份漂移或 symlink 边界变化时保持只读并拒绝覆盖。旧规划文档 evidence 不做隐式迁移，需要显式处理旧文档或选择新路径后重新进入流程。
-
-## Package 自动完成什么
-
-批准实施计划后，正常情况下无需继续输入命令：
-
-1. 复验已批准技术方案文档并创建实施计划文档。
-2. 获取当前 Git worktree 的唯一 writer lease。
-3. Tiny 由父 Pi 在 exact scope 内直接实现；Standard/High-Risk 默认由一个受控 foreground worker 实现，兼容的 plan-v2 `single` 路径仍保留父 Pi 实现。worker 不持有 shell，也不得修改已批准的 solution、plan 或任何 progress target；Package 在 worker terminal 后、repair 前复验这些受保护制品，批准 repair 完成后、candidate freeze 前再复验一次。计划中可选的、明确批准的 formatter/generator 修复命令由 Delivery Gate 只在首次复验通过后执行。
-4. 冻结包含 HEAD、staged、tracked、untracked、submodule 和批准记录的 candidate digest。
-5. 由 Delivery Gate 通过 Pi 的公开命令 API 顺序执行批准的验证命令。
-6. Standard/High-Risk 使用 fresh reviewer 检查 runtime 提供的同一 candidate actual diff，并把结果绑定 candidate/diff digest；Tiny 默认省略。
-7. 把 accepted P0/P1 转成可验证关闭义务并批量返工。
-8. 复验后只做一次 closure review。
-9. Standard/High-Risk 在 writer-free 边界同步唯一进度台账；Tiny 不注册 progress target。progress target 必须是 Git root 内 canonical project-relative 非保留路径；`.git`、`.pi`、`node_modules`、绝对路径和非规范化路径不允许。同步使用当前 exact 非空文本：目标已唯一包含 `newText` 时按幂等成功处理；`oldText` 在写前缺失或不唯一时保持原阶段并允许重读后重试，不做模糊合并或删除。身份、路径、取消/超时、写后检查或 lease/策略证明失败仍进入 `BLOCKED`。
-10. 全部证据仍对应当前 candidate 时进入 `DELIVERED`。
-
-P2、推测性意见和与当前修改无关的历史问题只进入最终 notes，不会无限触发 review/fix。
-
-这些内部工具按阶段和任务路由出现，不会一次全部显示给 AI。`delivery_begin` 只在 `IDLE` 可见；`single` 实现阶段给父 Pi 代码修改和“提交候选”；`standard/high-risk` 只给父 Pi `delivery_delegate_worker`，父 Pi 看不到 `edit/write`，worker 成功结束且可选批准修复命令通过后自动冻结候选。随后才切换为验证、审查、返工和完成工具。AI 不确定时会调用只读的 `delivery_runtime_status` 查看当前阶段与开发方式。
-
-固定验证开始后不需要查询状态。`delivery_validate` 会保持当前工具调用，临时隐藏 TUI 默认高频 spinner，以 30 秒低频 heartbeat 显示“正在执行哪条批准命令”和已经完成的结果；全部结束后恢复 TUI working 状态并返回逐命令摘要。若 Pi 在终态保存前 reload 或验证工具被中断，Package 会保持只读并要求确认没有遗留命令后重试，不会把未知结果当成通过。
-
-## 状态和下一步
-
-| 看到的状态 | 含义 | 用户通常要做什么 |
-|---|---|---|
-| `空闲 [IDLE]` | 尚未开始任务 | 运行 `/delivery-shape` |
-| `方案梳理中 [SHAPING]` | 正在只读理解需求 | 等待方案，必要时纠正 |
-| `技术方案待确认` | 等待方向批准 | 检查后运行 `/delivery-approve-solution` |
-| `实施计划编制中 [PLANNING]` | 正在生成具体步骤 | 等待计划 |
-| `实施计划待确认` | 等待施工计划批准 | 检查后运行 `/delivery-approve-plan` |
-| `开发中 [IMPLEMENTING]` | 已授权并正在实现 | 通常无需操作 |
-| `验证中 [VALIDATING]` | 正在验证或 review | 通常无需操作 |
-| `返工中 [REWORKING]` | 正在关闭 accepted P0/P1 | 通常无需操作 |
-| `已阻塞 [BLOCKED]` | 有前置条件无法证明 | 运行 `/delivery-status` 查看原因 |
-| `已交付 [DELIVERED]` | 当前候选已通过门禁 | 做用户验收，另行决定是否提交或发布 |
-| `已取消 [CANCELLED]` | 当前流程已结束 | 新任务使用新 Session |
-
-`/delivery-status` 会用中文显示恢复状态、写入者、候选版本、验证、审查、规划文档和进度同步。worker 运行期间，状态栏和状态命令还会显示当前工具、已运行时间、工具调用数及最近一条有界输出；这些内容只用于当前进程展示，不作为批准或恢复证据。`当前有效` 表示证据仍对应当前工作区，`已过期` 表示工作区已经变化，`不可证明` 表示当前无法确认。路径、digest、运行 ID 和 `[STATE]` 会保留原始诊断值。
-
-## 常见恢复
-
-### 自动生成计划或自动开始实现失败
-
-TUI 会明确显示应手工运行的命令：
-
-```text
-/delivery-plan
-```
-
-或：
-
-```text
-/delivery-run
-```
-
-手工运行不会重新批准，也不会扩大权限。
-
-### 流程进入 BLOCKED
-
-先查看原因：
-
-```text
-/delivery-status
-```
-
-解决显示的条件后再执行：
-
-```text
-/delivery-resume
-```
-
-resume 会重新校验批准、cwd、Git root、适用的规划文档或 Tiny baseline/scope、lease、candidate 和 evidence；不能证明时继续保持只读。
-
-临时 `BLOCKED` 会保留已经批准的方案、计划、两份规划文档、candidate 和已有验证证据，只释放当前 writer lease；因此解决运行时问题后通常可以直接 resume，不需要重新批准，也不会因为 create-only 文档已经存在而卡住。只有需求、范围、架构或计划确实要重做时，才使用 `/delivery-revise` 撤销相应批准。
-
-用户在 TUI 确认 resume 且状态、lease、candidate/evidence 和策略全部恢复成功后，Package 会自动继续当前阶段：恢复到 `PLANNING` 时生成实施计划，恢复到 `IMPLEMENTING`、`REWORKING` 或 `VALIDATING` 时继续 `/delivery-run`。热恢复后仍为 `starting/running` 的 worker 没有可证明终态时会保留 lease 并继续 `BLOCKED`，不能直接 resume；需要先证明终态或由用户确认 force-release。如果自动发送失败，恢复本身仍然有效，界面会明确提示手工运行对应命令。
-
-### 更新后旧 Session 报 plan contract malformed
-
-当前 plan contract 是 v2，旧 v1 Session 不能自动升级。确认没有任务仍在执行后：
-
-```text
-/delivery-force-release-lease
-/delivery-cancel
-/new
-```
-
-然后重新运行 `/delivery-shape`。force-release 会显示 workspace 和 owner，并要求真实 TUI 确认。
-
-### 取消任务
-
-```text
-/delivery-cancel
-```
-
-取消不会回退已经产生的项目改动，但会关闭当前交付权限。新任务应使用新 Session。
-
-## 命令参考
-
-| 命令 | 作用 |
-|---|---|
-| `/delivery-shape <需求>` | 只读理解需求并形成技术方案 |
-| `/delivery-approve-solution` | TUI 批准技术方案，成功后自动生成计划 |
-| `/delivery-approve-plan` | TUI 批准计划，文档同步后自动开始实现 |
-| `/delivery-status` | 查看状态、证据、阻塞原因和下一步 |
-| `/delivery-revise [plan]` | 撤销批准并返回方案或计划阶段 |
-| `/delivery-resume` | TUI 确认后恢复 BLOCKED 流程并自动继续当前阶段 |
-| `/delivery-force-release-lease` | TUI 确认后强制释放 workspace lease |
-| `/delivery-cancel` | 取消当前流程并锁定只读 |
-| `/delivery-plan` | 自动续跑失败时手工生成计划 |
-| `/delivery-run` | 自动续跑失败时手工开始实现 |
-
-approve、resume 和 force-release 只接受真实 TUI 用户确认。RPC、JSON、print、Extension 注入消息和 child 请求不能独立授予权限。
-
-## 支持与安全边界
-
-当前自动验证基线：
-
-- Pi `0.84.4`
-- Node.js `>=22.19.0`
-- bundled `pi-subagents 0.64.0`
-- macOS
-- 受信任的单 Git 仓库或 managed worktree
-
-Linux 使用相同 Node/POSIX 原语，但在有 Linux CI 证据前仍标记为待验证。Windows 的 `O_NOFOLLOW`、realpath 和 lease 文件语义尚未验证。
-
-Package 不支持：
-
-- 非 Git 工作区
-- 无人值守批准
-- 多仓库原子交付
-- 自动 commit、push、PR、npm publish 或部署
-- 自动训练或自主修改 Package
-- 操作系统级沙箱
-
-Package 和 Extension 以当前用户权限运行。writer lease 只约束加载兼容 Package 的受控 Pi 流程，不能阻止外部编辑器、未加载 Package 的进程或恶意同进程 Extension。公开 structured delegation API 只提供工具名能力上限，不提供 child 路径级预写入拦截；因此 Package 通过明确 worker 契约和 terminal 后第一边界复验保护 planning/progress 制品，发现漂移即不形成 candidate并只读阻塞。candidate digest 用于发现变化，不证明代码一定正确。不可信仓库或 unattended automation 仍需容器、VM 或其他操作系统级隔离。
-
-Pi 的 active-tools 用于让模型看到当前阶段应使用的工具，但不是唯一授权边界。Package 还会在每次 `tool_call` 真正执行前拒绝最后一次成功阶段策略集合外的任意工具；内置 `edit/write` 继续执行实时 approval、lease、route 和 scope 校验。Standard/High-Risk 的 worker 路由中，即使工具因 Provider 或后加载 Extension 短暂出现，父 Pi 也不能据此修改项目或启动命令。
-
-真实 Provider、费用、生产数据、数据库迁移、发布和不可逆操作继续服从用户与项目自己的授权规则。
-
-## Agent 与模型
-
-Package 内部固定携带并加载 `pi-subagents 0.64.0` 作为唯一子 Agent runtime owner，并暴露同版本的 builtin Agents、Skill 和 Prompt。不要再单独安装或启用另一份 `pi-subagents`；检测到多个 owner 时，Package 会在启动 child 前失败并提示清理，不产生子 Agent 费用。
-
-Package 使用稳定角色：
-
-- `scout`：bundled runtime 的通用角色；当前 Adaptive Delivery 流程不向模型暴露，普通取证由父 Pi 直接完成
-- `oracle`：高风险方案挑战
-- `worker`：standard/high-risk 的唯一写入者；父 Pi 在这些路径只编排
-- `reviewer`：fresh-context 独立审查
-- Delivery Gate 验证器：只执行已批准计划中的固定命令，并记录逐命令终态
-
-Package 不硬编码 Provider 或模型。角色模型由用户级 `subagents.agentOverrides` 或现有 profile 配置；使用 `/subagents-models` 检查实际解析结果。
-
-为 worker 和 reviewer 配置至少一个 fallback，避免单个 Provider/模型的临时故障阻塞实现或独立审查：
-
-```json
-{
-  "subagents": {
-    "agentOverrides": {
-      "worker": {
-        "model": "provider/implementation-model",
-        "fallbackModels": ["provider/backup-implementation-model"]
-      },
-      "reviewer": {
-        "model": "provider/strong-review-model",
-        "fallbackModels": ["provider/backup-review-model"]
-      }
-    }
-  }
-}
-```
-
-普通方案梳理由父 Pi 直接使用只读工具完成，不为提速启动 scout。Package 会在实施计划批准前做只读 preflight；没有任何可用 reviewer candidate 时，已经批准并同步的技术方案会保留，但不会创建实施计划、获取实施阶段 writer lease 或进入实现，因为后续 fresh review 无法完成。固定验证本身不再启动 reviewer 或依赖模型：`delivery_validate` 只执行已批准命令，并在当前工具卡显示当前命令、退出码和耗时。命令失败只表示批准验证未通过；父 Pi 必须再判断原因是候选代码、验证环境还是计划错误，不能一律修改源码。
-
-实施计划为每条验证固定 `timeoutMs`。长全量测试、构建和容器命令应使用同机器、同环境、同范围的最近耗时并留足余量；没有可比证据时使用保守值。若宿主 timeout 不能终止容器或其他外部后代进程，批准命令自身还必须提供可终止边界；非用户中断且 runtime 看到 `killed=true` 时按超时失败处理，即使外部进程稍后返回退出码 0。
-
-模型临时排除由 bundled `pi-subagents` runtime 管理。其默认 TTL 可在 `~/.pi/agent/extensions/subagent/config.json` 调整，例如把单次瞬时错误的冷却设为 5 分钟：
-
-```json
-{
-  "modelExclusions": {
-    "defaultTtlMs": 300000
-  }
-}
-```
-
-短 TTL 与 fallback 配合使用：短冷却避免立即重试风暴，fallback 保证仍有模型可以继续。Package 不自动改写这份用户级配置。
-
-内部枚举和协议保持英文，面向用户的状态、断点、下一步、证据和恢复提示使用中文。Pi 或 Provider 自身返回的底层错误可能保留原始诊断详情。
-
-## 卸载
-
-项目级安装先进入对应项目，再使用 `pi list` 确认精确 source，然后执行：
-
-```bash
-pi remove -l git:github.com/small-xiexu/pi-adaptive-delivery
-```
-
-本地路径安装使用 `pi list` 找到原绝对路径 source 后移除。全局安装去掉 `-l`。
-
-卸载 Adaptive Delivery 后如需继续单独使用 `pi-subagents`，再显式安装所需的固定版本；不要在 Adaptive Delivery 仍启用时并行安装。
-
-卸载不会自动删除 Session custom entries、已经创建的需求文档或可能保留的 writer lease。卸载前先用 `/delivery-status` 确认没有活动 writer；未知 lease 应完成恢复或由用户确认 force-release。
-
-## 维护者参考
-
-内部协议当前为：
-
-- `adaptive-delivery-documents` v1：需求短名称、solution/plan 路径和选择来源
-- `adaptive-delivery-plan` v2：规划文档路由、风险分类、验证命令、可选批准修复命令和 progress target/check
-- `adaptive-delivery-tiny` v1：Tiny intent、non-goals、exact scope、validation 和风险否决声明
-- `adaptive-delivery-review` v1：绑定 candidate/diff digest 的 reviewer verdict 和 findings
-- Planning document evidence v2：同步时文件/父目录身份和内容摘要
-- Delivery runtime state v1
-- Candidate manifest v3
-- Writer lease v1
-
-Planning document evidence v1 不包含文件及父目录身份，当前版本恢复时会失败关闭并要求重新进入流程，不提供隐式迁移。
-
-开发验证：
-
-```bash
-npm install
+```sh
 npm run typecheck
 npm run test:all
-npm pack --dry-run
-npm audit --omit=dev
+git diff --check
 ```
 
-默认测试使用临时 Git 仓库、隔离 `PI_CODING_AGENT_DIR` 和本地 fake provider，不读取用户凭证或连接真实模型。
+测试入口使用系统禁网、临时 Git、临时 HOME/agent dir、空凭证与 fake provider。仅仓库源码/依赖及必要祖先元数据可从真实 HOME 读取；其他内容和临时根外写入被拒绝。未提供有效系统隔离时失败退出，不静默跳过。
 
-## 设计文档
+不要读取真实 `.npmrc`、凭据或加载用户插件。依赖操作必须离线、禁止安装脚本；缓存不足时暂停，不自行联网。测试制品保留在输出的临时目录中。fake provider 只证明机制，不证明真实模型质量。
 
-- [技术方案](./docs/技术方案.md)
-- [实施计划](./docs/实施计划.md)
+## 事实源
+
+- [技术方案](docs/技术方案.md)
+- [实施计划](docs/实施计划.md)：第 13.3 节为唯一当前实施台账，旧计数不是新实现验收证据。
+
+未经单独授权，不提交、推送、发布或部署。
