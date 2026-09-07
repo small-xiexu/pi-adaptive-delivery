@@ -1,13 +1,14 @@
 import { constants } from "node:fs";
 import { access, lstat, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { createEditTool, createWriteTool, type EditToolInput, type WriteToolInput } from "@earendil-works/pi-coding-agent";
-import { type WorkspaceIdentity, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
+import { type WorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
 
 interface DocumentScope {
 	workspace: WorkspaceIdentity;
 	paths: readonly string[];
-	sessionId: string;
+	owner: WriterLeaseOwner;
 	lease: WriterLeaseReference;
 	leases: WriterLeaseManager;
 	authorize: () => Promise<void>;
@@ -20,32 +21,43 @@ function within(root: string, target: string): boolean {
 }
 
 // 内部执行底层，不是批准入口。调用方须提供已核实的文档授权并负责 lease 的完整生命周期。
-export function createPlanningDocumentTools(scope: DocumentScope) {
+export function createPlanningDocumentTools(scope: DocumentScope, protectedPaths: readonly string[] = []) {
+	return createFileTools(scope, "parent", protectedPaths);
+}
+
+export function createDevelopmentFileTools(scope: DocumentScope, protectedPaths: readonly string[]) {
+	return createFileTools(scope, "child", protectedPaths);
+}
+
+function createFileTools(scope: DocumentScope, kind: "parent" | "child", protectedPaths: readonly string[]) {
 	const { workspacePath: root, cwdPath: cwd, key } = scope.workspace;
-	const { sessionId, leases, authorize, signal: approvalSignal } = scope;
+	const { leases, authorize, signal: approvalSignal } = scope;
+	const owner = structuredClone(scope.owner);
 	const lease = { ...scope.lease };
-	const allowed = new Set(scope.paths.map((value) => path.resolve(cwd, value)));
+	const allowed = scope.paths.map((value) => path.resolve(cwd, value));
+	const protectedTargets = [path.join(root, ".git"), ...protectedPaths.map((value) => path.resolve(cwd, value))];
 	let cleanupFailed = false;
 
 	async function close(handle: FileHandle): Promise<void> {
 		try { await handle.close(); } catch (error) { cleanupFailed = true; throw error; }
 	}
 
-	async function requireParent(): Promise<void> {
+	async function requireWriter(): Promise<void> {
 		const current = await leases.read(key);
 		if (cleanupFailed) throw new Error("文档句柄清理失败，停止后续变更并保留 writer");
 		if (!current || lease.workspaceKey !== key || current.leaseId !== lease.leaseId
-			|| current.workspace.workspacePath !== root || current.owner.kind !== "parent"
-			|| current.owner.sessionId !== sessionId || current.owner.pid !== process.pid
-			|| current.owner.processToken !== leases.processToken) {
-			throw new Error("当前会话未持有该 worktree 的父 writer，文档操作未获准");
+			|| current.workspace.workspacePath !== root || owner.kind !== kind || !isDeepStrictEqual(current.owner, owner)
+			|| owner.pid !== process.pid || owner.processToken !== leases.processToken) {
+			throw new Error(`当前会话未持有该 worktree 的${kind === "parent" ? "父" : "子"} writer，文件操作未获准`);
 		}
 	}
 
 	async function checkPath(target: string): Promise<void> {
-		if (!within(root, cwd) || !within(root, target) || !allowed.has(target) || path.extname(target).toLowerCase() !== ".md") {
-			throw new Error("目标不在明确的 Markdown 文档范围内");
+		if (!within(root, cwd) || !within(root, target)
+			|| !(kind === "parent" ? allowed.includes(target) && path.extname(target).toLowerCase() === ".md" : allowed.some((entry) => within(entry, target)))) {
+			throw new Error(kind === "parent" ? "目标不在明确的 Markdown 文档范围内" : "目标不在已授权的开发路径内");
 		}
+		if (protectedTargets.some((entry) => within(entry, target) || within(target, entry))) throw new Error("不能修改规划文档、执行记录或 Git 元数据等受保护路径");
 		if (await realpath(root) !== root) throw new Error("worktree 根目录已发生路径替换");
 		const parts = path.relative(root, target).split(path.sep);
 		let cursor = root;
@@ -64,27 +76,27 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 		}
 	}
 
-	async function execute(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput, callerSignal?: AbortSignal) {
+	async function execute(operation: "edit" | "write", id: string, input: EditToolInput | WriteToolInput, callerSignal?: AbortSignal) {
 		const signal = callerSignal ? AbortSignal.any([callerSignal, approvalSignal]) : approvalSignal;
 		signal.throwIfAborted();
 		// 与 Pi 的 @file 输入习惯一致；向原生工具传固定绝对路径，避免二次解析改变目标。
 		const target = path.resolve(cwd, input.path.startsWith("@") ? input.path.slice(1) : input.path);
 		await checkPath(target);
 		await authorize();
-		await requireParent();
+		await requireWriter();
 		signal.throwIfAborted();
 
 		const writeFile = async (_file: string, content: string) => {
 			await checkPath(target);
 			await authorize();
-			await requireParent();
+			await requireWriter();
 			signal.throwIfAborted();
-			const handle = await open(target, constants.O_WRONLY | constants.O_NOFOLLOW | (kind === "write" ? constants.O_CREAT : 0), 0o666);
+			const handle = await open(target, constants.O_WRONLY | constants.O_NOFOLLOW | (operation === "write" ? constants.O_CREAT : 0), 0o666);
 			try {
 				const info = await handle.stat();
 				if (!info.isFile() || info.nlink !== 1) throw new Error("文档写入目标不是独立普通文件");
 				await authorize();
-				await requireParent();
+				await requireWriter();
 				signal.throwIfAborted();
 				await handle.truncate(0);
 				signal.throwIfAborted();
@@ -94,7 +106,7 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 				await close(handle);
 			}
 		};
-		if (kind === "edit") {
+		if (operation === "edit") {
 			const native = createEditTool(cwd, { operations: {
 				access: () => access(target, constants.R_OK | constants.W_OK),
 				readFile: async () => {
@@ -109,7 +121,7 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 			mkdir: async (directory) => {
 				await checkPath(target);
 				await authorize();
-				await requireParent();
+				await requireWriter();
 				signal.throwIfAborted();
 				await mkdir(directory, { recursive: true });
 			},

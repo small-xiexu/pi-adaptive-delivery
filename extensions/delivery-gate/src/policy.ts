@@ -1,8 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DELEGATE_TOOL } from "./subagents.ts";
 import { APPROVAL_TOOL } from "./approvals.ts";
+import { DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./parent-writer.ts";
+import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
 
-export const READ_ONLY_NOTICE = "当前交付编排处于重构中的只读阶段；父 TUI 可记录交付批准，但文档写入、开发写入与恢复尚未开放。";
+export const CAPABILITY_NOTICE = "当前支持原生只读、父 TUI 批准的文档编辑与受控子开发、明确批准的本地容器命令、固定候选验收及独立只读审查。宿主 Shell 关闭，旧权限和证据不自动恢复；真实用户 TUI 及完整交付效果仍待验收。";
 const NATIVE_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">): string[] {
@@ -11,26 +13,28 @@ export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActi
 		&& tools.get(name)?.sourceInfo.source === "builtin");
 }
 
-export function installReadOnlyPolicy(pi: ExtensionAPI, coordinatorPath?: string): void {
-	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [DELEGATE_TOOL, APPROVAL_TOOL].includes(name)
+export function installPolicy(pi: ExtensionAPI, coordinatorPath?: string, developerPath?: string): void {
+	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL].includes(name)
 		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === coordinatorPath);
+	const developerAllowed = (name: string) => developerPath !== undefined && ["edit", "write", "bash"].includes(name)
+		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === developerPath);
 	pi.on("session_start", () => {
 		const tools = allowedReadTools(pi);
-		tools.push(...pi.getActiveTools().filter(coordinatorAllowed));
+		tools.push(...pi.getActiveTools().filter((name) => coordinatorAllowed(name) || developerAllowed(name)));
 		pi.setActiveTools(tools);
 	});
 	// active-tools 只减少模型看到的工具，不作为权限保证；实际调用时重新核实实现来源。
 	pi.on("tool_call", (event) => {
 		try {
-			if (coordinatorAllowed(event.toolName)) return undefined;
+			if (coordinatorAllowed(event.toolName) || developerAllowed(event.toolName)) return undefined;
 			if (allowedReadTools(pi).includes(event.toolName)) return undefined;
 		} catch (error) {
 			return { block: true, reason: `无法核实工具权限，未执行：${String(error)}` };
 		}
-		return { block: true, reason: `${READ_ONLY_NOTICE} 工具 ${event.toolName} 不在当前已验证的原生只读能力内，未执行。` };
+		return { block: true, reason: `${CAPABILITY_NOTICE} 工具 ${event.toolName} 不在当前已验证的原生只读或父协调能力内，未执行。` };
 	});
 	// 原生 !/!! 及 RPC bash 也不能绕开本阶段的关闭状态。
 	pi.on("user_bash", () => ({
-		result: { output: `${READ_ONLY_NOTICE} Shell 未执行。`, exitCode: 1, cancelled: false, truncated: false },
+		result: { output: `${CAPABILITY_NOTICE} Shell 未执行。`, exitCode: 1, cancelled: false, truncated: false },
 	}));
 }

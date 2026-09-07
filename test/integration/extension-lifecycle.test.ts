@@ -38,16 +38,24 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		assert.equal(tool.isError, !success, JSON.stringify(tool.result));
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.type === "custom" && entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
-		assert.ok(ended, "原生父会话应记录委派引用与结果");
-		assert.equal(ended.parentSessionId, parent.sessionId);
-		assert.equal(ended.status === "completed", success);
-		if (scenario === "missing-pi") assert.match(ended.error, /ENOENT/);
+		if (scenario === "missing-pi") {
+			assert.equal(ended, undefined, "启动前拒绝不能伪造子进程终态");
+			const result = entries.findLast((entry: any) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "delivery_readonly");
+			assert.equal(result?.message.isError, true);
+			assert.match(JSON.stringify(result.message.content), /没有可用的已安装标准 Pi CLI/);
+			assert.ok(!entries.some((entry: any) => entry.customType === "delivery-delegation"));
+		} else {
+			assert.ok(ended, "原生父会话应记录实际委派引用与结果");
+			assert.equal(ended.parentSessionId, parent.sessionId);
+			assert.equal(ended.status === "completed", success);
+		}
 		if (scenario === "missing-tools") assert.match(ended.error, /需要 read.*实际 \[\]/);
 		if (scenario === "crash") assert.equal(ended.status, "unknown");
-		if (ended.pid) assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
+		if (ended?.pid) assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
 		const events = await audit(fixture.agentDir);
 		const childStart = events.find((event) => event.child && event.phase === "start");
-		if (scenario !== "missing-pi") {
+		if (scenario === "missing-pi") assert.equal(childStart, undefined);
+		else {
 			assert.ok(childStart);
 			assert.ok(!childStart.tools.includes("delivery_readonly"));
 			assert.ok(!childStart.tools.includes("delivery_approval"));

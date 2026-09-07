@@ -1,8 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { access, readFile, realpath, stat } from "node:fs/promises";
+import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { truncateHead, type RpcCommand, type RpcSessionState, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { truncateHead, type BuildSystemPromptOptions, type ExtensionContext, type RpcCommand, type RpcExtensionUIResponse, type RpcSessionState, type SessionEntry, type ToolInfo } from "@earendil-works/pi-coding-agent";
+import { resolveWorkspaceIdentity } from "./workspace.ts";
 
 export const CHILD_ENV = "PI_ADAPTIVE_DELIVERY_CHILD";
 export const DELEGATE_TOOL = "delivery_readonly";
@@ -14,7 +17,34 @@ export const DELEGATION_ENTRY = "delivery-delegation";
 type Packet = { type: string; [key: string]: any };
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
 
-// 仅服务下方的一次只读委派：不实现模型循环、后台调度或完整 RPC 客户端。
+export interface ReadOnlyEnvironment {
+	tools: { name: string; digest: string }[];
+	instructions: string;
+	rules: string;
+	skills: string;
+}
+
+// 只核对 Pi 已加载的基础输入，不重新发现资源，也不将规则正文复制到握手记录。
+export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, tools: ToolInfo[]): ReadOnlyEnvironment {
+	const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	return {
+		tools: tools.map((tool) => ({ name: tool.name, digest: digest(tool) })).sort((a, b) => a.name.localeCompare(b.name)),
+		instructions: digest([options.customPrompt ?? null, options.appendSystemPrompt ?? null]),
+		rules: digest(options.contextFiles ?? []),
+		skills: digest(options.skills ?? []),
+	};
+}
+
+export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?: ReadOnlyEnvironment): void {
+	if (JSON.stringify(expected.tools) !== JSON.stringify(actual?.tools)) {
+		throw new Error(`只读工具定义或来源未对齐：需要 ${expected.tools.map((tool) => tool.name).join(",")}；实际 ${JSON.stringify(actual?.tools)}。未发送任务`);
+	}
+	if (expected.instructions !== actual?.instructions) throw new Error("基础指令未对齐；请按配置提供子任务所需指令。未发送任务");
+	if (expected.rules !== actual?.rules) throw new Error("项目或全局规则未对齐；请核对配置与已加载内容。未发送任务");
+	if (expected.skills !== actual?.skills) throw new Error("Skills 目录、来源或描述未对齐；请按配置提供子任务所需 Skill。未发送任务");
+}
+
+// 仅服务一次前台委派：不实现模型循环、后台调度或完整 RPC 客户端。
 export class ChildRpc {
 	readonly closed: Promise<Exit>;
 	exit?: Exit;
@@ -127,16 +157,17 @@ export class ChildRpc {
 		});
 	}
 
-	denyDialog(id: string): void {
-		this.process.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id, cancelled: true })}\n`);
+	respondDialog(response: RpcExtensionUIResponse): void {
+		if (this.failure || this.exit) throw this.failure ?? new Error("子 Pi 已关闭，不能发送交互回复");
+		this.process.stdin.write(`${JSON.stringify(response)}\n`);
 	}
 
-	async control(name: string, entryPath: string, signal?: AbortSignal): Promise<void> {
+	async control(name: string, entryPath: string, signal?: AbortSignal, args = ""): Promise<void> {
 		const { commands } = await this.request<{ commands: { name: string; sourceInfo: { path?: string } }[] }>({ type: "get_commands" }, signal);
 		if (!commands.some((command) => command.name === name && command.sourceInfo?.path === entryPath)) {
 			throw new Error(`子 Pi 内部命令 ${name} 的实现来源未核实，未执行`);
 		}
-		await this.request({ type: "prompt", message: `/${name}` }, signal);
+		await this.request({ type: "prompt", message: `/${name}${args ? ` ${args}` : ""}` }, signal);
 	}
 
 	async stop(entryPath?: string): Promise<Exit> {
@@ -173,7 +204,80 @@ export class ChildRpc {
 	}
 }
 
-interface ReadOnlyTask {
+type DialogContext = Pick<ExtensionContext, "mode" | "ui" | "abort">;
+
+// 一次委派只承接一个普通问题，不转发批准、父编辑器或其他持久 UI 状态。
+export function createChildDialogs(rpc: ChildRpc, ctx: DialogContext, signal: AbortSignal, interrupt: AbortController) {
+	let pending: Promise<void> | undefined;
+	let dialog: AbortController | undefined;
+	let closed = false;
+	let failure: unknown;
+	const pause = (error: unknown) => {
+		failure ??= error;
+		interrupt.abort(error);
+		if (ctx.mode === "tui") {
+			try { ctx.abort(); }
+			catch (abortError) { failure = new AggregateError([failure, abortError], "子交互失败且父中止失败"); }
+		}
+	};
+	const cancel = (id: string) => {
+		if (!rpc.exit && !rpc.failure) rpc.respondDialog({ type: "extension_ui_response", id, cancelled: true });
+	};
+	return {
+		handle(event: Packet) {
+			if (pending && ["tool_execution_end", "agent_settled"].includes(event.type)) {
+				pause(new Error("子交互尚未回答但原任务已结束，丢弃回答并暂停"));
+				dialog?.abort(failure);
+			}
+			if (event.type !== "extension_ui_request" || !["select", "confirm", "input", "editor"].includes(event.method)) return;
+			if (typeof event.id !== "string" || !event.id) throw new Error("子交互缺少关联 ID");
+			if (closed || signal.aborted || pending) {
+				pause(new Error("子交互已关闭或出现并发请求，未接受新回答"));
+				dialog?.abort(failure);
+				cancel(event.id);
+				return;
+			}
+			const controller = dialog = new AbortController();
+			pending = Promise.resolve().then(async () => {
+				try {
+					if (ctx.mode !== "tui" || event.method === "editor") throw new Error(`子任务需要 ${event.method} 交互；只支持父 TUI 的普通选择、确认和输入，已暂停`);
+					if (typeof event.title !== "string" || event.timeout !== undefined && (!Number.isInteger(event.timeout) || event.timeout <= 0 || event.timeout > 2_147_483_647)) throw new Error("子交互标题或超时参数无效");
+					const waiting = AbortSignal.any([signal, controller.signal, ...(event.timeout ? [AbortSignal.timeout(event.timeout)] : [])]);
+					waiting.throwIfAborted();
+					const title = `子任务 PID ${rpc.process.pid}：普通询问，不授予交付权限\n${event.title}`;
+					let value: string | boolean | undefined;
+					if (event.method === "select") {
+						if (!Array.isArray(event.options) || !event.options.length || !event.options.every((item: unknown) => typeof item === "string")) throw new Error("子交互选项无效");
+						value = await ctx.ui.select(title, [...event.options], { signal: waiting, timeout: event.timeout });
+						if (value !== undefined && !event.options.includes(value)) throw new Error("子交互回答不在本次选项内");
+					} else if (event.method === "confirm") {
+						if (typeof event.message !== "string") throw new Error("子交互确认正文无效");
+						value = await ctx.ui.confirm(title, event.message, { signal: waiting, timeout: event.timeout });
+					} else {
+						if (event.placeholder !== undefined && typeof event.placeholder !== "string") throw new Error("子交互输入提示无效");
+						value = await ctx.ui.input(title, event.placeholder, { signal: waiting, timeout: event.timeout });
+					}
+					waiting.throwIfAborted();
+					if (value === undefined || value === false) throw new Error("用户取消或拒绝子问题，已暂停当前任务");
+					rpc.respondDialog(event.method === "confirm" ? { type: "extension_ui_response", id: event.id, confirmed: value === true }
+						: { type: "extension_ui_response", id: event.id, value: value as string });
+				} catch (error) {
+					pause(error);
+					try { cancel(event.id); }
+					catch (responseError) { failure = new AggregateError([failure, responseError], "子交互失败且取消回复失败"); }
+				} finally { pending = undefined; dialog = undefined; }
+			});
+		},
+		async close() {
+			closed = true;
+			dialog?.abort(new Error("子任务正在收尾，丢弃未决交互"));
+			await pending;
+			if (failure) throw failure;
+		},
+	};
+}
+
+export interface ChildTask {
 	id: string;
 	task: string;
 	cwd: string;
@@ -181,25 +285,74 @@ interface ReadOnlyTask {
 	parentSessionId: string;
 	model: { provider: string; id: string };
 	thinking: string;
-	tools: string[];
+	environment: ReadOnlyEnvironment;
 	projectTrusted: boolean;
 }
 
+export async function startChild(input: ChildTask, kind: "readonly" | "development"): Promise<ChildRpc> {
+	const tools = input.environment.tools.map((tool) => tool.name);
+	if (!tools.length) throw new Error("没有已启用的原生只读工具，未启动子 Pi");
+	if (kind === "development") tools.push("edit", "write", "bash");
+	const { workspacePath } = await resolveWorkspaceIdentity(input.cwd);
+	const outside = (file: string) => {
+		const relative = path.relative(workspacePath, file);
+		return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+	};
+	let executable: string | undefined;
+	for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+		const candidate = path.resolve(input.cwd, directory, "pi");
+		try { await access(candidate, constants.X_OK); }
+		catch (error) {
+			if (["ENOENT", "ENOTDIR", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+			throw error;
+		}
+		const file = await realpath(candidate);
+		if (!outside(candidate) || !outside(file) || !(await stat(file)).isFile()) throw new Error("Pi 入口必须是工作区外的已安装标准 CLI，未执行项目入口");
+		executable = file;
+		break;
+	}
+	if (!executable) throw new Error("没有可用的已安装标准 Pi CLI，未启动子任务");
+	const node = await realpath(process.execPath);
+	if (!outside(node)) throw new Error("Pi 的 Node 解释器必须在工作区外");
+	// 不经 /usr/bin/env node 再次解析 PATH；仅支持当前标准 Node CLI 入口。
+	return new ChildRpc(spawn(node, [executable,
+		"--mode", "rpc", "--extension", input.entryPath,
+		"--provider", input.model.provider, "--model", input.model.id, "--thinking", input.thinking,
+		"--tools", tools.join(","), input.projectTrusted ? "--approve" : "--no-approve",
+	], { cwd: input.cwd, env: { ...process.env, [CHILD_ENV]: kind === "development" ? "development" : "1" }, stdio: ["pipe", "pipe", "pipe"] }));
+}
+
+export async function readyChild(rpc: ChildRpc, input: ChildTask, signal: AbortSignal, recordState: (state: RpcSessionState) => void) {
+	await rpc.control(CHILD_READY, input.entryPath, signal, input.id);
+	const state = await rpc.request<RpcSessionState>({ type: "get_state" }, signal);
+	recordState(state);
+	const { entries } = await rpc.request<{ entries: SessionEntry[] }>({ type: "get_entries" }, signal);
+	const ready = entries.filter((entry) => entry.type === "custom" && entry.customType === CHILD_READY);
+	const data = ready.length === 1 && ready[0]!.type === "custom" ? ready[0]!.data as any : undefined;
+	assertReadOnlyEnvironment(input.environment, data?.environment);
+	if (!state.sessionFile || state.sessionId === input.parentSessionId || state.messageCount !== 0
+		|| state.isStreaming || state.pendingMessageCount !== 0 || data?.pid !== rpc.process.pid
+		|| data?.sessionId !== state.sessionId || data?.cwd !== input.cwd || data?.entryPath !== input.entryPath
+		|| data?.projectTrusted !== input.projectTrusted
+		|| state.model?.provider !== input.model.provider || state.model?.id !== input.model.id
+		|| state.thinkingLevel !== input.thinking) {
+		throw new Error("子 Pi 的独立会话、受控入口、模型或只读工具未核实，未发送任务");
+	}
+	return { state, data };
+}
+
 export async function delegateReadOnly(
-	input: ReadOnlyTask,
+	input: ChildTask,
 	signal: AbortSignal,
 	record: (data: Record<string, unknown>) => void,
 	update: (message: string) => void,
+	ctx: DialogContext,
 ): Promise<{ text: string; sessionId: string; sessionFile: string; pid: number }> {
 	signal.throwIfAborted();
-	if (!input.tools.length) throw new Error("没有已启用的原生只读工具，未启动子 Pi");
-	const rpc = new ChildRpc(spawn("pi", [
-		"--mode", "rpc", "--extension", input.entryPath,
-		"--provider", input.model.provider, "--model", input.model.id, "--thinking", input.thinking,
-		"--tools", input.tools.join(","), input.projectTrusted ? "--approve" : "--no-approve",
-	], { cwd: input.cwd, env: { ...process.env, [CHILD_ENV]: "1" }, stdio: ["pipe", "pipe", "pipe"] }));
+	const rpc = await startChild(input, "readonly");
 	const interrupt = new AbortController();
 	const operation = AbortSignal.any([signal, interrupt.signal]);
+	const dialogs = createChildDialogs(rpc, ctx, operation, interrupt);
 	let state: RpcSessionState | undefined;
 	let text: string | null = null;
 	let problem: unknown;
@@ -208,26 +361,9 @@ export async function delegateReadOnly(
 	try {
 		rpc.onEvent = (event) => {
 			if (event.type === "tool_execution_start") update(`子任务调用 ${event.toolName}`);
-			if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) {
-				rpc.denyDialog(event.id);
-				interrupt.abort(new Error("子任务需要交互；当前只读阶段尚未支持转发，已拒绝并暂停该任务"));
-			}
+			dialogs.handle(event);
 		};
-		await rpc.control(CHILD_READY, input.entryPath, operation);
-		state = await rpc.request<RpcSessionState>({ type: "get_state" }, operation);
-		const { entries } = await rpc.request<{ entries: SessionEntry[] }>({ type: "get_entries" }, operation);
-		const ready = entries.filter((entry) => entry.type === "custom" && entry.customType === CHILD_READY);
-		const data = ready.length === 1 && ready[0]!.type === "custom" ? ready[0]!.data as any : undefined;
-		if (JSON.stringify(data?.tools) !== JSON.stringify(input.tools)) {
-			throw new Error(`只读工具未对齐：需要 ${input.tools.join(",")}；实际 ${JSON.stringify(data?.tools)}。未发送任务`);
-		}
-		if (!state.sessionFile || state.sessionId === input.parentSessionId || state.messageCount !== 0
-			|| state.isStreaming || state.pendingMessageCount !== 0 || data?.pid !== rpc.process.pid
-			|| data?.sessionId !== state.sessionId || data?.cwd !== input.cwd
-			|| data?.projectTrusted !== input.projectTrusted
-			|| state.model?.provider !== input.model.provider || state.model?.id !== input.model.id) {
-			throw new Error("子 Pi 的独立会话、受控入口、模型或只读工具未核实，未发送任务");
-		}
+		await readyChild(rpc, input, operation, (value) => { state = value; });
 		record({ ...reference(), phase: "started" });
 		update(`只读子任务已启动，PID ${rpc.process.pid}`);
 		await Promise.all([
@@ -237,6 +373,8 @@ export async function delegateReadOnly(
 		]);
 		if (rpc.toolError || rpc.openTools.size) throw new Error("子任务存在工具失败或未确认的执行终态");
 	} catch (error) { problem = error; }
+	try { await dialogs.close(); }
+	catch (error) { problem ??= error; }
 	try { await rpc.stop(input.entryPath); }
 	catch (error) { problem = new Error(`${problem ? `${String(problem)}；` : ""}收尾失败：${String(error)}`, { cause: error }); }
 	if (!problem && (rpc.exit?.code !== 0 || rpc.exit.signal !== null || rpc.failure || rpc.openTools.size)) {

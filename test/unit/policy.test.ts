@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { allowedReadTools, installReadOnlyPolicy } from "../../extensions/delivery-gate/src/policy.ts";
+import { allowedReadTools, installPolicy } from "../../extensions/delivery-gate/src/policy.ts";
 
-function host(coordinatorPath?: string) {
+function host(coordinatorPath?: string, developerPath?: string) {
 	const handlers = new Map<string, Function>();
 	let active = ["read", "write", "bash"];
 	const tools: { name: string; sourceInfo: { source: string; path?: string } }[] = ["read", "write", "bash", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } }));
 	const pi: any = { getAllTools: () => tools, getActiveTools: () => active,
 		setActiveTools: (names: string[]) => { active = names; }, on: (name: string, handler: Function) => handlers.set(name, handler) };
-	installReadOnlyPolicy(pi, coordinatorPath);
+	installPolicy(pi, coordinatorPath, developerPath);
 	return { pi, tools, handlers };
 }
 
@@ -35,10 +35,12 @@ test("同名工具实现被覆盖后不能继承原生只读权限", () => {
 test("权限核对异常时显式拒绝，不把异常交给扩展调度器后继续执行", () => {
 	const { pi, handlers } = host();
 	pi.getAllTools = () => { throw new Error("fixture metadata failure"); };
-	assert.equal(handlers.get("tool_call")!({ toolName: "read" }).block, true);
+	for (const toolName of ["read", "delivery_document_edit", "delivery_document_write"]) {
+		assert.equal(handlers.get("tool_call")!({ toolName }).block, true);
+	}
 });
 
-for (const name of ["delivery_readonly", "delivery_approval"]) test(`只有父角色的自有 ${name} 可以调用，同名覆盖立即失权`, () => {
+for (const name of ["delivery_readonly", "delivery_approval", "delivery_document_edit", "delivery_document_write", "delivery_develop", "delivery_validate", "delivery_review"]) test(`只有父角色的自有 ${name} 可以调用，同名覆盖立即失权`, () => {
 	const { pi, tools, handlers } = host("/owned/index.ts");
 	const tool = { name, sourceInfo: { source: "extension", path: "/owned/index.ts" } };
 	tools.push(tool);
@@ -51,4 +53,20 @@ for (const name of ["delivery_readonly", "delivery_approval"]) test(`只有父�
 	const child = host();
 	child.tools.push({ ...tool, sourceInfo: { source: "extension", path: "/owned/index.ts" } });
 	assert.equal(child.handlers.get("tool_call")!({ toolName: tool.name }).block, true);
+});
+
+for (const name of ["edit", "write", "bash"]) test(`开发子角色仅允许自有 ${name} 进入执行，覆盖与宿主 Shell 仍拒绝`, () => {
+	const { pi, tools, handlers } = host(undefined, "/owned/index.ts");
+	const own = { name, sourceInfo: { source: "extension", path: "/owned/index.ts" } };
+	const existing = tools.findIndex((tool) => tool.name === name);
+	if (existing >= 0) tools[existing] = own;
+	else tools.push(own);
+	pi.setActiveTools(["read", ...new Set([name, "bash"])]);
+	handlers.get("session_start")!();
+	assert.deepEqual(pi.getActiveTools(), ["read", name]);
+	assert.equal(handlers.get("tool_call")!({ toolName: name }), undefined);
+	if (name !== "bash") assert.equal(handlers.get("tool_call")!({ toolName: "bash" }).block, true);
+	assert.equal(handlers.get("user_bash")!().result.exitCode, 1);
+	own.sourceInfo.path = "/foreign/index.ts";
+	assert.equal(handlers.get("tool_call")!({ toolName: name }).block, true);
 });

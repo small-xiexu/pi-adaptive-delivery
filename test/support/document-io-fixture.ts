@@ -18,7 +18,7 @@ export default function documentIOFixture(pi: ExtensionAPI): void {
 			assert.ok(acquired.ok);
 			const controller = new AbortController();
 			let valid = scenario !== "denied";
-			const tools = createPlanningDocumentTools({ workspace, paths: ["docs/plan.md"], sessionId: ctx.sessionManager.getSessionId(),
+			const tools = createPlanningDocumentTools({ workspace, paths: ["docs/plan.md"], owner: acquired.record.owner,
 				leases, lease: acquired.reference, signal: controller.signal,
 				authorize: async () => { if (!valid) throw new Error("fixture approval denied"); } });
 			const file = path.join(ctx.cwd, "docs/plan.md");
@@ -92,7 +92,7 @@ export default function documentIOFixture(pi: ExtensionAPI): void {
 					await initialCheck;
 					if (scenario === "queued-revoke") valid = false;
 					if (scenario === "queued-cancel") controller.abort();
-					if (scenario === "queued-lease") await leases.release(acquired.reference, { kind: "parent-owner", processToken: leases.processToken });
+					if (scenario === "queued-lease") await leases.releaseParent(acquired.reference, acquired.record.owner, async () => {}, new AbortController().signal);
 				} finally { unblock(); await blocker; }
 				await failed;
 				assert.equal(await readFile(file, "utf8"), "原文");

@@ -29,7 +29,7 @@ async function host(existing?: string) {
 	const notices: string[] = [];
 	const pi: any = { on: (name: string, handler: Function) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
 		registerTool: (tool: any) => { approval = tool; }, registerEntryRenderer() {}, appendEntry: (type: string, data: unknown) => sm.appendCustomEntry(type, data) };
-	const ctx: any = { cwd, mode: "tui", hasUI: true, sessionManager: sm,
+	const ctx: any = { cwd, mode: "tui", hasUI: true, sessionManager: sm, isIdle: () => true, abort: () => {},
 		ui: { select: async (_title: string, choices: string[]) => choices[1], notify: (text: string) => notices.push(text) } };
 	const approvals = installApprovals(pi);
 	await approval.execute("approve", { stage: "documents", body: "仅编辑 plan.md", paths: ["plan.md"], validationCommands: [] }, undefined, undefined, ctx);
@@ -245,6 +245,26 @@ test("shutdown 与重新安装不恢复未交接的 writer", async () => {
 	const replacement = createParentDocumentWriter(h.pi, h.approvals);
 	await assert.rejects(replacement.write("restored", { path: "plan.md", content: "不应写入" }, undefined, h.ctx), /本轮没有/);
 	assert.ok(await h.readLease());
+});
+
+for (const terminal of ["persisted", "missing"]) test(`在途父回合 shutdown 等待原生停止，${terminal} 结果决定是否交回`, async () => {
+	const h = await host();
+	const call = h.begin();
+	await call.run;
+	let aborted = false;
+	h.ctx.isIdle = () => false;
+	h.ctx.abort = () => { aborted = true; };
+	let closed = false;
+	const shutdown = h.event("session_shutdown").then(() => { closed = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(aborted, true);
+	assert.equal(closed, false);
+	assert.ok(await h.readLease());
+	if (terminal === "persisted") await call.persist();
+	await h.event("agent_settled");
+	await shutdown;
+	assert.equal(Boolean(await h.readLease()), terminal === "missing");
+	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "更新");
 });
 
 for (const failure of ["remove-lock", "foreign-lock"]) {

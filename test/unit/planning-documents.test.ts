@@ -21,10 +21,10 @@ async function host(paths = ["docs/方案.md", "docs/计划.md"], authorize = as
 	const acquired = await leases.acquire(workspace, { kind: "parent", sessionId: "parent", pid: process.pid });
 	assert.ok(acquired.ok);
 	const controller = new AbortController();
-	const scope = { workspace, paths, sessionId: "parent", leases, lease: acquired.reference, authorize, signal: controller.signal };
+	const scope = { workspace, paths, owner: acquired.record.owner, leases, lease: acquired.reference, authorize, signal: controller.signal };
 	return { root, cwd, stateRoot, scope, leases, controller, tools: createPlanningDocumentTools(scope),
 		file: path.join(cwd, "docs/方案.md"),
-		release: () => leases.release(acquired.reference, { kind: "parent-owner", processToken: leases.processToken }),
+		release: () => leases.releaseParent(acquired.reference, acquired.record.owner, async () => {}, new AbortController().signal),
 	};
 }
 
@@ -49,6 +49,13 @@ test("原生编辑支持创建、持续修改与完整重写，不要求标题�
 	await h.tools.write("rewrite", { path: h.file, content: "明确的完整重写\n" });
 	assert.equal(await readFile(h.file, "utf8"), "明确的完整重写\n");
 	assert.equal((await h.leases.read(h.scope.workspace.key))?.leaseId, h.scope.lease.leaseId, "底层不会自行释放 writer");
+});
+
+test("父文件底层拒绝显式提供的 Git 元数据保护目录", async () => {
+	const h = await host(["metadata/forbidden.md"]);
+	const tools = createPlanningDocumentTools(h.scope, [path.join(h.cwd, "metadata")]);
+	await assert.rejects(tools.write("metadata", { path: "metadata/forbidden.md", content: "禁止" }), /受保护路径/);
+	await assert.rejects(access(path.join(h.cwd, "metadata/forbidden.md")), { code: "ENOENT" });
 });
 
 test("再次编辑读取最新正文，保留用户随后新增的无关内容", async () => {

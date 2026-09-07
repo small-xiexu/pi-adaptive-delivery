@@ -7,7 +7,7 @@ import { isDeepStrictEqual, promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const PROCESS_TOKEN_KEY = Symbol.for("pi-adaptive-delivery.process-owner-token.v1");
 
-export const WRITER_LEASE_VERSION = 1 as const;
+export const WRITER_LEASE_VERSION = 2 as const;
 
 export interface WorkspaceIdentity {
 	key: string;
@@ -21,7 +21,6 @@ export interface WriterLeaseOwner {
 	sessionId: string;
 	pid: number;
 	processToken: string;
-	missionId?: string;
 	runId?: string;
 }
 
@@ -30,7 +29,7 @@ export interface WriterLeaseRecord {
 	leaseId: string;
 	workspace: WorkspaceIdentity;
 	owner: WriterLeaseOwner;
-	phase: "provisional" | "bound";
+	coordinator?: WriterLeaseOwner;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -44,10 +43,6 @@ export interface WriterLeaseReference {
 export type AcquireWriterLeaseResult =
 	| { ok: true; record: WriterLeaseRecord; reference: WriterLeaseReference }
 	| { ok: false; reason: string; existing?: WriterLeaseRecord };
-
-export type ReleaseWriterLeaseProof =
-	| { kind: "parent-owner"; processToken: string }
-	| { kind: "process-terminal"; runId: string; observed: true };
 
 function processOwnerToken(): string {
 	const store = globalThis as typeof globalThis & { [PROCESS_TOKEN_KEY]?: string };
@@ -63,7 +58,7 @@ export async function resolveWorkspaceIdentity(cwd: string): Promise<WorkspaceId
 	const cwdPath = await realpath(cwd);
 	let stdout: string;
 	try {
-		({ stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: cwdPath }));
+		({ stdout } = await execFileAsync("/usr/bin/git", ["rev-parse", "--show-toplevel"], { cwd: cwdPath }));
 	} catch (error) {
 		throw new Error(`Writer lease requires a Git repository: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -77,7 +72,7 @@ export async function resolveWorkspaceIdentity(cwd: string): Promise<WorkspaceId
 }
 
 export async function getWriterStateRoot(workspace: WorkspaceIdentity): Promise<string> {
-	const { stdout } = await execFileAsync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace.workspacePath });
+	const { stdout } = await execFileAsync("/usr/bin/git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace.workspacePath });
 	return path.join(await realpath(stdout.trim()), "pi-adaptive-delivery");
 }
 
@@ -104,14 +99,12 @@ function parseOwner(value: unknown): WriterLeaseOwner | undefined {
 	) {
 		return undefined;
 	}
-	if (input.missionId !== undefined && (typeof input.missionId !== "string" || !input.missionId)) return undefined;
 	if (input.runId !== undefined && (typeof input.runId !== "string" || !input.runId)) return undefined;
 	return {
 		kind: input.kind,
 		sessionId: input.sessionId,
 		pid: input.pid,
 		processToken: input.processToken,
-		...(typeof input.missionId === "string" ? { missionId: input.missionId } : {}),
 		...(typeof input.runId === "string" ? { runId: input.runId } : {}),
 	};
 }
@@ -120,7 +113,6 @@ export function parseWriterLeaseRecord(value: unknown): WriterLeaseRecord | unde
 	if (!value || typeof value !== "object") return undefined;
 	const input = value as Record<string, unknown>;
 	if (input.version !== WRITER_LEASE_VERSION || typeof input.leaseId !== "string" || !input.leaseId) return undefined;
-	if (input.phase !== "provisional" && input.phase !== "bound") return undefined;
 	if (!input.workspace || typeof input.workspace !== "object") return undefined;
 	const workspace = input.workspace as Record<string, unknown>;
 		if (
@@ -137,6 +129,8 @@ export function parseWriterLeaseRecord(value: unknown): WriterLeaseRecord | unde
 	}
 	const owner = parseOwner(input.owner);
 	if (!owner || typeof input.createdAt !== "string" || typeof input.updatedAt !== "string") return undefined;
+	const coordinator = input.coordinator === undefined ? undefined : parseOwner(input.coordinator);
+	if (owner.kind === "child" ? !coordinator || !validTransfer(coordinator, owner) : input.coordinator !== undefined) return undefined;
 	if (Number.isNaN(Date.parse(input.createdAt)) || Number.isNaN(Date.parse(input.updatedAt))) return undefined;
 	return {
 		version: WRITER_LEASE_VERSION,
@@ -148,7 +142,7 @@ export function parseWriterLeaseRecord(value: unknown): WriterLeaseRecord | unde
 			gitRoot: workspace.gitRoot,
 		},
 		owner,
-		phase: input.phase,
+		...(coordinator ? { coordinator } : {}),
 		createdAt: input.createdAt,
 		updatedAt: input.updatedAt,
 	};
@@ -167,6 +161,11 @@ export function parseWriterLeaseReference(value: unknown): WriterLeaseReference 
 		return undefined;
 	}
 	return { version: WRITER_LEASE_VERSION, leaseId: input.leaseId, workspaceKey: input.workspaceKey };
+}
+
+function validTransfer(parent: WriterLeaseOwner, child: WriterLeaseOwner): boolean {
+	return parent.kind === "parent" && child.kind === "child" && Boolean(parent.runId) && parent.runId === child.runId
+		&& parent.sessionId !== child.sessionId && parent.pid !== child.pid && parent.processToken !== child.processToken;
 }
 
 export class WriterLeaseManager {
@@ -255,7 +254,7 @@ export class WriterLeaseManager {
 
 	async acquire(
 		workspace: WorkspaceIdentity,
-		owner: Omit<WriterLeaseOwner, "processToken">,
+		owner: Omit<WriterLeaseOwner, "processToken" | "kind"> & { kind: "parent" },
 		now: Date = new Date(),
 	): Promise<AcquireWriterLeaseResult> {
 		return this.withOperationLock(workspace.key, async () => {
@@ -264,7 +263,6 @@ export class WriterLeaseManager {
 			leaseId: randomUUID(),
 			workspace,
 			owner: { ...owner, processToken: this.token },
-			phase: owner.runId ? "bound" : "provisional",
 			createdAt: now.toISOString(),
 			updatedAt: now.toISOString(),
 		};
@@ -293,27 +291,19 @@ export class WriterLeaseManager {
 		});
 	}
 
-	async bind(
-		reference: WriterLeaseReference,
-		binding: { missionId?: string; runId: string; pid?: number },
-		now: Date = new Date(),
-	): Promise<WriterLeaseRecord> {
+	async handoff(reference: WriterLeaseReference, parent: WriterLeaseOwner, child: WriterLeaseOwner,
+		verifyReady: () => Promise<void>, signal: AbortSignal): Promise<WriterLeaseRecord> {
+		const expected = structuredClone(parent);
+		const destination = parseOwner(structuredClone(child));
+		if (!destination || !validTransfer(expected, destination)) throw new Error("父子 writer 的独立进程、Session 或执行绑定无效");
 		return this.withOperationLock(reference.workspaceKey, async () => {
-		const current = await this.assertOwned(reference);
-		const next: WriterLeaseRecord = {
-			...current,
-			owner: {
-				...current.owner,
-				kind: "child",
-				pid: binding.pid ?? current.owner.pid,
-				...(binding.missionId ? { missionId: binding.missionId } : {}),
-				runId: binding.runId,
-			},
-			phase: "bound",
-			updatedAt: now.toISOString(),
-		};
-		await this.atomicReplace(reference.workspaceKey, next);
-		return next;
+			const current = await this.assertOwned(reference);
+			if (current.owner.kind !== "parent" || !isDeepStrictEqual(current.owner, expected)) throw new Error("父 writer 归属已变化，未交接");
+			await verifyReady();
+			signal.throwIfAborted();
+			const next: WriterLeaseRecord = { ...current, owner: destination, coordinator: expected, updatedAt: new Date().toISOString() };
+			await this.atomicReplace(reference.workspaceKey, next);
+			return next;
 		});
 	}
 
@@ -351,27 +341,6 @@ export class WriterLeaseManager {
 		}
 	}
 
-	async release(reference: WriterLeaseReference, proof: ReleaseWriterLeaseProof): Promise<void> {
-		await this.withOperationLock(reference.workspaceKey, async () => {
-		const current = await this.assertOwned(reference);
-		if (current.owner.kind === "parent") {
-			if (proof.kind !== "parent-owner" || proof.processToken !== this.token) {
-				throw new Error("Parent writer lease requires the current process owner proof");
-			}
-		} else {
-			if (
-				proof.kind !== "process-terminal" ||
-				proof.observed !== true ||
-				!current.owner.runId ||
-				proof.runId !== current.owner.runId
-			) {
-				throw new Error("Child writer lease requires matching observed process-terminal proof");
-			}
-		}
-		await unlink(this.leasePath(reference.workspaceKey));
-		});
-	}
-
 	// 在同一 lease 操作锁内核对原 owner 和原生终态；等待锁期间取得的旧证明不能用于释放。
 	async releaseParent(reference: WriterLeaseReference, owner: WriterLeaseOwner,
 		verifyTerminal: () => Promise<void>, signal: AbortSignal): Promise<void> {
@@ -386,13 +355,18 @@ export class WriterLeaseManager {
 		});
 	}
 
-	async forceRelease(workspaceKey: string, expectedLeaseId: string): Promise<WriterLeaseRecord | undefined> {
-			return this.withOperationLock(workspaceKey, async () => {
-				const current = await this.read(workspaceKey);
-				if (!current) return undefined;
-				if (current.leaseId !== expectedLeaseId) throw new Error("Writer lease owner changed after confirmation");
-				await unlink(this.leasePath(workspaceKey));
-				return current;
-			});
-		}
+	async releaseChild(reference: WriterLeaseReference, owner: WriterLeaseOwner, coordinator: WriterLeaseOwner,
+		verifyTerminal: () => Promise<void>, signal: AbortSignal): Promise<void> {
+		await this.withOperationLock(reference.workspaceKey, async () => {
+			const current = await this.read(reference.workspaceKey);
+			if (!current || current.leaseId !== reference.leaseId || current.owner.kind !== "child"
+				|| current.coordinator?.processToken !== this.token || !isDeepStrictEqual(current.coordinator, coordinator)
+				|| !isDeepStrictEqual(current.owner, owner)) {
+				throw new Error("子 writer 或父协调归属已变化，未释放 lease");
+			}
+			await verifyTerminal();
+			signal.throwIfAborted();
+			await unlink(this.leasePath(reference.workspaceKey));
+		});
+	}
 }

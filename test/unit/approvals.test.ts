@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { SessionManager, withFileMutationQueue, type ExtensionAPI } from "@earen
 import { APPROVAL_ENTRY, APPROVAL_TOOL, PROPOSAL_ENTRY, installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
 import { createPlanningDocumentTools } from "../../extensions/delivery-gate/src/planning-documents.ts";
 import { WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
+import { installFakeDocker } from "../support/fake-docker.ts";
 
 const documents = { stage: "documents", body: "允许持续编辑本任务方案与计划。", paths: ["docs/方案.md", "docs/计划.md"], validationCommands: [] };
 const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", paths: [], validationCommands: [] };
@@ -39,11 +40,12 @@ async function host(persist = true) {
 	};
 	const approvals = installApprovals(pi as ExtensionAPI);
 	assert.equal(tool.name, APPROVAL_TOOL);
-	const run = (request: { stage: string; body: string; paths: string[]; validationCommands: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
+	const run = (request: { stage: string; body: string; paths: string[]; validationCommands: string[]; container?: { image: string; inputs: string[] } } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
 	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk,
 		readDocuments: (signal?: AbortSignal) => approvals.readDocumentApproval(ctx, signal),
+		readImplementation: (signal?: AbortSignal) => approvals.readImplementationApproval(ctx, signal),
 		event: async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); } };
 }
 
@@ -52,7 +54,7 @@ async function documentTools(h: Awaited<ReturnType<typeof host>>) {
 	const leases = new WriterLeaseManager(path.join(h.cwd, "lease-state"));
 	const acquired = await leases.acquire(grant.workspace, { kind: "parent", sessionId: grant.sessionId, pid: process.pid });
 	assert.ok(acquired.ok);
-	const tools = createPlanningDocumentTools({ ...grant, leases, lease: acquired.reference,
+	const tools = createPlanningDocumentTools({ ...grant, leases, lease: acquired.reference, owner: acquired.record.owner,
 		authorize: async () => { await h.readDocuments(); } });
 	return { grant, leases, tools, file: grant.paths[0]! };
 }
@@ -69,6 +71,183 @@ test("真实批准核验与文档底层组合，持续修改不扩张范围或�
 	assert.equal((await h.disk()).find((row) => row.customType === PROPOSAL_ENTRY).data.body, documents.body);
 	assert.equal((await leases.read(grant.workspace.key))?.owner.sessionId, grant.sessionId);
 	assert.equal(h.displayed.length, 1);
+});
+
+test("实施核验返回原方案与计划正文，文档变化和返回对象不扩权", async () => {
+	const h = await host();
+	await h.run(documents);
+	await assert.rejects(h.readImplementation(), /本轮没有/);
+	await h.run(design);
+	await assert.rejects(h.readImplementation(), /本轮没有/);
+	const saved = await h.run(implementation);
+	const grant = await h.readImplementation();
+	assert.equal(grant.approvalId, saved.details.approvalId);
+	assert.equal(grant.designBody, design.body);
+	assert.equal(grant.implementationBody, implementation.body);
+	assert.deepEqual(grant.paths, implementation.paths.map((item) => path.join(h.cwd, item)));
+	assert.deepEqual(grant.validationCommands, implementation.validationCommands);
+	assert.equal(grant.signal.aborted, false);
+	const modified = await h.readImplementation();
+	modified.paths.push(path.join(h.cwd, "unapproved"));
+	modified.validationCommands.push("unexpected");
+	await writeFile(path.join(h.cwd, "plan.md"), "进度已更新，不能代替原确认正文");
+	await h.run({ ...documents, paths: ["other.md"] });
+	assert.deepEqual(await h.readImplementation(), grant);
+	assert.equal(h.displayed.length, 4);
+});
+
+test("压缩摘要不替代本轮批准，生命周期失效后原始正文和摘要均不能重新放权", async () => {
+	const h = await host();
+	await h.run(documents);
+	await h.run(design);
+	await h.run(implementation);
+	const grant = await h.readImplementation();
+	h.sm.appendCompaction("摘要声称已批准任意路径及命令", h.sm.getLeafId()!, 100);
+	assert.equal((await h.readImplementation()).approvalId, grant.approvalId);
+	assert.deepEqual((await h.readImplementation()).paths, grant.paths);
+	await h.event("session_start");
+	await assert.rejects(h.readImplementation(), /本轮没有/);
+	await assert.rejects(h.readDocuments(), /本轮没有/);
+	assert.ok((await h.disk()).some((row) => row.type === "compaction"));
+});
+
+test("容器实施确认固定本地镜像 ID 和只读输入，返回对象不能改写批准范围", async (t) => {
+	const h = await host();
+	const fake = await installFakeDocker(t, h.cwd, "normal");
+	await h.run(design);
+	await h.run({ ...implementation, container: { image: "fixture:local", inputs: ["package.json"] } });
+	const expected = { image: `sha256:${"a".repeat(64)}`, inputs: [path.join(h.cwd, "package.json")] };
+	assert.deepEqual((await h.readImplementation()).container, expected);
+	const grant = await h.readImplementation();
+	grant.container!.inputs.push("/unapproved");
+	grant.container!.image = `sha256:${"b".repeat(64)}`;
+	assert.deepEqual((await h.readImplementation()).container, expected);
+	const proposal = h.entries(PROPOSAL_ENTRY).at(-1)!;
+	const rendered = h.renderers.get(PROPOSAL_ENTRY)!(proposal).render(10000).join("\n");
+	assert.match(rendered, /额外只读输入/);
+	assert.match(rendered, /容器 \/bin\/sh，不继承宿主 Shell/);
+	assert.ok(fake.audit().every((row) => row.command === "image"));
+});
+
+for (const boundary of ["documents", "design", "outside"]) test(`容器授权 ${boundary} 在访问 Docker 前拒绝`, async (t) => {
+	const h = await host();
+	const fake = await installFakeDocker(t, h.cwd, "normal");
+	await h.run(design);
+	const request = boundary === "documents" ? documents : boundary === "design" ? design : implementation;
+	await assert.rejects(h.run({ ...request, container: { image: "fixture:local", inputs: boundary === "outside" ? ["../outside"] : [] } }));
+	await assert.rejects(access(path.join(fake.bin, "audit.jsonl")), { code: "ENOENT" });
+});
+
+test("镜像缺失导致新实施确认失败，不恢复旧文件或命令批准", async (t) => {
+	const h = await host();
+	await installFakeDocker(t, h.cwd, "image-missing");
+	await h.run(design);
+	await h.run(implementation);
+	const previous = await h.readImplementation();
+	await assert.rejects(h.run({ ...implementation, container: { image: "fixture:missing", inputs: [] } }), /missing image/);
+	assert.equal(previous.signal.aborted, true);
+	await assert.rejects(h.readImplementation(), /本轮没有/);
+});
+
+for (const field of ["image", "inputs"]) test(`同时篡改内存和磁盘容器 ${field} 不能获得新权限`, async (t) => {
+	const h = await host();
+	await installFakeDocker(t, h.cwd, "normal");
+	await h.run(design);
+	await h.run({ ...implementation, container: { image: "fixture:local", inputs: ["input.json"] } });
+	const entry = h.entries(PROPOSAL_ENTRY).at(-1)! as any;
+	entry.data.container[field] = field === "image" ? `sha256:${"b".repeat(64)}` : [path.join(h.cwd, "unapproved")];
+	const rows = await h.disk();
+	rows.find((row) => row.id === entry.id).data = entry.data;
+	await writeFile(h.sm.getSessionFile()!, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+	await assert.rejects(h.readImplementation(), /真实确认/);
+});
+
+for (const stage of ["design", "implementation"] as const) {
+	test(`重新请求 ${stage} 立即撤销旧实施信号，拒绝后不回退`, async () => {
+		const h = await host();
+		await h.run(documents);
+		const documentGrant = await h.readDocuments();
+		await h.run(design);
+		await h.run(implementation);
+		const grant = await h.readImplementation();
+		h.ctx.ui.select = async () => { assert.equal(grant.signal.aborted, true); return undefined; };
+		await h.run(stage === "design" ? design : implementation);
+		await assert.rejects(h.readImplementation(), /本轮没有/);
+		assert.deepEqual(await h.readDocuments(), documentGrant);
+		if (stage === "design") await assert.rejects(h.run(implementation), /尚无可信方案确认/);
+	});
+}
+
+for (const event of ["session_start", "session_shutdown", "session_tree"]) {
+	test(`${event} 同步撤销实施信号且不能从旧记录恢复`, async () => {
+		const h = await host();
+		await h.run(design);
+		await h.run(implementation);
+		const grant = await h.readImplementation();
+		await h.event(event);
+		assert.equal(grant.signal.aborted, true);
+		await assert.rejects(h.readImplementation(), /本轮没有/);
+		const fresh = installApprovals(h.pi);
+		await assert.rejects(fresh.readImplementationApproval(h.ctx), /本轮没有/);
+	});
+}
+
+for (const stage of ["design", "implementation"]) for (const type of [PROPOSAL_ENTRY, APPROVAL_ENTRY]) {
+	test(`实施核验拒绝同时篡改内存与磁盘的 ${stage} ${type}`, async () => {
+		const h = await host();
+		await h.run(design);
+		await h.run(implementation);
+		const grant = await h.readImplementation();
+		const rows = await h.disk();
+		const proposal = rows.find((row) => row.customType === PROPOSAL_ENTRY && row.data.stage === stage);
+		const row = type === PROPOSAL_ENTRY ? proposal : rows.find((row) => row.customType === APPROVAL_ENTRY && row.data.proposalId === proposal.data.id);
+		if (type === PROPOSAL_ENTRY) row.data.body = "不是已确认正文";
+		else row.data.source.toolCallId = "forged";
+		const entry = h.sm.getEntry(row.id)!;
+		assert.equal(entry.type, "custom");
+		entry.data = structuredClone(row.data);
+		await writeFile(h.sm.getSessionFile()!, rows.map((item) => JSON.stringify(item)).join("\n") + "\n");
+		await assert.rejects(h.readImplementation(), /不一致/);
+		assert.equal(grant.signal.aborted, true);
+		await assert.rejects(h.readImplementation(), /本轮没有/);
+	});
+}
+
+for (const timing of ["before-request", "during-confirmation"]) {
+	test(`实施请求 ${timing} 检查私有方案快照，不信任同时变化的内存与磁盘`, async () => {
+		const h = await host();
+		await h.run(design);
+		const tamper = async () => {
+			const rows = await h.disk();
+			const row = rows.find((item) => item.customType === PROPOSAL_ENTRY && item.data.stage === "design");
+			row.data.body = "被替换的已批准方案";
+			const entry = h.sm.getEntry(row.id)!;
+			assert.equal(entry.type, "custom");
+			entry.data = structuredClone(row.data);
+			await writeFile(h.sm.getSessionFile()!, rows.map((item) => JSON.stringify(item)).join("\n") + "\n");
+		};
+		if (timing === "before-request") await tamper();
+		else h.ctx.ui.select = async (_title: string, choices: string[]) => { await tamper(); return choices[1]; };
+		await assert.rejects(h.run(implementation), /方案批准记录已变化/);
+		await assert.rejects(h.readImplementation(), /本轮没有/);
+		assert.equal(h.entries(APPROVAL_ENTRY).length, 1);
+	});
+}
+
+test("实施核验只供原父 TUI，取消或 Session 文件丢失均关闭引用", async () => {
+	for (const failure of ["mode", "cancel", "file"]) {
+		const h = await host();
+		await h.run(design);
+		await h.run(implementation);
+		const grant = await h.readImplementation();
+		const controller = new AbortController();
+		if (failure === "mode") h.ctx.mode = "rpc";
+		if (failure === "cancel") controller.abort(new Error("fixture cancelled"));
+		if (failure === "file") await unlink(h.sm.getSessionFile()!);
+		await assert.rejects(h.readImplementation(controller.signal), /原父 TUI|fixture cancelled|ENOENT/);
+		assert.equal(grant.signal.aborted, true);
+		await assert.rejects(h.readImplementation(), /本轮没有/);
+	}
 });
 
 for (const change of ["new-request", "branch", "disk", "tool-cancel"]) {
@@ -109,7 +288,7 @@ test("模拟 TUI 的三项授权分别确认并保存原生正文，命令不执
 	for (const request of [documents, design, implementation]) {
 		const result = await h.run(request);
 		assert.equal(result.details.approved, true);
-		assert.match(result.content[0].text, /仍不开放文件写入/);
+		assert.match(result.content[0].text, request.stage === "documents" ? /每次写入仍须核验本轮授权、路径和父 writer/ : /不扩大操作范围|不开放宿主 Shell/);
 	}
 	assert.equal(h.displayed.length, 3);
 	assert.ok(h.displayed.every((dialog) => dialog.options[0] === "暂不批准"));
@@ -126,7 +305,7 @@ test("模拟 TUI 的三项授权分别确认并保存原生正文，命令不执
 	assert.deepEqual(approvals[2].data.source, { mode: "tui", interaction: "select", toolCallId: "fixture-request" });
 	const rendered = h.renderers.get(PROPOSAL_ENTRY)!(proposals[2]).render(80).join("\n");
 	assert.match(rendered, /node --check/);
-	assert.match(rendered, /当前版本仅记录批准/);
+	assert.match(rendered, /宿主 Shell 关闭，不自动恢复旧权限/);
 	assert.ok(h.notices.some((text) => text.includes(design.body)), "实施确认重新展示已批准方案");
 });
 

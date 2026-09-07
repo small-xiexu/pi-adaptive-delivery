@@ -3,18 +3,22 @@ import { isDeepStrictEqual } from "node:util";
 import type { AgentToolResult, EditToolInput, ExtensionAPI, ExtensionContext, SessionEntry, WriteToolInput } from "@earendil-works/pi-coding-agent";
 import type { installApprovals } from "./approvals.ts";
 import { createPlanningDocumentTools } from "./planning-documents.ts";
+import path from "node:path";
 import { getWriterStateRoot, type WriterLeaseOwner, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
 
 export const DOCUMENT_EDIT_TOOL = "delivery_document_edit";
 export const DOCUMENT_WRITE_TOOL = "delivery_document_write";
 
-interface DocumentRun {
-	id: string;
-	name: string;
+export interface SessionBinding {
 	cwd: string;
 	sessionId: string;
 	sessionFile: string;
 	lifetime: AbortController;
+}
+
+interface DocumentRun extends SessionBinding {
+	id: string;
+	name: string;
 	run?: Promise<AgentToolResult<unknown>>;
 	attemptedLease: boolean;
 	finished: boolean;
@@ -28,15 +32,15 @@ interface DocumentRun {
 }
 
 // 原生 JSONL 会省略 undefined 字段；私有快照同样按 JSON 表示隔离，不能共享原生可变引用。
-function snapshot<T>(value: T): T { return JSON.parse(JSON.stringify(value)); }
+export function snapshot<T>(value: T): T { return JSON.parse(JSON.stringify(value)); }
 
-function current(state: DocumentRun, ctx: ExtensionContext): void {
+export function current(state: SessionBinding, ctx: ExtensionContext): void {
 	state.lifetime.signal.throwIfAborted();
 	if (ctx.cwd !== state.cwd || ctx.sessionManager.getSessionId() !== state.sessionId
 		|| ctx.sessionManager.getSessionFile() !== state.sessionFile) throw new Error("父 writer 的 Session、文件或目录已变化");
 }
 
-async function nativeEntries(state: DocumentRun, ctx: ExtensionContext) {
+export async function nativeEntries(state: SessionBinding, ctx: ExtensionContext) {
 	current(state, ctx);
 	const content = await readFile(state.sessionFile, "utf8");
 	current(state, ctx);
@@ -54,10 +58,11 @@ async function nativeEntries(state: DocumentRun, ctx: ExtensionContext) {
 }
 
 // 仅协调本轮父文档操作；不注册工具、不授予批准、不从旧记录恢复 writer，也不管理外部进程。
-export function createParentDocumentWriter(pi: ExtensionAPI, approvals: ReturnType<typeof installApprovals>) {
+export function createParentDocumentWriter(pi: ExtensionAPI, approvals: Pick<ReturnType<typeof installApprovals>, "readDocumentApproval">) {
 	let active: DocumentRun | undefined;
 	let stopped = false;
 	let finishing: Promise<void> | undefined;
+	let shutdownSettled: (() => void) | undefined;
 
 	async function execute(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput,
 		signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
@@ -84,7 +89,8 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: ReturnTy
 					throw new Error("文档工具调用已有结果，不能重放取得 writer");
 				}
 				state.call = call;
-				state.leases = new WriterLeaseManager(await getWriterStateRoot(grant.workspace));
+				const stateRoot = await getWriterStateRoot(grant.workspace);
+				state.leases = new WriterLeaseManager(stateRoot);
 				current(state, ctx);
 				operation.throwIfAborted();
 				grant.signal.throwIfAborted();
@@ -93,13 +99,13 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: ReturnTy
 				if (!acquired.ok) { state.attemptedLease = false; throw new Error(acquired.reason); }
 				state.lease = { ...acquired.reference };
 				state.owner = { ...acquired.record.owner };
-				state.tools = createPlanningDocumentTools({ ...grant, lease: state.lease, leases: state.leases,
+				state.tools = createPlanningDocumentTools({ ...grant, lease: state.lease, leases: state.leases, owner: state.owner,
 					authorize: async () => {
 						current(state, ctx);
 						const latest = await approvals.readDocumentApproval(ctx, operation);
 						current(state, ctx);
 						if (latest.approvalId !== grant.approvalId) throw new Error("本次文档授权已被替换");
-					} });
+					} }, [path.dirname(stateRoot), sessionFile]);
 				const result = kind === "edit" ? await state.tools.edit(id, input as EditToolInput, operation)
 					: await state.tools.write(id, input as WriteToolInput, operation);
 				state.result = snapshot({ content: result.content, details: result.details, isError: false });
@@ -150,7 +156,9 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: ReturnTy
 	};
 	pi.on("turn_end", settle);
 	// 原生持久化失败时可能没有 turn_end；最终停止时仍要核验并明确关闭，不能把事件当成功。
-	pi.on("agent_settled", settle);
+	pi.on("agent_settled", async (event, ctx) => {
+		try { await settle(event, ctx); } finally { shutdownSettled?.(); }
+	});
 	const preventSwitch = () => active ? { cancel: true } : undefined;
 	pi.on("session_before_switch", preventSwitch);
 	pi.on("session_before_fork", preventSwitch);
@@ -162,8 +170,11 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: ReturnTy
 		stopped = true;
 		const state = active;
 		if (!state) return;
+		const settled = !ctx.isIdle() ? new Promise<void>((resolve) => { shutdownSettled = resolve; }) : undefined;
+		if (settled) ctx.abort();
+		await Promise.allSettled([state.run, finishing, settled]);
+		shutdownSettled = undefined;
 		state.lifetime.abort(new Error("父会话正在关闭或重载"));
-		await Promise.allSettled([state.run, ...(finishing ? [finishing] : [])]);
 		if (active) ctx.ui.notify("父文档操作已停止；终态交接未完成，保持关闭，不自动恢复。", "warning");
 	});
 	return {

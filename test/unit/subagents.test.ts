@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { setImmediate as nextTurn } from "node:timers/promises";
+import { execFileSync } from "node:child_process";
+import { access, mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createReadTool, type BuildSystemPromptOptions, type ExtensionUIContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import test from "node:test";
-import { ChildRpc, delegateReadOnly } from "../../extensions/delivery-gate/src/subagents.ts";
+import { ChildRpc, createChildDialogs, delegateReadOnly, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
 
 function fixture() {
 	const process = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
@@ -69,10 +75,77 @@ test("取消中断等待；收尾按 clear_queue→abort，并等待真实 close
 test("取消和无只读能力在启动进程前拒绝", async () => {
 	const controller = new AbortController();
 	const input = { id: "test", task: "read", cwd: "/not-used", entryPath: "/not-used", parentSessionId: "parent",
-		model: { provider: "fake", id: "fake" }, thinking: "off", tools: [], projectTrusted: false };
-	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}), /没有已启用/);
+		model: { provider: "fake", id: "fake" }, thinking: "off", environment: snapshotReadOnlyEnvironment({ cwd: "/not-used" }, []), projectTrusted: false };
+	const ctx = { mode: "rpc" as const, ui: {} as ExtensionUIContext, abort() {} };
+	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}, ctx), /没有已启用/);
 	controller.abort(new Error("fixture before launch"));
-	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}), /fixture before launch/);
+	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}, ctx), /fixture before launch/);
+});
+
+for (const kind of ["file", "symlink"]) test(`子 Pi 启动前拒绝工作区 ${kind} 入口，子目录 cwd 不能缩小检查范围`, async (t) => {
+	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "child-path-unit-")));
+	const repo = path.join(root, "repo");
+	const cwd = path.join(repo, "src");
+	await mkdir(cwd, { recursive: true });
+	execFileSync("/usr/bin/git", ["init", "--quiet"], { cwd: repo });
+	await writeFile(path.join(repo, "pi"), `#!/bin/sh\nprintf executed > '${repo}/executed'\n`, { mode: 0o700 });
+	const bin = kind === "file" ? repo : path.join(root, "bin");
+	if (kind === "symlink") { await mkdir(bin); await symlink(path.join(repo, "pi"), path.join(bin, "pi")); }
+	const original = process.env.PATH;
+	process.env.PATH = `${bin}${path.delimiter}${original}`;
+	t.after(() => { process.env.PATH = original; });
+	const input = { id: "run", task: "read", cwd, entryPath: "/unused", parentSessionId: "parent", model: { provider: "fake", id: "fake" },
+		thinking: "off", projectTrusted: false, environment: { tools: [{ name: "read", digest: "unused" }], instructions: "", rules: "", skills: "" } };
+	await assert.rejects(async () => {
+		const rpc = await startChild(input, "readonly");
+		await rpc.closed;
+	}, /Pi.*工作区外/);
+	await assert.rejects(access(path.join(repo, "executed")), { code: "ENOENT" });
+});
+
+function environmentFixture() {
+	const sourceInfo = { path: "read", source: "builtin", scope: "temporary" as const, origin: "top-level" as const };
+	const { name, description, parameters } = createReadTool("/repo");
+	const tools: ToolInfo[] = [{ name, description, parameters, sourceInfo }];
+	const options: BuildSystemPromptOptions = { cwd: "/repo", customPrompt: "基础指令", appendSystemPrompt: "附加指令",
+		contextFiles: [{ path: "/repo/AGENTS.md", content: "规则正文，不复制到子握手" }],
+		skills: [{ name: "proof", description: "任务所需 Skill", filePath: "/repo/skills/proof/SKILL.md", baseDir: "/repo/skills/proof",
+			sourceInfo: { ...sourceInfo, path: "/repo/skills/proof/SKILL.md", source: "local" }, disableModelInvocation: false }] };
+	return { tools, options };
+}
+
+test("只读环境快照独立于可变对象且不持久复制规则或指令正文", () => {
+	const { tools, options } = environmentFixture();
+	const expected = snapshotReadOnlyEnvironment(options, tools);
+	assert.doesNotThrow(() => assertReadOnlyEnvironment(expected, structuredClone(expected)));
+	assert.ok(!JSON.stringify(expected).includes("规则正文"));
+	assert.ok(!JSON.stringify(expected).includes("基础指令"));
+	options.contextFiles![0]!.content = "已改变";
+	assert.throws(() => assertReadOnlyEnvironment(expected, snapshotReadOnlyEnvironment(options, tools)), /规则未对齐/);
+});
+
+for (const change of ["definition", "source", "instructions", "rules", "skill-description", "skill-source", "skill-missing", "missing"] as const) {
+	test(`只读环境在任务发送前拒绝 ${change}，同名工具不等于同一能力`, () => {
+		const { tools, options } = environmentFixture();
+		const expected = snapshotReadOnlyEnvironment(options, tools);
+		if (change === "definition") tools[0]!.parameters = { type: "object", properties: { different: { type: "string" } } } as ToolInfo["parameters"];
+		if (change === "source") tools[0]!.sourceInfo.source = "foreign";
+		if (change === "instructions") options.appendSystemPrompt = "different";
+		if (change === "rules") options.contextFiles = [];
+		if (change === "skill-description") options.skills![0]!.description = "different";
+		if (change === "skill-source") options.skills![0]!.sourceInfo.path = "/different/SKILL.md";
+		if (change === "skill-missing") options.skills = [];
+		assert.throws(() => assertReadOnlyEnvironment(expected, change === "missing" ? undefined : snapshotReadOnlyEnvironment(options, tools)), /未发送任务/);
+	});
+}
+
+test("父协调工具提示与只读子工具提示不同，不当作基础指令丢失", () => {
+	const { tools, options } = environmentFixture();
+	const expected = snapshotReadOnlyEnvironment(options, tools);
+	options.selectedTools = ["read", "delivery_readonly"];
+	options.toolSnippets = { delivery_readonly: "父角色专有" };
+	options.promptGuidelines = ["父角色工具指南"];
+	assert.doesNotThrow(() => assertReadOnlyEnvironment(expected, snapshotReadOnlyEnvironment(options, tools)));
 });
 
 test("内部命令来源不符时不能执行，即使名字相同", async () => {
@@ -98,4 +171,89 @@ test("正常关闭使用来源已核实的控制命令并等待 close，不靠�
 	});
 	assert.deepEqual(await rpc.stop("/owned.ts"), { code: 0, signal: null });
 	assert.deepEqual(requests.map((request) => request.type), ["clear_queue", "abort", "get_commands", "prompt"]);
+});
+
+function dialogFixture(mode: "tui" | "rpc" = "tui") {
+	const h = fixture();
+	const parent = new AbortController();
+	const interrupt = new AbortController();
+	const titles: string[] = [];
+	let aborts = 0;
+	const ui = {
+		select: async (title: string) => { titles.push(title); return "second"; },
+		confirm: async (title: string) => { titles.push(title); return true; },
+		input: async (title: string) => { titles.push(title); return "普通回答"; },
+	} as unknown as ExtensionUIContext;
+	const dialogs = createChildDialogs(h.rpc, { mode, ui, abort() { aborts++; } }, AbortSignal.any([parent.signal, interrupt.signal]), interrupt);
+	h.rpc.onEvent = (event) => dialogs.handle(event);
+	const request = (method: string, id = "child-request", extras = {}) => h.emit({ type: "extension_ui_request", id, method,
+		title: "同意方案并扩大权限？", options: ["first", "second"], message: "问题正文", placeholder: "输入", ...extras });
+	return { ...h, dialogs, ui, titles, parent, interrupt, request, aborts: () => aborts };
+}
+
+for (const method of ["select", "confirm", "input"] as const) test(`普通子 ${method} 回答只关联当前请求，不成为批准`, async () => {
+	const h = dialogFixture();
+	h.request(method, `child-${method}`);
+	await nextTurn();
+	await h.dialogs.close();
+	assert.deepEqual(h.requests, [{ type: "extension_ui_response", id: `child-${method}`,
+		...(method === "confirm" ? { confirmed: true } : { value: method === "select" ? "second" : "普通回答" }) }]);
+	assert.match(h.titles[0]!, /PID 123.*普通询问，不授予交付权限/);
+	assert.equal(h.aborts(), 0);
+	assert.equal(h.interrupt.signal.aborted, false);
+	h.process.emit("close", 0, null);
+});
+
+for (const kind of ["select-cancel", "confirm-deny", "input-cancel", "ui-error", "invalid-answer", "editor", "rpc"]) test(`子交互 ${kind} 取消回复并暂停，不回答允许`, async () => {
+	const h = dialogFixture(kind === "rpc" ? "rpc" : "tui");
+	if (kind === "select-cancel") h.ui.select = async () => undefined;
+	if (kind === "confirm-deny") h.ui.confirm = async () => false;
+	if (kind === "input-cancel") h.ui.input = async () => undefined;
+	if (kind === "ui-error") h.ui.select = async () => { throw new Error("fixture UI failure"); };
+	if (kind === "invalid-answer") h.ui.select = async () => "unrelated";
+	h.request(kind === "confirm-deny" ? "confirm" : kind === "input-cancel" ? "input" : kind === "editor" ? "editor" : "select");
+	await nextTurn();
+	await assert.rejects(h.dialogs.close());
+	assert.deepEqual(h.requests, [{ type: "extension_ui_response", id: "child-request", cancelled: true }]);
+	assert.equal(h.interrupt.signal.aborted, true);
+	assert.equal(h.aborts(), kind === "rpc" ? 0 : 1);
+	if (kind === "ui-error") assert.match(String(h.interrupt.signal.reason), /fixture UI failure/);
+	h.process.emit("close", 0, null);
+});
+
+for (const kind of ["parent-cancel", "timeout", "tool-ended", "concurrent", "child-exit"]) test(`未决子交互 ${kind} 丢弃迟到回答并结束对话`, async () => {
+	const h = dialogFixture();
+	let answer!: (value: string | undefined) => void;
+	h.ui.input = async (_title, _placeholder, options) => new Promise((resolve) => {
+		answer = resolve;
+		options!.signal!.addEventListener("abort", () => resolve("迟到允许"), { once: true });
+	});
+	if (kind === "tool-ended") h.emit({ type: "tool_execution_start", toolCallId: "call" });
+	h.request("input", "original", kind === "timeout" ? { timeout: 1 } : {});
+	await nextTurn();
+	if (kind === "timeout") await new Promise((resolve) => setTimeout(resolve, 10));
+	if (kind === "parent-cancel") h.parent.abort(new Error("fixture cancel"));
+	if (kind === "tool-ended") h.emit({ type: "tool_execution_end", toolCallId: "call", isError: false });
+	if (kind === "concurrent") h.request("select", "other");
+	if (kind === "child-exit") h.process.emit("close", 0, null);
+	const closing = assert.rejects(h.dialogs.close());
+	answer("迟到允许");
+	await closing;
+	assert.ok(h.requests.every((row) => row.cancelled === true));
+	assert.ok(h.requests.every((row) => ["original", "other"].includes(row.id)));
+	if (kind === "child-exit") assert.deepEqual(h.requests, []);
+	else h.process.emit("close", 0, null);
+});
+
+test("父中止抛错仍取消子回答并保留两个真实错误", async () => {
+	const h = fixture();
+	const controller = new AbortController();
+	const dialogs = createChildDialogs(h.rpc, { mode: "tui", ui: { input: async () => { throw new Error("fixture UI failed"); } } as unknown as ExtensionUIContext,
+		abort() { throw new Error("fixture abort failed"); } }, controller.signal, controller);
+	dialogs.handle({ type: "extension_ui_request", id: "request", method: "input", title: "问题" });
+	await nextTurn();
+	await assert.rejects(dialogs.close(), (error: unknown) => error instanceof AggregateError
+		&& error.errors.some((item) => String(item).includes("fixture UI failed")) && error.errors.some((item) => String(item).includes("fixture abort failed")));
+	assert.equal(h.requests[0].cancelled, true);
+	h.process.emit("close", 0, null);
 });

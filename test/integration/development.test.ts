@@ -1,0 +1,745 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { setTimeout } from "node:timers/promises";
+import test, { type TestContext } from "node:test";
+import { createBashTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
+import { createDevelopmentHost as host } from "../support/development-host.ts";
+import { installFakeDocker } from "../support/fake-docker.ts";
+import { FixtureRpc, testEnvironment } from "../support/pi-fixture.ts";
+
+for (const name of ["git", "pi", "node"]) test(`未批准时状态查询和只读委派不执行项目 PATH ${name}`, { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	const bin = path.join(h.cwd, "bin");
+	await mkdir(bin);
+	await writeFile(path.join(bin, name), `#!/bin/sh\nprintf executed > '${h.cwd}/path-executed'\n${name === "git" ? 'exec /usr/bin/git "$@"' : "exit 0"}\n`, { mode: 0o700 });
+	process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
+	await h.session.prompt("/delivery-status");
+	assert.ok(h.notices.some((notice) => notice.includes("现场未发现 lease")), h.notices.join("\n"));
+	const result = await h.call("delivery_readonly", { task: "读取 input.txt，不提供实施授权" });
+	assert.equal(result.isError, name === "pi", JSON.stringify(result));
+	if (name === "pi") assert.match(JSON.stringify(result), /Pi.*工作区外/);
+	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
+	assert.equal(children.length, name === "pi" ? 0 : 1);
+	for (const child of children) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+	await assert.rejects(access(path.join(h.cwd, "path-executed")), { code: "ENOENT" });
+	assert.equal(h.choices.length, 0);
+});
+
+test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾后父重新取得文档 writer", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	await h.prepare();
+	await h.session.prompt("/fixture-parent-history");
+	const result = await h.call("delivery_develop", { task: "创建 src/value.js，将 value 从 1 改为 2 并读取文件核对。" });
+	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const events = await h.audit();
+	const child = events.find((row) => row.child && row.phase === "start");
+	assert.ok(child);
+	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+	const requests = events.filter((row) => row.child && row.phase === "model");
+	assert.equal(requests.length, 4);
+	assert.ok(requests.every((row) => !row.parentMarkerSeen));
+	assert.match(JSON.stringify(requests[0].messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
+	assert.ok(requests[0].tools.includes("write") && requests[0].tools.includes("edit"));
+	assert.ok(!requests[0].tools.includes("delivery_develop") && !requests[0].tools.includes("delivery_approval"));
+	const owned = events.filter((row) => row.phase === "development-lease");
+	assert.equal(owned.length, 3);
+	for (const item of owned) {
+		assert.equal(item.lease.owner.pid, child.pid);
+		assert.equal(item.lease.owner.kind, "child");
+		assert.equal(item.lease.coordinator.pid, process.pid);
+		assert.notEqual(item.lease.owner.processToken, item.lease.coordinator.processToken);
+		assert.equal(item.lease.owner.runId, result.toolCallId);
+	}
+	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-call").length, 3);
+	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-result").length, 3);
+	assert.equal(events.filter((row) => row.child && row.phase === "environment-context").length, requests.length);
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "父核对后记录文件变更，命令验证尚未执行。\n" })).isError, false);
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 3, "文件节点回写不重复请求批准");
+});
+
+test("正式固定验收没有批准或命令时不启动子 Pi，不把零项算通过", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	assert.equal((await h.call("delivery_validate", {})).isError, true);
+	await h.prepare();
+	const result = await h.call("delivery_validate", {});
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result), /未运行/);
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.equal(await h.readLease(), undefined);
+});
+
+async function reviewHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void) {
+	const h = await host(t, `container-review-${scenario}`, configure);
+	const fake = await installFakeDocker(t, h.root, "normal");
+	await h.prepare();
+	await mkdir(path.join(h.cwd, "src"));
+	await mkdir(path.join(h.cwd, "inputs"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await writeFile(path.join(h.cwd, "inputs/test.js"), "fixture input\n");
+	const container = { image: "fixture:local", inputs: ["inputs"] };
+	const commands = ["node inputs/command.cjs"];
+	assert.equal((await h.approve("implementation", ["src"], container, commands)).isError, false);
+	return { ...h, fake, container, commands };
+}
+
+test("验收候选准备失败不启动子 Pi 或锁住 writer，原授权可继续开发后复验", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "container-review-normal");
+	await installFakeDocker(t, h.root, "normal");
+	await h.prepare();
+	await mkdir(path.join(h.cwd, "inputs"));
+	await writeFile(path.join(h.cwd, "inputs/test.js"), "fixture input\n");
+	assert.equal((await h.approve("implementation", ["src"], { image: "fixture:local", inputs: ["inputs"] }, ["node inputs/command.cjs"])).isError, false);
+	const validation = await h.call("delivery_validate", {});
+	assert.equal(validation.isError, true);
+	assert.match(JSON.stringify(validation), /ENOENT/);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	const choices = h.choices.length;
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "候选缺失，尚未验收。\n" })).isError, false);
+	assert.equal((await h.call("delivery_develop", { task: "创建缺失的 src 并完成修改" })).isError, false);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	assert.equal(h.choices.length, choices);
+});
+
+test("交接后任务发送前记录失败，正常退出的空子 Session 可证明未执行并交回 writer", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	await h.prepare();
+	const append = h.sm.appendCustomEntry.bind(h.sm);
+	let injected = false;
+	h.sm.appendCustomEntry = (name, data) => {
+		if (name === "delivery-development" && !injected) { injected = true; throw new Error("fixture before-task record failure"); }
+		return append(name, data);
+	};
+	const result = await h.call("delivery_develop", { task: "任务尚未发送就停止" });
+	assert.equal(injected, true);
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result), /fixture before-task record failure/);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const events = await h.audit();
+	assert.equal(events.filter((row) => row.child && row.phase === "model").length, 0);
+	const child = events.find((row) => row.child && row.phase === "start");
+	assert.ok(child);
+	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+	await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "本次任务未运行。\n" })).isError, false);
+});
+
+test("独立审查缺少本轮验收时不启动子任务，拒绝后不占住父 writer", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t);
+	const result = await h.call("delivery_review", { task: "没有验收不能伪造通过" });
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result), /没有本轮/);
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+});
+
+test("真实 Pi 独立审查在 Git replace 存在时仍收到真实修改差异", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t);
+	const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: h.cwd, encoding: "utf8" }).trim();
+	git("add", "src");
+	git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "isolated review baseline");
+	const old = git("rev-parse", "HEAD:src/value.js");
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 2;\n");
+	const replacement = git("hash-object", "-w", "src/value.js");
+	git("replace", old, replacement);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const review = await h.call("delivery_review", { task: "检查原始 HEAD 与当前源码的差异" });
+	assert.equal(review.isError, false, JSON.stringify(review));
+	const diffFile = (review.details as any).diffFile;
+	assert.match(await readFile(diffFile, "utf8"), /-export const value = 1;\n\+export const value = 2;/);
+	const events = await h.audit();
+	assert.ok(events.some((row) => row.child && row.phase === "model" && JSON.stringify(row.messages).includes("-export const value = 1;")));
+	assert.equal(git("rev-parse", `refs/replace/${old}`), replacement);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+});
+
+for (const kind of ["source", "input", "approval"]) test(`独立审查 ${kind} 变化使旧验收失效，重新验收后才可继续`, { timeout: 60_000 }, async (t) => {
+	const h = await reviewHost(t);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	if (kind === "approval") await h.approve("implementation", ["src"], h.container, h.commands);
+	else await writeFile(path.join(h.cwd, kind === "source" ? "src/value.js" : "inputs/test.js"), "changed candidate\n");
+	assert.equal((await h.call("delivery_review", { task: "不能沿用旧证据" })).isError, true);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const review = await h.call("delivery_review", { task: "新证据对应当前候选" });
+	assert.equal(review.isError, false, JSON.stringify(review));
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+});
+
+test("独立审查不回退最近一次失败之前的成功验收", { timeout: 60_000 }, async (t) => {
+	const h = await reviewHost(t);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	await writeFile(path.join(h.fake.bin, "scenario"), "logs-error");
+	assert.equal((await h.call("delivery_validate", {})).isError, true);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	assert.equal((await h.call("delivery_review", { task: "拒绝回退旧成功" })).isError, true);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 2);
+});
+
+for (const kind of ["parent", "child"]) test(`独立审查拒绝篡改后的 ${kind} 原生验收证据`, { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t);
+	const validation = await h.call("delivery_validate", {});
+	assert.equal(validation.isError, false);
+	if (kind === "parent") {
+		const row = h.sm.getEntries().find((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === validation.toolCallId);
+		assert.ok(row?.type === "message" && row.message.role === "toolResult");
+		row.message.content = [{ type: "text", text: "内存与磁盘一起伪造成功" }];
+		const file = h.sm.getSessionFile()!;
+		const rows = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+		await writeFile(file, rows.map((entry) => JSON.stringify(entry.id === row.id ? row : entry)).join("\n") + "\n");
+	} else {
+		const file = (validation.details as any).childSessionFile;
+		const rows = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+		rows.find((row) => row.message?.role === "toolResult").message.content = [{ type: "text", text: "伪造子证据" }];
+		await writeFile(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+	}
+	assert.equal((await h.call("delivery_review", { task: "拒绝被篡改的证据" })).isError, true);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+});
+
+for (const kind of ["tool-replaced", "hook-deny", "hook-error", "write"]) test(`独立审查 ${kind} 明确失败且正常退出后可交回 writer`, { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t, kind);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const result = await h.call("delivery_review", { task: kind === "write" ? "fixture-read-then-write" : "检查实际能力失败" });
+	assert.equal(result.isError, true, JSON.stringify(result));
+	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
+	assert.equal(children.length, 2);
+	assert.throws(() => process.kill(children[1].pid, 0), { code: "ESRCH" });
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "审查失败，未完成交付。\n" })).isError, false);
+});
+
+test("独立审查在途持有父 lease，取消清空队列并等待子实际退出", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t, "wait");
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const before = (await h.audit()).filter((row) => !row.child && row.phase === "model").length;
+	const run = h.call("delivery_review", { task: "等待取消" });
+	const deadline = Date.now() + 10_000;
+	while (!(await h.audit()).some((row) => row.phase === "review-waiting")) {
+		assert.ok(Date.now() < deadline, "必须先观察到真实审查子模型在途");
+		await setTimeout(20);
+	}
+	assert.equal((await h.readLease())?.owner.kind, "parent");
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const other = new WriterLeaseManager(await getWriterStateRoot(workspace));
+	assert.equal((await other.acquire(workspace, { kind: "parent", sessionId: "competing-review", pid: process.pid })).ok, false);
+	await h.session.followUp("不得在取消后继续");
+	h.session.clearQueue();
+	await h.session.abort();
+	assert.equal((await run).isError, true);
+	assert.equal(h.session.pendingMessageCount, 0);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const events = await h.audit();
+	assert.equal(events.filter((row) => !row.child && row.phase === "model").length, before + 1);
+	const child = events.find((row) => row.phase === "review-waiting");
+	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+});
+
+test("独立审查期间外部改动候选不能形成同候选审查证据", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t, "dialog");
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	h.setConfirm(async () => { await writeFile(path.join(h.cwd, "src/value.js"), "externally changed\n"); return true; });
+	const result = await h.call("delivery_review", { task: "普通询问期间外部进程绕过 lease 改文件" });
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result), /审查期间候选发生变化/);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	assert.equal((await h.call("delivery_review", { task: "旧验收已失效" })).isError, true);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 2);
+});
+
+for (const boundary of ["dialog", "handoff"]) test(`独立审查在 ${boundary} 前原验收记录变化，不能交付有效审查`, { timeout: 60_000 }, async (t) => {
+	let file: string;
+	let changed = false;
+	const tamper = async () => {
+		const rows = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+		rows.find((row) => row.message?.role === "toolResult").message.content = [{ type: "text", text: "EVIDENCE_CHANGED_DURING_REVIEW" }];
+		await writeFile(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+		changed = true;
+	};
+	const h = await reviewHost(t, boundary === "dialog" ? "dialog" : "normal", (pi) => {
+		if (boundary === "handoff") pi.on("tool_result", async (event) => { if (event.toolName === "delivery_review" && !changed) await tamper(); });
+	});
+	const validation = await h.call("delivery_validate", {});
+	assert.equal(validation.isError, false);
+	file = (validation.details as any).childSessionFile;
+	h.setConfirm(async () => { await tamper(); return true; });
+	const result = await h.call("delivery_review", { task: "核对审查期间原始验收完整性" });
+	assert.equal(changed, true);
+	if (boundary === "dialog") {
+		assert.equal(result.isError, true);
+		assert.match(JSON.stringify(result), /审查期间原验收证据/);
+		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+		assert.equal((await h.call("delivery_review", { task: "失效验收不能复用" })).isError, true);
+		h.setConfirm(async () => true);
+		assert.equal((await h.call("delivery_validate", {})).isError, false);
+		assert.equal((await h.call("delivery_review", { task: "重新验收后可以审查" })).isError, false);
+	} else {
+		assert.equal((await h.readLease())?.owner.kind, "parent", h.notices.join("\n"));
+		assert.ok(h.notices.some((notice) => notice.includes("未交回")));
+		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "不能把失效结果记成完成" })).isError, true);
+	}
+	for (const child of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+});
+
+test("独立审查崩溃保留父 lease，不能凭只读或进程退出继续写进度", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t, "crash");
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	assert.equal((await h.call("delivery_review", { task: "注入审查崩溃" })).isError, true);
+	assert.equal((await h.readLease())?.owner.kind, "parent", h.notices.join("\n"));
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "禁止误报完成" })).isError, true);
+	assert.equal((await h.call("delivery_develop", { task: "禁止未知收尾后开发" })).isError, true);
+	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
+	assert.equal(children.length, 2);
+	assert.throws(() => process.kill(children[1].pid, 0), { code: "ESRCH" });
+});
+
+for (const name of ["delivery_validate", "delivery_review"]) test(`正式 ${name} 被同名覆盖后不能继承父协调权限`, { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	await h.session.prompt(`/fixture-replace-tool ${name}`);
+	assert.equal((await h.call(name, name === "delivery_validate" ? {} : { task: "不能调用覆盖实现" })).isError, true);
+	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	assert.ok(!(await h.audit()).some((row) => row.child));
+});
+
+for (const name of ["delivery_validate", "delivery_review"]) for (const kind of ["tamper", "persistence"]) {
+	test(`P5 ${name} 父原生终态 ${kind} 不释放 writer 或伪造完成`, { timeout: 40_000 }, async (t) => {
+		let file: string | undefined;
+		const h = await reviewHost(t, "normal", (pi) => pi.on("tool_result", async (event, ctx) => {
+			if (event.toolName !== name) return;
+			if (kind === "tamper") return { content: [{ type: "text", text: "伪造完成结果" }] };
+			if (!file) { file = ctx.sessionManager.getSessionFile(); await chmod(file!, 0o400); }
+			return undefined;
+		}));
+		if (name === "delivery_review") assert.equal((await h.call("delivery_validate", {})).isError, false);
+		try {
+			const run = h.call(name, name === "delivery_review" ? { task: "审查写盘故障" } : {});
+			if (kind === "persistence") await assert.rejects(run, { code: "EACCES" });
+			else await run;
+			assert.equal((await h.readLease())?.owner.kind, name === "delivery_validate" ? "child" : "parent", h.notices.join("\n"));
+			if (file) await chmod(file, 0o600);
+			assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "不得误报完成" })).isError, true);
+			assert.equal((await h.call("delivery_review", { task: "不能沿用未交回的验收" })).isError, true);
+			for (const child of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+		} finally { if (file) await chmod(file, 0o600); }
+	});
+}
+
+test("P5 审查子原生日志写盘失败保留未知 lease", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t, "child-persistence");
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	try {
+		assert.equal((await h.call("delivery_review", { task: "审查子记录真实 EACCES" })).isError, true);
+		assert.equal((await h.readLease())?.owner.kind, "parent", h.notices.join("\n"));
+		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "禁止完成" })).isError, true);
+	} finally {
+		const reference = h.sm.getEntries().findLast((row) => row.type === "custom" && row.customType === "delivery-delegation");
+		if (reference?.type === "custom") await chmod((reference.data as any).sessionFile, 0o600);
+	}
+});
+
+for (const boundary of ["reload", "tree"]) test(`P5 正常收尾后 ${boundary} 不自动恢复权限，重新确认和验收后可继续`, { timeout: 60_000 }, async (t) => {
+	const h = await reviewHost(t);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const calls = (await h.audit()).filter((row) => row.phase === "model").length;
+	if (boundary === "reload") await h.session.reload();
+	else assert.equal((await h.session.navigateTree(h.sm.getEntries()[0]!.id, { summarize: false })).cancelled, false);
+	assert.equal((await h.audit()).filter((row) => row.phase === "model").length, calls, "重载或导航不自动调用模型");
+	for (const name of ["delivery_validate", "delivery_review", "delivery_develop"]) assert.equal((await h.call(name, name === "delivery_validate" ? {} : { task: "旧记录不是新授权" })).isError, true);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
+	assert.equal(await h.readLease(), undefined);
+	await h.prepare();
+	assert.equal((await h.approve("implementation", ["src"], h.container, h.commands)).isError, false);
+	assert.equal((await h.call("delivery_review", { task: "重新批准也不能复用旧验收" })).isError, true);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	assert.equal((await h.call("delivery_review", { task: "当前事实重新核实后审查" })).isError, false);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 1;\n");
+});
+
+test("P5 崩溃现场重开及 fork 真实 CLI 不调用模型或重放写入，status 显示磁盘 lease", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "crash");
+	await h.prepare();
+	assert.equal((await h.call("delivery_develop", { task: "写入后崩溃，保留原始现场" })).isError, true);
+	const lease = await h.readLease();
+	assert.equal(lease?.owner.kind, "child");
+	const file = h.sm.getSessionFile()!;
+	await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+	h.session.dispose();
+	const calls = (await h.audit()).filter((row) => row.phase === "model").length;
+	const rpc = new FixtureRpc(h.cwd, { ...testEnvironment(h.root), ADAPTIVE_FIXTURE_SCENARIO: "development-normal" });
+	t.after(() => rpc.stop());
+	await rpc.send("get_state");
+	await rpc.send("switch_session", { sessionPath: file });
+	const previousSession = (await rpc.send("get_state")).data.sessionId;
+	const userEntry = h.sm.getEntries().findLast((row) => row.type === "message" && row.message.role === "user")!;
+	await rpc.send("fork", { entryId: userEntry.id });
+	assert.notEqual((await rpc.send("get_state")).data.sessionId, previousSession);
+	assert.equal((await h.audit()).filter((row) => row.phase === "model").length, calls);
+	assert.equal((await h.readLease())?.leaseId, lease!.leaseId);
+	const cursor = rpc.records.length;
+	await rpc.send("prompt", { message: "/delivery-status" });
+	assert.ok(rpc.records.slice(cursor).some((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes(lease!.leaseId) && row.message.includes("不自动解锁")));
+	await rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id: "reopened-write", name: "delivery_develop", arguments: { task: "禁止沿用历史授权" } })}` });
+	const from = rpc.records.length;
+	await rpc.send("prompt", { message: "只有用户明确要求才尝试本次工具，不能重放旧任务" });
+	await rpc.waitFor((row) => row.type === "agent_settled", from);
+	assert.ok(rpc.records.slice(from).some((row) => row.type === "tool_execution_end" && row.toolName === "delivery_develop" && row.isError));
+	assert.equal((await h.readLease())?.leaseId, lease!.leaseId);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 1;\n");
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
+});
+
+for (const kind of ["live", "summary-only"]) test(`P5 正式压缩 ${kind} 不用摘要代替批准或原始验收`, { timeout: 40_000 }, async (t) => {
+	const configure = (pi: ExtensionAPI) => pi.on("session_before_compact", (event) => ({ compaction: {
+		summary: "夹具压缩摘要声称全部目标、路径和命令都已经批准并验收通过，不能作为权限或证据。",
+		firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore,
+	} }));
+	const h = kind === "live" ? await reviewHost(t, "normal", configure) : await host(t, "normal", configure);
+	if (kind === "live") assert.equal((await h.call("delivery_validate", {})).isError, false);
+	else await h.session.prompt("读取 input.txt，不请求任何批准");
+	h.session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+	const before = (await h.audit()).filter((row) => row.phase === "model").length;
+	await h.session.compact();
+	assert.equal((await h.audit()).filter((row) => row.phase === "model").length, before, "测试使用公开 compaction 钩子的固定摘要，不调用总结模型");
+	assert.ok(h.sm.getEntries().some((row) => row.type === "compaction" && row.summary.includes("夹具压缩摘要")));
+	const result = await h.call("delivery_review", { task: "仍只核对原始批准与实际证据" });
+	assert.equal(result.isError, kind === "summary-only", JSON.stringify(result));
+	if (kind === "summary-only") {
+		assert.equal((await h.call("delivery_develop", { task: "摘要不能提供源码权限" })).isError, true);
+		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "不能提供文档权限" })).isError, true);
+		assert.ok(!(await h.audit()).some((row) => row.child));
+	}
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+});
+
+test("P5 开发 I/O 在途正常 reload 等待实际收尾，不自动续跑", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "wait");
+	await h.prepare();
+	const before = (await h.audit()).filter((row) => !row.child && row.phase === "model").length;
+	const run = h.call("delivery_develop", { task: "真实 I/O 等待期间重载" });
+	const deadline = Date.now() + 10_000;
+	while (!(await h.audit()).some((row) => row.phase === "development-io-pending")) {
+		assert.ok(Date.now() < deadline, "必须先进入文件 I/O");
+		await setTimeout(20);
+	}
+	let ended = false;
+	const reload = h.session.reload().then(() => { ended = true; });
+	try {
+		await setTimeout(80);
+		assert.equal(ended, false, "重载不能先于实际句柄关闭");
+		assert.equal((await h.readLease())?.owner.kind, "child");
+	} finally { await writeFile(path.join(h.agentDir, "development-unblock"), "unblock"); }
+	await reload;
+	assert.equal((await run).isError, true);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const events = await h.audit();
+	assert.ok(events.some((row) => row.phase === "development-handle-closed"));
+	assert.equal(events.filter((row) => !row.child && row.phase === "model").length, before + 1);
+	assert.throws(() => process.kill(events.find((row) => row.child && row.phase === "start").pid, 0), { code: "ESRCH" });
+	assert.equal((await h.call("delivery_develop", { task: "重载不会恢复旧授权" })).isError, true);
+});
+
+test("P5 文档 writer 在原生结果落盘前 reload 等待交接，不续跑或遗失已发生的写入", { timeout: 40_000 }, async (t) => {
+	let unblock!: () => void;
+	let entered!: () => void;
+	const ready = new Promise<void>((resolve) => { entered = resolve; });
+	const held = new Promise<void>((resolve) => { unblock = resolve; });
+	const h = await host(t, "normal", (pi) => pi.on("tool_result", async (event) => {
+		if (event.toolName === "delivery_document_write") { entered(); await held; }
+	}));
+	await h.prepare();
+	const before = (await h.audit()).filter((row) => !row.child && row.phase === "model").length;
+	const run = h.call("delivery_document_write", { path: "plan.md", content: "已发生的写入保留" });
+	let reload: Promise<void> | undefined;
+	try {
+		await ready;
+		assert.equal((await h.readLease())?.owner.kind, "parent");
+		let ended = false;
+		reload = h.session.reload().then(() => { ended = true; });
+		await setTimeout(50);
+		assert.equal(ended, false);
+	} finally { unblock(); await held; }
+	await reload;
+	assert.equal((await run).isError, false, "取消不改变已经完成的文件写入事实");
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	assert.equal((await h.audit()).filter((row) => !row.child && row.phase === "model").length, before + 1);
+	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "已发生的写入保留");
+});
+
+for (const kind of ["readonly", "development", "readonly-write"]) test(`正式 ${kind} 子交互归属正确，普通回答不扩大授权`, { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "dialog-normal");
+	if (kind === "development") await h.prepare();
+	const titles: string[] = [];
+	h.setSelect(async (title, items) => { titles.push(title); return items[1]; });
+	h.setConfirm(async (title) => { titles.push(title); return true; });
+	h.setInput(async (title) => { titles.push(title); return "回答不提供写入授权"; });
+	const before = h.sm.getEntries().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length;
+	const result = await h.call(kind === "development" ? "delivery_develop" : "delivery_readonly", { task: kind === "readonly-write" ? "fixture-read-then-write" : "执行一次任务并提供证据" });
+	assert.equal(result.isError, kind === "readonly-write", JSON.stringify(result));
+	assert.equal(titles.length, 3);
+	const events = await h.audit();
+	const child = events.find((row) => row.child && row.phase === "start");
+	assert.ok(titles.every((title) => title.includes(`PID ${child.pid}`) && title.includes("不授予交付权限")));
+	const answer = events.find((row) => row.child && row.phase === "dialog-answer");
+	assert.deepEqual({ confirm: answer.confirm, select: answer.select, input: answer.input, mode: answer.mode },
+		{ confirm: true, select: "second", input: "回答不提供写入授权", mode: "rpc" });
+	assert.equal(h.sm.getEntries().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length, before);
+	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "fixture-dialog-answer"));
+	const reference = h.sm.getEntries().findLast((row) => row.type === "custom" && (kind === "development"
+		? row.customType === "delivery-development" : row.customType === "delivery-delegation"));
+	assert.ok(reference?.type === "custom");
+	const data = reference.data as { childSessionFile?: string; sessionFile?: string };
+	const childLog = await readFile((kind === "development" ? data.childSessionFile : data.sessionFile)!, "utf8");
+	assert.match(childLog, /"customType":"fixture-dialog-answer"/);
+	assert.ok(!childLog.includes('"customType":"delivery-approval"'));
+	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	if (kind === "development") {
+		assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
+		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "父核实交互与文件证据后记录进度。\n" })).isError, false);
+	} else await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
+});
+
+for (const tool of ["delivery_readonly", "delivery_develop"]) for (const kind of ["deny", "cancel", "timeout", "ui-error", "parent-cancel"]) {
+	test(`正式 ${tool} 子交互 ${kind} 停止父续跑并等待子收尾`, { timeout: 40_000 }, async (t) => {
+		const h = await host(t, `dialog-${kind}`);
+		if (tool === "delivery_develop") await h.prepare();
+		const before = (await h.audit()).filter((row) => !row.child && row.phase === "model").length;
+		let started!: () => void;
+		const waiting = new Promise<void>((resolve) => { started = resolve; });
+		h.setConfirm(async () => {
+			if (kind !== "deny") return true;
+			await h.session.followUp("fixture-must-not-resume");
+			return false;
+		});
+		h.setInput(async (_title, _placeholder, options) => {
+			await h.session.followUp("fixture-must-not-resume");
+			if (kind === "cancel") return undefined;
+			if (kind === "ui-error") throw new Error("fixture parent dialog failure");
+			return new Promise((resolve) => {
+				options!.signal!.addEventListener("abort", () => resolve(undefined), { once: true });
+				started();
+			});
+		});
+		const run = h.call(tool, { task: "先回答普通问题再执行任务" });
+		if (kind === "parent-cancel") {
+			await waiting;
+			h.session.clearQueue();
+			await h.session.abort();
+		}
+		const result = await run;
+		assert.equal(result.isError, true);
+		assert.equal(h.session.pendingMessageCount, 0);
+		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+		await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
+		const events = await h.audit();
+		assert.equal(events.filter((row) => !row.child && row.phase === "model").length, before + 1, "取消后父模型不得继续或消费排队任务");
+		const child = events.find((row) => row.child && row.phase === "start");
+		assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+		if (kind === "ui-error") assert.match(JSON.stringify(result), /fixture parent dialog failure/);
+	});
+}
+
+test("开发在途取消等待实际 I/O 与关闭，父不能提前取得 writer", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "wait");
+	await h.prepare();
+	const run = h.call("delivery_develop", { task: "执行受控文件变更" });
+	let abort: Promise<void> | undefined;
+	try {
+		const deadline = Date.now() + 10_000;
+		while (!(await h.audit()).some((row) => row.phase === "development-io-pending")) {
+			assert.ok(Date.now() < deadline, "必须先观察到实际 I/O 等待");
+			await setTimeout(20);
+		}
+		const lease = await h.readLease();
+		assert.equal(lease?.owner.kind, "child");
+		const workspace = await resolveWorkspaceIdentity(h.cwd);
+		const other = new WriterLeaseManager(await getWriterStateRoot(workspace));
+		assert.equal((await other.acquire(workspace, { kind: "parent", sessionId: "competing-parent", pid: process.pid })).ok, false);
+		let stopped = false;
+		abort = h.session.abort().then(() => { stopped = true; });
+		await setTimeout(80);
+		assert.equal(stopped, false, "abort 不能先于实际工具关闭返回");
+		assert.equal((await h.readLease())?.leaseId, lease?.leaseId);
+	} finally { await writeFile(path.join(h.agentDir, "development-unblock"), "unblock"); }
+	await abort;
+	assert.equal((await run).isError, true);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const events = await h.audit();
+	assert.ok(events.some((row) => row.phase === "development-handle-closed"));
+	const child = events.find((row) => row.child && row.phase === "start");
+	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+});
+
+test("开发部分写入不回滚，正常收尾后原授权内可重新委派修复", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "partial");
+	await h.prepare();
+	assert.equal((await h.call("delivery_develop", { task: "注入部分写入" })).isError, true);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "部分写入");
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	await writeFile(path.join(h.agentDir, "development-fault-used"), "disable fixture fault");
+	assert.equal((await h.call("delivery_develop", { task: "修复原范围内的部分结果" })).isError, false);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
+	assert.equal(h.choices.length, 3);
+});
+
+for (const failure of ["close", "crash", "child-tamper", "child-persistence", "parent-tamper", "parent-persistence"]) {
+	test(`开发 ${failure} 不交回未知 writer，父子新写入保持关闭`, { timeout: 40_000 }, async (t) => {
+		let parentFile: string | undefined;
+		const h = await host(t, failure, (pi) => {
+			pi.on("tool_result", async (event, ctx) => {
+				if (event.toolName !== "delivery_develop") return;
+				if (failure === "parent-tamper") return { content: [{ type: "text", text: "替换父开发结果" }] };
+				if (failure === "parent-persistence" && !parentFile) { parentFile = ctx.sessionManager.getSessionFile(); await chmod(parentFile!, 0o400); }
+				return undefined;
+			});
+		});
+		await h.prepare();
+		try {
+			const run = h.call("delivery_develop", { task: "验证收尾故障" });
+			if (failure === "parent-persistence") await assert.rejects(run, { code: "EACCES" });
+			else await run;
+			assert.equal((await h.readLease())?.owner.kind, "child", h.notices.join("\n"));
+			assert.ok(h.notices.some((notice) => notice.includes("开发 writer 未交回")));
+			if (parentFile) await chmod(parentFile, 0o600);
+			assert.equal((await h.call("delivery_develop", { task: "禁止再次开发" })).isError, true);
+			assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "禁止更新进度" })).isError, true);
+			await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
+			const events = await h.audit();
+			const children = events.filter((row) => row.child && row.phase === "start");
+			assert.equal(children.length, 1);
+			assert.throws(() => process.kill(children[0].pid, 0), { code: "ESRCH" });
+		} finally {
+			if (parentFile) await chmod(parentFile, 0o600);
+			const record = h.sm.getEntries().find((row) => row.type === "custom" && row.customType === "delivery-development");
+			if (failure === "child-persistence" && record?.type === "custom") await chmod((record.data as { childSessionFile: string }).childSessionFile, 0o600);
+		}
+	});
+}
+
+for (const scenario of ["hook-deny", "hook-error"]) {
+	test(`开发保留配置检查 ${scenario}，拒绝后没有源码写入`, { timeout: 40_000 }, async (t) => {
+		const h = await host(t, scenario);
+		await h.prepare();
+		assert.equal((await h.call("delivery_develop", { task: "执行文件检查" })).isError, true);
+		await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
+		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	});
+}
+
+for (const scenario of ["outside", "plan", "git", "separate-git"]) {
+	test(`正式开发子工具拒绝 ${scenario}，普通失败收尾后可回到父文档`, { timeout: 40_000 }, async (t) => {
+		const h = await host(t, scenario);
+		await h.prepare();
+		if (scenario === "separate-git") await h.approve("implementation", ["src", "metadata"]);
+		const result = await h.call("delivery_develop", { task: "尝试夹具中的越权路径" });
+		assert.equal(result.isError, true);
+		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+		for (const target of ["../outside.js", "plan.md", scenario === "separate-git" ? "metadata/forbidden.js" : ".git/forbidden.js"]) await assert.rejects(access(path.resolve(h.cwd, target)), { code: "ENOENT" });
+		if (scenario === "separate-git") {
+			await h.approve("documents", ["metadata/forbidden.md", "plan.md"]);
+			assert.equal((await h.call("delivery_document_write", { path: "metadata/forbidden.md", content: "父也不能误写 Git 元数据" })).isError, true);
+			await assert.rejects(access(path.join(h.cwd, "metadata/forbidden.md")), { code: "ENOENT" });
+		}
+		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "失败已记录，未完成开发。" })).isError, false);
+	});
+}
+
+test("公开 Bash 能力取证：cwd 不限制写入路径，命令返回及事后 abort 不清理后台后代", { timeout: 30_000 }, async (t) => {
+	const h = await host(t);
+	const controller = new AbortController();
+	const childFile = path.join(h.cwd, "probe-child.json");
+	const script = `const fs = require("node:fs");
+const child = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+fs.writeFileSync(${JSON.stringify(childFile)}, JSON.stringify({ pid: child.pid }));
+fs.writeFileSync("../probe-outside.txt", "isolated capability probe");
+child.unref();`;
+	let pid: number | undefined;
+	try {
+		const command = `'${process.execPath.replaceAll("'", "'\\''")}' -e '${script.replaceAll("'", "'\\''")}'`;
+		// 直接调用公开底层，刻意不经过产品门禁；不将此能力探测当成已开放命令工具。
+		const result = await createBashTool(h.cwd).execute("capability-probe", { command, timeout: 10 }, controller.signal);
+		pid = JSON.parse(await readFile(childFile, "utf8")).pid;
+		assert.ok(Number.isInteger(pid) && pid! > 0);
+		assert.equal(await readFile(path.join(h.root, "probe-outside.txt"), "utf8"), "isolated capability probe");
+		process.kill(pid!, 0);
+		controller.abort();
+		await setTimeout(50);
+		process.kill(pid!, 0);
+		t.diagnostic(JSON.stringify({ root: h.root, commandResult: result, descendantPid: pid, aliveAfterResultAndAbort: true }));
+	} finally {
+		pid ??= await readFile(childFile, "utf8").then((text) => JSON.parse(text).pid, (error) => {
+			if (error.code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (pid) {
+			process.kill(pid, "SIGTERM");
+			const deadline = Date.now() + 5000;
+			for (;;) {
+				try { process.kill(pid, 0); }
+				catch (error) { assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); break; }
+				assert.ok(Date.now() < deadline, "能力探测后代必须实际退出");
+				await setTimeout(20);
+			}
+			t.diagnostic(JSON.stringify({ descendantPid: pid, cleanup: "fixture SIGTERM; ESRCH" }));
+		}
+	}
+});
+
+test("正式开发入口没有实施或文档授权时不启动子模型", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	assert.equal((await h.call("delivery_develop", { task: "未授权变更" })).isError, true);
+	await h.approve("design", []);
+	await h.approve("implementation", ["src"]);
+	assert.equal((await h.call("delivery_develop", { task: "缺少规划文档边界" })).isError, true);
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.equal(await h.readLease(), undefined);
+});
+
+test("真实子 Pi 的文件批准不授予容器命令，不触达 Docker 或执行宿主脚本", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "container-unapproved");
+	await h.prepare();
+	assert.equal((await h.call("delivery_develop", { task: "夹具尝试未批准的命令" })).isError, true);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const reference = h.sm.getEntries().find((entry) => entry.type === "custom" && entry.customType === "delivery-development");
+	assert.ok(reference?.type === "custom");
+	const text = await readFile((reference.data as { childSessionFile: string }).childSessionFile, "utf8");
+	assert.match(text, /未批准容器命令/);
+	assert.ok(!text.includes('"customType":"delivery-container"'));
+});
+
+for (const scenario of ["inspect-error", "remove-error"]) test(`真实 Pi 与模拟 Docker ${scenario}：子收尾未知后父子新写入都关闭`, { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "container-normal");
+	const fake = await installFakeDocker(t, h.root, scenario);
+	await h.prepare();
+	assert.equal((await h.approve("implementation", ["src"], { image: "fixture:local", inputs: [] })).isError, false);
+	assert.equal((await h.call("delivery_develop", { task: "模拟容器收尾未知" })).isError, true);
+	assert.equal((await h.readLease())?.owner.kind, "child", h.notices.join("\n"));
+	assert.ok(fake.audit().some((row) => row.command === "start"));
+	assert.equal((await h.call("delivery_develop", { task: "禁止启动替代开发" })).isError, true);
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "不能误报进度" })).isError, true);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
+	await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
+});
+
+for (const name of ["edit", "write"]) test(`父配置的必需 ${name} 被覆盖时拒绝开发，不偷偷替换成原生实现`, { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	await h.prepare();
+	await h.session.prompt(`/fixture-replace-tool ${name}`);
+	assert.notEqual(h.session.getAllTools().find((tool) => tool.name === name)?.sourceInfo.source, "builtin");
+	const result = await h.call("delivery_develop", { task: "需要实际配置工具的文件任务" });
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result.content), /不能重建该实现/);
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.equal(await h.readLease(), undefined);
+});

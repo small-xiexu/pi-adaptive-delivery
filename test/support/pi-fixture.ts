@@ -25,7 +25,7 @@ export function testEnvironment(root: string): NodeJS.ProcessEnv {
 }
 
 // 仅测试使用系统沙箱；不将它作为 Package 的生产权限实现。
-export function sandboxProfile(root: string, sourceRoot?: string): string {
+export function sandboxProfile(root: string, sourceRoot?: string, containerSocket?: string): string {
 	if (process.platform !== "darwin") {
 		throw new Error("正式隔离测试当前只验收 macOS；没有系统隔离时不执行测试。");
 	}
@@ -37,11 +37,15 @@ export function sandboxProfile(root: string, sourceRoot?: string): string {
 	for (let parent = sourceRoot && path.dirname(sourceRoot); parent && parent !== path.dirname(parent); parent = path.dirname(parent)) {
 		sourceParents.push(`(literal ${JSON.stringify(parent)})`);
 	}
+	if (containerSocket) for (let file = containerSocket; file !== path.dirname(file); file = path.dirname(file)) {
+		sourceParents.push(`(literal ${JSON.stringify(file)})`);
+	}
 	return `(version 1)
 (allow default)
 (deny network*)
 (deny file-read* ${blockedHome})
 ${sourceParents.length ? `(allow file-read-metadata ${sourceParents.join(" ")})` : ""}
+${containerSocket ? `(allow network-outbound (literal ${JSON.stringify(containerSocket)}))` : ""}
 (deny file-write* (require-not (require-any
   (subpath ${JSON.stringify(root)}) (literal "/dev/null"))))`;
 }
@@ -182,9 +186,11 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 		await copyFile(fileURLToPath(new URL("./document-io-fixture.ts", import.meta.url)), path.join(packageDir, "document-io.ts"));
 	}
 	const writerFixture = scenario?.startsWith("writer-") === true;
+	const developmentFixture = scenario?.startsWith("development-") === true;
 	if (writerFixture) await copyFile(fileURLToPath(new URL("./parent-writer-fixture.ts", import.meta.url)), path.join(packageDir, "parent-writer.ts"));
+	if (developmentFixture) await copyFile(fileURLToPath(new URL("./development-io-fixture.ts", import.meta.url)), path.join(packageDir, "development-io.ts"));
 	await writeFile(path.join(packageDir, "package.json"), JSON.stringify({
-		name: "adaptive-isolation-fixture", type: "module", pi: { extensions: ["./provider.ts", ...(scenario === "document-io" ? ["./document-io.ts"] : []), ...(writerFixture ? ["./parent-writer.ts"] : [])] },
+		name: "adaptive-isolation-fixture", type: "module", pi: { extensions: ["./provider.ts", ...(scenario === "document-io" ? ["./document-io.ts"] : []), ...(writerFixture ? ["./parent-writer.ts"] : []), ...(developmentFixture ? ["./development-io.ts"] : [])] },
 	}));
 	await writeFile(path.join(agentDir, "auth.json"), "{}\n");
 	let productDir: string | undefined;
@@ -202,5 +208,13 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 	}));
 	await writeFile(path.join(cwd, "AGENTS.md"), "# 临时规则\n仅操作测试夹具。\n");
 	await writeFile(path.join(cwd, "input.txt"), "fixture-read-ok\n");
+	if (scenario?.startsWith("environment-")) {
+		await mkdir(path.join(agentDir, "skills", "environment-proof"), { recursive: true });
+		await writeFile(path.join(agentDir, "AGENTS.md"), "# 全局测试规则\nGLOBAL_ENVIRONMENT_RULE\n");
+		await writeFile(path.join(cwd, "AGENTS.md"), "# 项目测试规则\nPROJECT_ENVIRONMENT_RULE\n");
+		await writeFile(path.join(agentDir, "SYSTEM.md"), "BASE_ENVIRONMENT_INSTRUCTION\n");
+		await writeFile(path.join(agentDir, "skills", "environment-proof", "SKILL.md"),
+			"---\nname: environment-proof\ndescription: ENVIRONMENT_SKILL_DESCRIPTION\n---\n\nENVIRONMENT_SKILL_BODY\n");
+	}
 	return { root, cwd, agentDir, packageDir, productDir, rpc: new FixtureRpc(cwd, env) };
 }

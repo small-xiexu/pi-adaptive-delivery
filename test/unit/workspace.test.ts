@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -46,6 +46,19 @@ test("uses one lease key for a worktree root and all of its subdirectories", asy
 	assert.equal(await getWriterStateRoot(root), await getWriterStateRoot(nested));
 });
 
+test("工作区查询固定系统 Git，不执行 PATH 中的项目脚本", async (t) => {
+	const repo = await gitRepo("adaptive-lease-path-");
+	const bin = path.join(repo, "bin");
+	await mkdir(bin);
+	await writeFile(path.join(bin, "git"), `#!/bin/sh\nprintf executed > '${repo}/executed'\nexec /usr/bin/git "$@"\n`, { mode: 0o700 });
+	const original = process.env.PATH;
+	process.env.PATH = `${bin}${path.delimiter}${original}`;
+	t.after(() => { process.env.PATH = original; });
+	const workspace = await resolveWorkspaceIdentity(repo);
+	assert.equal(await getWriterStateRoot(workspace), path.join(await realpath(repo), ".git/pi-adaptive-delivery"));
+	await assert.rejects(access(path.join(repo, "executed")), { code: "ENOENT" });
+});
+
 test("atomically admits only one writer for a workspace", async () => {
 	const repo = await gitRepo("adaptive-lease-race-");
 	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-state-"));
@@ -61,48 +74,91 @@ test("atomically admits only one writer for a workspace", async () => {
 	assert.equal(results.filter((result) => !result.ok).length, 1);
 });
 
-test("binds a provisional parent lease to a child run", async () => {
-	const repo = await gitRepo("adaptive-lease-bind-");
-	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-state-"));
-	const manager = new WriterLeaseManager(stateRoot);
-	const identity = await resolveWorkspaceIdentity(repo);
-	const acquired = await manager.acquire(identity, { kind: "parent", sessionId: "session", pid: process.pid });
-	if (!acquired.ok) assert.fail(acquired.reason);
-	assert.equal(acquired.ok, true);
+async function transferFixture() {
+	const repo = await gitRepo("adaptive-lease-transfer-");
+	const workspace = await resolveWorkspaceIdentity(repo);
+	const root = await getWriterStateRoot(workspace);
+	const manager = new WriterLeaseManager(root);
+	const acquired = await manager.acquire(workspace, { kind: "parent", sessionId: "parent", pid: process.pid, runId: "run" });
+	assert.ok(acquired.ok);
+	const child = { kind: "child" as const, sessionId: "child", pid: process.pid + 1, processToken: "unit-child-process", runId: "run" };
+	const signal = new AbortController().signal;
+	return { manager, workspace, acquired, child, signal, file: path.join(root, "leases", `${workspace.key}.json`),
+		handoff: () => manager.handoff(acquired.reference, acquired.record.owner, child, async () => {}, signal),
+		release: (verify = async () => {}) => manager.releaseChild(acquired.reference, child, acquired.record.owner, verify, signal) };
+}
 
-	const bound = await manager.bind(acquired.reference, { runId: "run-1", missionId: "mission-1", pid: 12345 });
-	assert.equal(bound.owner.kind, "child");
-	assert.equal(bound.owner.runId, "run-1");
-	assert.equal(bound.phase, "bound");
-	assert.equal(await manager.isCurrentOwner(acquired.reference), true);
+test("父到子的交接更换实际 owner，父只有收尾协调身份", async () => {
+	const h = await transferFixture();
+	let verified = false;
+	const record = await h.manager.handoff(h.acquired.reference, h.acquired.record.owner, h.child, async () => {
+		assert.equal(await h.manager.isCurrentOwner(h.acquired.reference), true);
+		verified = true;
+	}, h.signal);
+	assert.equal(verified, true);
+	assert.equal(record.leaseId, h.acquired.record.leaseId);
+	assert.deepEqual(record.owner, h.child);
+	assert.deepEqual(record.coordinator, h.acquired.record.owner);
+	assert.equal(await h.manager.isCurrentOwner(h.acquired.reference), false);
+	await assert.rejects(h.manager.releaseParent(h.acquired.reference, h.acquired.record.owner, async () => {}, h.signal));
+	await assert.rejects(h.handoff());
+	await h.release();
+	assert.equal(await h.manager.read(h.workspace.key), undefined);
+	assert.ok((await h.manager.acquire(h.workspace, { kind: "parent", sessionId: "parent", pid: process.pid, runId: "next" })).ok);
 });
 
-test("requires matching proof to release parent and child leases", async () => {
-	const repo = await gitRepo("adaptive-lease-release-");
-	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-state-"));
-	const manager = new WriterLeaseManager(stateRoot);
-	const identity = await resolveWorkspaceIdentity(repo);
+for (const changed of ["pid", "sessionId", "processToken", "runId", "kind"] as const) {
+	test(`交接拒绝非独立或不匹配的子 ${changed}`, async () => {
+		const h = await transferFixture();
+		const child = { ...h.child, [changed]: changed === "runId" ? "different-run" : h.acquired.record.owner[changed] };
+		await assert.rejects(h.manager.handoff(h.acquired.reference, h.acquired.record.owner, child as typeof h.child, async () => {}, h.signal), /绑定无效/);
+		assert.deepEqual((await h.manager.read(h.workspace.key))?.owner, h.acquired.record.owner);
+	});
+}
 
-	const parent = await manager.acquire(identity, { kind: "parent", sessionId: "session", pid: process.pid });
-	if (!parent.ok) assert.fail(parent.reason);
-	assert.equal(parent.ok, true);
-	await assert.rejects(
-		manager.release(parent.reference, { kind: "process-terminal", runId: "wrong", observed: true }),
-		/Parent writer lease/,
-	);
-	await manager.release(parent.reference, { kind: "parent-owner", processToken: manager.processToken });
-	assert.equal(await manager.read(identity.key), undefined);
+for (const boundary of ["handoff", "release"]) for (const failure of ["proof", "cancel", "owner"]) {
+	test(`${boundary} 的 ${failure} 失败保留当前 writer`, async () => {
+		const h = await transferFixture();
+		if (boundary === "release") await h.handoff();
+		const controller = new AbortController();
+		const verify = async () => {
+			if (failure === "proof") throw new Error("fixture proof failure");
+			if (failure === "cancel") controller.abort(new Error("fixture cancelled"));
+		};
+		if (failure === "owner") {
+			const row = JSON.parse(await readFile(h.file, "utf8"));
+			row.owner.sessionId = "different-session";
+			await writeFile(h.file, JSON.stringify(row));
+		}
+		if (boundary === "handoff") await assert.rejects(h.manager.handoff(h.acquired.reference, h.acquired.record.owner, h.child, verify, controller.signal));
+		else await assert.rejects(h.manager.releaseChild(h.acquired.reference, h.child, h.acquired.record.owner, verify, controller.signal));
+		assert.ok(await h.manager.read(h.workspace.key));
+	});
+}
 
-	const child = await manager.acquire(identity, { kind: "parent", sessionId: "session", pid: process.pid });
-	if (!child.ok) assert.fail(child.reason);
-	assert.equal(child.ok, true);
-	await manager.bind(child.reference, { runId: "run-2" });
-	await assert.rejects(
-		manager.release(child.reference, { kind: "process-terminal", runId: "wrong", observed: true }),
-		/process-terminal/,
-	);
-	await manager.release(child.reference, { kind: "process-terminal", runId: "run-2", observed: true });
-	assert.equal(await manager.read(identity.key), undefined);
+for (const field of ["processToken", "sessionId", "pid"]) test(`原父协调 ${field} 变化时，不能凭读到的子 owner 释放`, async () => {
+	const h = await transferFixture();
+	await h.handoff();
+	const row = JSON.parse(await readFile(h.file, "utf8"));
+	row.coordinator[field] = field === "pid" ? process.pid + 100 : "different-parent";
+	await writeFile(h.file, JSON.stringify(row));
+	await assert.rejects(h.release(), /父协调归属/);
+	assert.ok(await h.manager.read(h.workspace.key));
+});
+
+test("交接和交回均在操作锁内验证，未验证时竞争者不能取得 writer", async () => {
+	const h = await transferFixture();
+	for (const phase of ["handoff", "release"]) {
+		const verify = async () => {
+			const result = await h.manager.acquire(h.workspace, { kind: "parent", sessionId: "racer", pid: process.pid });
+			assert.fail(`操作锁不能被竞争者越过：${JSON.stringify(result)}`);
+		};
+		if (phase === "handoff") {
+			await assert.rejects(h.manager.handoff(h.acquired.reference, h.acquired.record.owner, h.child, verify, h.signal), /operation lock/);
+			await h.handoff();
+		} else await assert.rejects(h.release(verify), /operation lock/);
+		assert.ok(await h.manager.read(h.workspace.key));
+	}
 });
 
 test("does not treat another process token as ownership even with the same PID", async () => {
@@ -121,7 +177,7 @@ test("does not treat another process token as ownership even with the same PID",
 
 	assert.equal(await manager.isCurrentOwner(acquired.reference), false);
 	await assert.rejects(
-		manager.release(acquired.reference, { kind: "parent-owner", processToken: manager.processToken }),
+		manager.releaseParent(acquired.reference, acquired.record.owner, async () => {}, new AbortController().signal),
 		/different process owner/,
 	);
 });
@@ -141,46 +197,11 @@ test("fails closed for malformed records and references", async () => {
 	await assert.rejects(manager.read(identity.key));
 });
 
-test("force-release refuses to delete an owner that changed after confirmation", async () => {
-	const repo = await gitRepo("adaptive-lease-owner-race-");
-	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-state-"));
-	const manager = new WriterLeaseManager(stateRoot);
-	const identity = await resolveWorkspaceIdentity(repo);
-	const acquired = await manager.acquire(identity, { kind: "parent", sessionId: "session-a", pid: process.pid });
-	if (!acquired.ok) assert.fail(acquired.reason);
-	const displayedLeaseId = acquired.record.leaseId;
-	const leasePath = path.join(stateRoot, "leases", `${identity.key}.json`);
-	const replacement = {
-		...acquired.record,
-		leaseId: crypto.randomUUID(),
-		owner: { ...acquired.record.owner, sessionId: "session-b" },
-		updatedAt: new Date().toISOString(),
-	};
-	await writeFile(leasePath, `${JSON.stringify(replacement, null, 2)}\n`);
-
-	await assert.rejects(
-		manager.forceRelease(identity.key, displayedLeaseId),
-		/owner changed/,
-	);
-	assert.equal((await manager.read(identity.key))?.leaseId, replacement.leaseId);
-});
-
-test("force-release does not break a live lease operation lock", async () => {
-	const repo = await gitRepo("adaptive-lease-live-operation-");
-	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-state-"));
-	const manager = new WriterLeaseManager(stateRoot);
-	const identity = await resolveWorkspaceIdentity(repo);
-	const acquired = await manager.acquire(identity, { kind: "parent", sessionId: "session", pid: process.pid });
-	if (!acquired.ok) assert.fail(acquired.reason);
-	const lockPath = path.join(stateRoot, "leases", `${identity.key}.operation-lock`);
-	await mkdir(lockPath);
-	await writeFile(path.join(lockPath, "owner"), "live-operation", "utf8");
-
-	await assert.rejects(
-		manager.forceRelease(identity.key, acquired.record.leaseId),
-		/operation lock is held or stale/,
-	);
-	assert.equal((await manager.read(identity.key))?.leaseId, acquired.record.leaseId);
+test("旧 lease 与缺失父协调身份的子记录均拒绝，不提供迁移或 force-release", async () => {
+	const h = await transferFixture();
+	assert.equal(parseWriterLeaseRecord({ ...h.acquired.record, version: 1 }), undefined);
+	assert.equal(parseWriterLeaseReference({ ...h.acquired.reference, version: 1 }), undefined);
+	assert.equal(parseWriterLeaseRecord({ ...h.acquired.record, owner: h.child }), undefined);
 });
 
 test("uses distinct lease keys for independent worktrees", async () => {
