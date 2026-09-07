@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, chmod, link, mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
+import { promises as fs } from "node:fs";
+import { access, chmod, link, mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile, type FileHandle } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { createPlanningDocumentTools } from "../../extensions/delivery-gate/src/planning-documents.ts";
 import { resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 
-async function host(paths = ["docs/方案.md", "docs/计划.md"]) {
+async function host(paths = ["docs/方案.md", "docs/计划.md"], authorize = async () => {}) {
 	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "planning-documents-")));
 	const cwd = path.join(root, "repo");
 	await mkdir(cwd);
@@ -18,11 +20,24 @@ async function host(paths = ["docs/方案.md", "docs/计划.md"]) {
 	const leases = new WriterLeaseManager(stateRoot);
 	const acquired = await leases.acquire(workspace, { kind: "parent", sessionId: "parent", pid: process.pid });
 	assert.ok(acquired.ok);
-	const scope = { workspace, paths, sessionId: "parent", leases, lease: acquired.reference };
-	return { root, cwd, stateRoot, scope, leases, tools: createPlanningDocumentTools(scope),
+	const controller = new AbortController();
+	const scope = { workspace, paths, sessionId: "parent", leases, lease: acquired.reference, authorize, signal: controller.signal };
+	return { root, cwd, stateRoot, scope, leases, controller, tools: createPlanningDocumentTools(scope),
 		file: path.join(cwd, "docs/方案.md"),
 		release: () => leases.release(acquired.reference, { kind: "parent-owner", processToken: leases.processToken }),
 	};
+}
+
+// 只在测试中拦截指定文件句柄；真实文件与 Pi 队列照常执行，不给生产底层增加故障开关。
+function interceptHandles(t: TestContext, target: string, intercept: (handle: FileHandle) => void) {
+	const open = fs.open;
+	t.mock.method(fs, "open", async (...args: Parameters<typeof open>) => {
+		const handle = await open(...args);
+		if (args[0] === target) intercept(handle);
+		return handle;
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
 }
 
 test("原生编辑支持创建、持续修改与完整重写，不要求标题或 JSON 契约", async () => {
@@ -187,4 +202,129 @@ test("canonical cwd 别名共享文档路径与父 writer，另一会话无法�
 	const tools = createPlanningDocumentTools({ ...h.scope, workspace });
 	await tools.write("create", { path: "docs/方案.md", content: "原文" });
 	assert.equal(await readFile(h.file, "utf8"), "原文");
+});
+
+test("持有 lease 不能替代批准核验，拒绝时不创建文档目录", async () => {
+	const h = await host(undefined, async () => { throw new Error("fixture approval revoked"); });
+	await assert.rejects(h.tools.write("denied", { path: h.file, content: "不应写入" }), /approval revoked/);
+	await assert.rejects(access(path.dirname(h.file)), { code: "ENOENT" });
+});
+
+test("排队期间批准失效，已通过初次核验的编辑仍不写入", async (t) => {
+	let valid = true;
+	const h = await host(undefined, async () => { if (!valid) throw new Error("fixture approval revoked"); });
+	await h.tools.write("create", { path: h.file, content: "原文" });
+	let unblock!: () => void;
+	let checked!: () => void;
+	const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+	const initialCheck = new Promise<void>((resolve) => { checked = resolve; });
+	const blocker = withFileMutationQueue(h.file, () => blocked);
+	t.after(async () => { unblock(); await blocker; });
+	const read = h.leases.read.bind(h.leases);
+	t.mock.method(h.leases, "read", async (key: string) => { const result = await read(key); checked(); return result; });
+	const failed = assert.rejects(h.tools.edit("queued", { path: h.file, edits: [{ oldText: "原文", newText: "不应写入" }] }), /approval revoked/);
+	await initialCheck;
+	valid = false;
+	unblock();
+	await failed;
+	assert.equal(await readFile(h.file, "utf8"), "原文");
+});
+
+test("最终批准核验等待期间失去 lease，不能继续截断文件", async (t) => {
+	let opened = false;
+	const h = await host(undefined, async () => { if (opened) { opened = false; await h.release(); } });
+	await h.tools.write("create", { path: h.file, content: "原文" });
+	interceptHandles(t, h.file, (handle) => {
+		const stat = handle.stat.bind(handle);
+		t.mock.method(handle, "stat", async () => { const result = await stat(); opened = true; return result; });
+	});
+	await assert.rejects(h.tools.write("denied", { path: h.file, content: "不应写入" }), /父 writer/);
+	assert.equal(await readFile(h.file, "utf8"), "原文");
+});
+
+for (const boundary of ["stat", "truncate"] as const) {
+	test(`批准在 ${boundary} 完成后失效，不开始下一次内容写入且等待句柄关闭`, async (t) => {
+		const h = await host();
+		await h.tools.write("create", { path: h.file, content: "原文" });
+		let closed = false;
+		interceptHandles(t, h.file, (handle) => {
+			const original = handle[boundary].bind(handle);
+			t.mock.method(handle, boundary, async (...args: any[]) => {
+				const result = await (original as Function)(...args);
+				h.controller.abort(new Error("fixture approval revoked"));
+				return result;
+			});
+			const close = handle.close.bind(handle);
+			t.mock.method(handle, "close", async () => { await close(); closed = true; });
+		});
+		await assert.rejects(h.tools.write("cancelled", { path: h.file, content: "不应写入" }), /approval revoked/);
+		assert.equal(closed, true);
+		assert.equal(h.tools.cleanupFailed, false);
+		assert.equal(await readFile(h.file, "utf8"), boundary === "stat" ? "原文" : "");
+		assert.ok(await h.leases.read(h.scope.workspace.key));
+	});
+}
+
+test("部分 I/O 失败保留实际内容，不误报成功或回滚，lease 仍由调用方持有", async (t) => {
+	const h = await host();
+	interceptHandles(t, h.file, (handle) => {
+		const write = handle.writeFile.bind(handle);
+		t.mock.method(handle, "writeFile", async () => { await write("部分内容", "utf8"); throw new Error("fixture partial I/O failure"); });
+	});
+	await assert.rejects(h.tools.write("partial", { path: h.file, content: "完整内容" }), /partial I\/O/);
+	assert.equal(await readFile(h.file, "utf8"), "部分内容");
+	assert.equal(h.tools.cleanupFailed, false);
+	assert.ok(await h.leases.read(h.scope.workspace.key));
+});
+
+for (const kind of ["edit", "write"] as const) {
+	test(`${kind} 句柄关闭报错时保留清理失败标志，不能因 Promise 结束当作已清理`, async (t) => {
+		const h = await host();
+		await h.tools.write("create", { path: h.file, content: "原文" });
+		interceptHandles(t, h.file, (handle) => {
+			const close = handle.close.bind(handle);
+			t.mock.method(handle, "close", async () => { await close(); throw new Error("fixture close failure"); });
+		});
+		const run = kind === "edit" ? h.tools.edit("failed", { path: h.file, edits: [{ oldText: "原文", newText: "更新" }] })
+			: h.tools.write("failed", { path: h.file, content: "更新" });
+		await assert.rejects(run, /close failure/);
+		assert.equal(h.tools.cleanupFailed, true);
+		assert.equal(await readFile(h.file, "utf8"), kind === "edit" ? "原文" : "更新");
+		assert.ok(await h.leases.read(h.scope.workspace.key));
+		await assert.rejects(h.tools.write("next", { path: h.file, content: "不应再写入" }), /清理失败/);
+		assert.equal(await readFile(h.file, "utf8"), kind === "edit" ? "原文" : "更新");
+	});
+}
+
+test("取消正在等待的写入时，Promise 与原生文件队列都等待 I/O 和关闭真正结束", async (t) => {
+	const h = await host();
+	let enter!: () => void;
+	let unblock!: () => void;
+	const entered = new Promise<void>((resolve) => { enter = resolve; });
+	const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+	let closed = false;
+	interceptHandles(t, h.file, (handle) => {
+		const write = handle.writeFile.bind(handle);
+		t.mock.method(handle, "writeFile", async (...args: Parameters<typeof write>) => { enter(); await blocked; await write(...args); });
+		const close = handle.close.bind(handle);
+		t.mock.method(handle, "close", async () => { await close(); closed = true; });
+	});
+	const run = h.tools.write("in-flight", { path: h.file, content: "已提交的 I/O 仍可能写入" });
+	const failed = assert.rejects(run, /aborted/);
+	t.after(async () => { unblock(); await failed; });
+	await entered;
+	let settled = false;
+	void run.then(() => { settled = true; }, () => { settled = true; });
+	let nextStarted = false;
+	const next = withFileMutationQueue(h.file, async () => { nextStarted = true; assert.equal(closed, true); });
+	h.controller.abort();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(settled, false);
+	assert.equal(nextStarted, false);
+	assert.ok(await h.leases.read(h.scope.workspace.key));
+	unblock();
+	await failed;
+	await next;
+	assert.equal(h.tools.cleanupFailed, false);
+	assert.equal(await readFile(h.file, "utf8"), "已提交的 I/O 仍可能写入");
 });

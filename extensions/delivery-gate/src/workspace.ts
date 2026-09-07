@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, open, readFile, realpath, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_TOKEN_KEY = Symbol.for("pi-adaptive-delivery.process-owner-token.v1");
@@ -74,6 +74,11 @@ export async function resolveWorkspaceIdentity(cwd: string): Promise<WorkspaceId
 		workspacePath: gitRoot,
 		gitRoot,
 	};
+}
+
+export async function getWriterStateRoot(workspace: WorkspaceIdentity): Promise<string> {
+	const { stdout } = await execFileAsync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace.workspacePath });
+	return path.join(await realpath(stdout.trim()), "pi-adaptive-delivery");
 }
 
 function referenceFor(record: WriterLeaseRecord): WriterLeaseReference {
@@ -212,14 +217,20 @@ export class WriterLeaseManager {
 			}
 		}
 		if (!acquired) throw new Error("Writer lease operation lock is held or stale");
+		let failure: { cause: unknown } | undefined;
 		try {
 			return await operation();
+		} catch (cause) {
+			failure = { cause };
+			throw cause;
 		} finally {
 			try {
 				const owner = await readFile(path.join(lockPath, "owner"), "utf8");
-				if (owner === token) await rm(lockPath, { recursive: true, force: true });
-			} catch {
-				// An unknown lock owner must not be removed by this operation.
+				if (owner !== token) throw new Error("Writer lease operation lock owner changed; lock retained");
+				await rm(lockPath, { recursive: true });
+			} catch (error) {
+				if (failure) throw new AggregateError([failure.cause, error], "Writer lease operation and lock cleanup both failed");
+				throw error;
 			}
 		}
 	}
@@ -358,6 +369,20 @@ export class WriterLeaseManager {
 			}
 		}
 		await unlink(this.leasePath(reference.workspaceKey));
+		});
+	}
+
+	// 在同一 lease 操作锁内核对原 owner 和原生终态；等待锁期间取得的旧证明不能用于释放。
+	async releaseParent(reference: WriterLeaseReference, owner: WriterLeaseOwner,
+		verifyTerminal: () => Promise<void>, signal: AbortSignal): Promise<void> {
+		await this.withOperationLock(reference.workspaceKey, async () => {
+			const current = await this.assertOwned(reference);
+			if (current.owner.kind !== "parent" || !isDeepStrictEqual(current.owner, owner)) {
+				throw new Error("父 writer 的会话或执行归属已变化，未释放 lease");
+			}
+			await verifyTerminal();
+			signal.throwIfAborted();
+			await unlink(this.leasePath(reference.workspaceKey));
 		});
 	}
 

@@ -178,8 +178,13 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 	await Promise.all([cwd, packageDir, env.HOME!, agentDir].map((dir) => mkdir(dir, { recursive: true })));
 	execFileSync("git", ["init", "--quiet", cwd], { env, cwd: root });
 	await copyFile(fileURLToPath(new URL("./fake-provider.ts", import.meta.url)), path.join(packageDir, "provider.ts"));
+	if (scenario === "document-io") {
+		await copyFile(fileURLToPath(new URL("./document-io-fixture.ts", import.meta.url)), path.join(packageDir, "document-io.ts"));
+	}
+	const writerFixture = scenario?.startsWith("writer-") === true;
+	if (writerFixture) await copyFile(fileURLToPath(new URL("./parent-writer-fixture.ts", import.meta.url)), path.join(packageDir, "parent-writer.ts"));
 	await writeFile(path.join(packageDir, "package.json"), JSON.stringify({
-		name: "adaptive-isolation-fixture", type: "module", pi: { extensions: ["./provider.ts"] },
+		name: "adaptive-isolation-fixture", type: "module", pi: { extensions: ["./provider.ts", ...(scenario === "document-io" ? ["./document-io.ts"] : []), ...(writerFixture ? ["./parent-writer.ts"] : [])] },
 	}));
 	await writeFile(path.join(agentDir, "auth.json"), "{}\n");
 	let productDir: string | undefined;
@@ -192,7 +197,7 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 		}
 	}
 	await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({
-		packages: [packageDir, ...(productDir ? [productDir] : [])], defaultProvider: "adaptive-fixture", defaultModel: "fake",
+		packages: [packageDir, ...(productDir && !writerFixture ? [productDir] : [])], defaultProvider: "adaptive-fixture", defaultModel: "fake",
 		defaultProjectTrust: "never", retry: { enabled: false }, compaction: { enabled: false },
 	}));
 	await writeFile(path.join(cwd, "AGENTS.md"), "# 临时规则\n仅操作测试夹具。\n");

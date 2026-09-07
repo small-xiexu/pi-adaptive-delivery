@@ -11,6 +11,7 @@ import {
 	parseWriterLeaseRecord,
 	parseWriterLeaseReference,
 	resolveWorkspaceIdentity,
+	getWriterStateRoot,
 } from "../../extensions/delivery-gate/src/workspace.ts";
 
 const execFileAsync = promisify(execFile);
@@ -30,6 +31,7 @@ test("canonicalizes symlink aliases to the same workspace key", async () => {
 	const direct = await resolveWorkspaceIdentity(repo);
 	const linked = await resolveWorkspaceIdentity(alias);
 	assert.deepEqual(linked, direct);
+	assert.equal(await getWriterStateRoot(linked), await getWriterStateRoot(direct));
 });
 
 test("uses one lease key for a worktree root and all of its subdirectories", async () => {
@@ -41,6 +43,7 @@ test("uses one lease key for a worktree root and all of its subdirectories", asy
 	assert.equal(root.key, nested.key);
 	assert.equal(root.workspacePath, nested.workspacePath);
 	assert.notEqual(root.cwdPath, nested.cwdPath);
+	assert.equal(await getWriterStateRoot(root), await getWriterStateRoot(nested));
 });
 
 test("atomically admits only one writer for a workspace", async () => {
@@ -195,4 +198,8 @@ test("uses distinct lease keys for independent worktrees", async () => {
 	assert.notEqual(rootIdentity.key, worktreeIdentity.key);
 	assert.equal(rootIdentity.gitRoot, await realpath(repo));
 	assert.equal(worktreeIdentity.gitRoot, await realpath(worktree));
+	const rootState = await getWriterStateRoot(rootIdentity);
+	const worktreeState = await getWriterStateRoot(worktreeIdentity);
+	assert.notEqual(rootState, worktreeState);
+	assert.equal(path.dirname(path.dirname(worktreeState)), path.join(rootIdentity.gitRoot, ".git", "worktrees"));
 });

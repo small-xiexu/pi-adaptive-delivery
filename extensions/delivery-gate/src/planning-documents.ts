@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, lstat, mkdir, open, realpath } from "node:fs/promises";
+import { access, lstat, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { createEditTool, createWriteTool, type EditToolInput, type WriteToolInput } from "@earendil-works/pi-coding-agent";
 import { type WorkspaceIdentity, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
@@ -10,6 +10,8 @@ interface DocumentScope {
 	sessionId: string;
 	lease: WriterLeaseReference;
 	leases: WriterLeaseManager;
+	authorize: () => Promise<void>;
+	signal: AbortSignal;
 }
 
 function within(root: string, target: string): boolean {
@@ -20,12 +22,18 @@ function within(root: string, target: string): boolean {
 // 内部执行底层，不是批准入口。调用方须提供已核实的文档授权并负责 lease 的完整生命周期。
 export function createPlanningDocumentTools(scope: DocumentScope) {
 	const { workspacePath: root, cwdPath: cwd, key } = scope.workspace;
-	const { sessionId, leases } = scope;
+	const { sessionId, leases, authorize, signal: approvalSignal } = scope;
 	const lease = { ...scope.lease };
 	const allowed = new Set(scope.paths.map((value) => path.resolve(cwd, value)));
+	let cleanupFailed = false;
+
+	async function close(handle: FileHandle): Promise<void> {
+		try { await handle.close(); } catch (error) { cleanupFailed = true; throw error; }
+	}
 
 	async function requireParent(): Promise<void> {
 		const current = await leases.read(key);
+		if (cleanupFailed) throw new Error("文档句柄清理失败，停止后续变更并保留 writer");
 		if (!current || lease.workspaceKey !== key || current.leaseId !== lease.leaseId
 			|| current.workspace.workspacePath !== root || current.owner.kind !== "parent"
 			|| current.owner.sessionId !== sessionId || current.owner.pid !== process.pid
@@ -56,28 +64,34 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 		}
 	}
 
-	async function execute(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput, signal?: AbortSignal) {
-		signal?.throwIfAborted();
+	async function execute(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput, callerSignal?: AbortSignal) {
+		const signal = callerSignal ? AbortSignal.any([callerSignal, approvalSignal]) : approvalSignal;
+		signal.throwIfAborted();
 		// 与 Pi 的 @file 输入习惯一致；向原生工具传固定绝对路径，避免二次解析改变目标。
 		const target = path.resolve(cwd, input.path.startsWith("@") ? input.path.slice(1) : input.path);
-		await requireParent();
 		await checkPath(target);
-		signal?.throwIfAborted();
+		await authorize();
+		await requireParent();
+		signal.throwIfAborted();
 
 		const writeFile = async (_file: string, content: string) => {
 			await checkPath(target);
+			await authorize();
 			await requireParent();
-			signal?.throwIfAborted();
+			signal.throwIfAborted();
 			const handle = await open(target, constants.O_WRONLY | constants.O_NOFOLLOW | (kind === "write" ? constants.O_CREAT : 0), 0o666);
 			try {
 				const info = await handle.stat();
 				if (!info.isFile() || info.nlink !== 1) throw new Error("文档写入目标不是独立普通文件");
-				signal?.throwIfAborted();
+				await authorize();
+				await requireParent();
+				signal.throwIfAborted();
 				await handle.truncate(0);
+				signal.throwIfAborted();
 				await handle.writeFile(content, "utf8");
 				await handle.sync();
 			} finally {
-				await handle.close();
+				await close(handle);
 			}
 		};
 		if (kind === "edit") {
@@ -85,7 +99,7 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 				access: () => access(target, constants.R_OK | constants.W_OK),
 				readFile: async () => {
 					const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
-					try { return await handle.readFile(); } finally { await handle.close(); }
+					try { return await handle.readFile(); } finally { await close(handle); }
 				},
 				writeFile,
 			} });
@@ -94,8 +108,9 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 		const native = createWriteTool(cwd, { operations: {
 			mkdir: async (directory) => {
 				await checkPath(target);
+				await authorize();
 				await requireParent();
-				signal?.throwIfAborted();
+				signal.throwIfAborted();
 				await mkdir(directory, { recursive: true });
 			},
 			writeFile,
@@ -104,6 +119,7 @@ export function createPlanningDocumentTools(scope: DocumentScope) {
 	}
 
 	return {
+		get cleanupFailed() { return cleanupFailed; },
 		edit: (id: string, input: EditToolInput, signal?: AbortSignal) => execute("edit", id, input, signal),
 		write: (id: string, input: WriteToolInput, signal?: AbortSignal) => execute("write", id, input, signal),
 	};

@@ -1,5 +1,6 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { appendFileSync, unlinkSync, writeSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { Type } from "typebox";
 export default function isolationProvider(pi: ExtensionAPI): void {
 	let calls = 0;
 	const scenario = process.env.ADAPTIVE_FIXTURE_SCENARIO ?? "normal";
+	const writer = scenario.startsWith("writer-");
 	const isChild = () => process.env.PI_ADAPTIVE_DELIVERY_CHILD === "1";
 	const audit = (phase: string, details: Record<string, unknown> = {}) => appendFileSync(
 		path.join(process.env.PI_CODING_AGENT_DIR!, "fixture-events.jsonl"),
@@ -68,21 +70,23 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					});
 					audit("aborted");
 				}
-				const read = context.messages.findLast((message) => message.role === "toolResult");
+				const messages = writer ? context.messages.slice(context.messages.findLastIndex((message) => message.role === "user")) : context.messages;
+				const read = messages.findLast((message) => message.role === "toolResult");
 				const user = context.messages.findLast((message) => message.role === "user");
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write");
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
-				const toolName = delegate || isChild() && scenario === "recursive" ? "delivery_readonly" : approval ? "delivery_approval" : write ? "write" : "read";
+				const toolName = writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly" : approval ? "delivery_approval" : write ? "write" : "read";
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
-				const args = toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: stage === "design" ? [] : ["plan.md"], validationCommands: [] }
+				const args = writer ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
+					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: stage === "design" ? [] : ["plan.md"], validationCommands: [] }
 					: toolName === "delivery_readonly" ? { task: scenario === "task-command" ? "/fixture-dangerous" : "读取 input.txt，提供独立证据。" }
 					: write ? { path: "forbidden.txt", content: "unexpected" } : { path: scenario === "tool-fail" && isChild() ? "missing.txt" : "input.txt" };
 				const aborted = options?.signal?.aborted === true;
 				const output: AssistantMessage = {
 					role: "assistant", api: model.api, provider: model.provider, model: model.id,
 					content: aborted ? [] : read ? [{ type: "text", text: `隔离✅\u2028保留\u2029JSONL ${JSON.stringify(read.content)}` }]
-						: [{ type: "toolCall", id: `fixture-call-${calls}`, name: toolName, arguments: args }],
+						: [{ type: "toolCall", id: writer ? randomUUID() : `fixture-call-${calls}`, name: toolName, arguments: args }],
 					stopReason: aborted ? "aborted" : read ? "stop" : "toolUse", timestamp: Date.now(),
 					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },

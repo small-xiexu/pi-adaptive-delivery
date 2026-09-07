@@ -54,28 +54,38 @@ function presentation(proposal: Proposal): string {
 }
 
 // 只读取 Pi 的原生文件。内存条目即使可见，也不能证明 appendEntry 已经落盘。
-async function persisted<T>(ctx: ExtensionContext, customType: string, id: string): Promise<CustomEntry<T>> {
+async function persisted<T>(ctx: ExtensionContext, ...references: [customType: string, id: string][]): Promise<CustomEntry<T>[]> {
 	const file = ctx.sessionManager.getSessionFile();
 	if (!file) throw new Error("当前 Session 不持久化，不能记录批准");
 	const content = await readFile(file, "utf8");
 	if (!content.endsWith("\n")) throw new Error("Session 记录不完整，批准不可用");
 	const rows = content.trimEnd().split("\n").map((line) => JSON.parse(line));
 	if (rows[0]?.type !== "session" || rows[0]?.id !== ctx.sessionManager.getSessionId()) throw new Error("Session 文件归属不符");
-	const matches = rows.filter((row) => row.type === "custom" && row.customType === customType && row.data?.id === id);
-	if (matches.length !== 1) throw new Error("批准相关条目未唯一落盘");
-	const entry = matches[0] as CustomEntry<T>;
-	const original = ctx.sessionManager.getBranch().find((row) => row.id === entry.id);
-	if (!original) throw new Error("批准相关条目不在当前分支");
-	if (!isDeepStrictEqual(original, entry)) throw new Error("批准记录已变化或未完整落盘");
-	return entry;
+	const branch = ctx.sessionManager.getBranch();
+	return references.map(([customType, id]) => {
+		const matches = rows.filter((row) => row.type === "custom" && row.customType === customType && row.data?.id === id);
+		if (matches.length !== 1) throw new Error("批准相关条目未唯一落盘");
+		const entry = matches[0] as CustomEntry<T>;
+		const original = branch.find((row) => row.id === entry.id);
+		if (!original) throw new Error("批准相关条目不在当前分支");
+		if (!isDeepStrictEqual(original, entry)) throw new Error("批准记录已变化或未完整落盘");
+		return entry;
+	});
 }
 
-export function installApprovals(pi: ExtensionAPI): void {
-	// 只记住本次运行亲自完成的方案确认引用；不从模型、摘要或旧 Session 恢复批准。
+export function installApprovals(pi: ExtensionAPI) {
+	// 只记住本次运行亲自完成的确认；与原生条目不共享可变对象，也不从历史恢复。
 	let design: Approval | undefined;
+	let documents: { approval: Approval; proposal: Proposal; sessionFile: string; controller: AbortController } | undefined;
 	let pending: AbortController | undefined;
+	const invalidateDocuments = () => {
+		const previous = documents;
+		documents = undefined;
+		previous?.controller.abort(new Error("文档授权已失效，停止后续写入"));
+	};
 	const invalidate = () => {
 		design = undefined;
+		invalidateDocuments();
 		pending?.abort(new Error("会话发生切换、重载或分支导航，批准请求已失效"));
 	};
 	pi.on("session_start", invalidate);
@@ -89,12 +99,14 @@ export function installApprovals(pi: ExtensionAPI): void {
 		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("批准只接受父 Pi 的真实 TUI 交互；当前模式不接受批准");
 			if (pending) throw new Error("已有批准请求等待处理，不并发显示第二个请求");
+			if (request.stage === "documents") invalidateDocuments();
 			const controller = new AbortController();
 			pending = controller;
 			const operation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 			try {
 				operation.throwIfAborted();
 				const sessionId = ctx.sessionManager.getSessionId();
+				const sessionFile = ctx.sessionManager.getSessionFile();
 				const cwd = ctx.cwd;
 				const workspace = await resolveWorkspaceIdentity(cwd);
 				const paths = request.paths.map((value) => path.resolve(workspace.cwdPath, value));
@@ -110,9 +122,9 @@ export function installApprovals(pi: ExtensionAPI): void {
 				let approvedDesign: Proposal | undefined;
 				if (request.stage === "implementation") {
 					if (!design || design.sessionId !== sessionId || design.workspaceKey !== workspace.key) throw new Error("当前会话与工作区尚无可信方案确认，不能请求实施确认");
-					const entry = await persisted<Approval>(ctx, APPROVAL_ENTRY, design.id);
+					const [entry] = await persisted<Approval>(ctx, [APPROVAL_ENTRY, design.id]);
 					if (!isDeepStrictEqual(entry.data, design)) throw new Error("方案批准记录已变化");
-					approvedDesign = (await persisted<Proposal>(ctx, PROPOSAL_ENTRY, design.proposalId)).data;
+					approvedDesign = (await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, design.proposalId]))[0]!.data;
 					if (!approvedDesign || approvedDesign.stage !== "design" || approvedDesign.sessionId !== sessionId || approvedDesign.workspaceKey !== workspace.key) throw new Error("方案批准正文归属不符");
 				}
 				const proposal: Proposal = { id: randomUUID(), sessionId, workspaceKey: workspace.key, cwd: workspace.cwdPath,
@@ -120,13 +132,15 @@ export function installApprovals(pi: ExtensionAPI): void {
 					...(approvedDesign ? { designApprovalId: design!.id } : {}) };
 				const current = () => {
 					operation.throwIfAborted();
-					if (ctx.sessionManager.getSessionId() !== sessionId || ctx.cwd !== cwd) throw new Error("确认期间会话或目录已变化");
+					if (ctx.sessionManager.getSessionId() !== sessionId || ctx.sessionManager.getSessionFile() !== sessionFile || ctx.cwd !== cwd) {
+						throw new Error("确认期间会话、Session 文件或目录已变化");
+					}
 				};
 				current();
 				// 实施确认重新展示已批准的方案正文；不用活动文档内容替换原批准依据。
 				if (approvedDesign) ctx.ui.notify(presentation(approvedDesign), "info");
-				pi.appendEntry(PROPOSAL_ENTRY, proposal);
-				const displayed = await persisted<Proposal>(ctx, PROPOSAL_ENTRY, proposal.id);
+				pi.appendEntry(PROPOSAL_ENTRY, structuredClone(proposal));
+				const [displayed] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]);
 				if (!isDeepStrictEqual(displayed.data, proposal)) throw new Error("展示正文与持久记录不一致");
 				current();
 				const accept = `确认${titles[request.stage]}`;
@@ -134,19 +148,20 @@ export function installApprovals(pi: ExtensionAPI): void {
 				current();
 				if (choice !== accept) return { content: [{ type: "text", text: "本次未批准，权限未扩大；暂停推进，不自动重复请求批准。" }], details: { approved: false }, terminate: true };
 				// 用户等待期间正文可能被外部改动；确认的是刚才展示的正文，不是后来替换的文件。
-				await persisted(ctx, PROPOSAL_ENTRY, proposal.id);
+				const [confirmed] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]);
+				if (!isDeepStrictEqual(confirmed.data, proposal)) throw new Error("确认正文与原展示正文不一致");
 				if (approvedDesign) {
-					await persisted(ctx, APPROVAL_ENTRY, proposal.designApprovalId!);
-					await persisted(ctx, PROPOSAL_ENTRY, approvedDesign.id);
+					await persisted(ctx, [APPROVAL_ENTRY, proposal.designApprovalId!], [PROPOSAL_ENTRY, approvedDesign.id]);
 				}
 				current();
 				const approval: Approval = { id: randomUUID(), proposalId: proposal.id, sessionId, workspaceKey: workspace.key,
 					source: { mode: "tui", interaction: "select", toolCallId } };
-				pi.appendEntry(APPROVAL_ENTRY, approval);
-				const saved = await persisted<Approval>(ctx, APPROVAL_ENTRY, approval.id);
+				pi.appendEntry(APPROVAL_ENTRY, structuredClone(approval));
+				const [saved] = await persisted<Approval>(ctx, [APPROVAL_ENTRY, approval.id]);
 				if (!isDeepStrictEqual(saved.data, approval)) throw new Error("确认记录与持久记录不一致");
 				current();
-				if (request.stage === "design") design = approval;
+				if (proposal.stage === "design") design = approval;
+				if (proposal.stage === "documents") documents = { approval, proposal, sessionFile: sessionFile!, controller: new AbortController() };
 				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。当前版本仍不开放文件写入。` }],
 					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
 			} finally {
@@ -154,4 +169,38 @@ export function installApprovals(pi: ExtensionAPI): void {
 			}
 		},
 	});
+	return {
+		// 只核实批准依据，不授予 writer；执行方不能把返回快照缓存为持续有效的权限。
+		async readDocumentApproval(ctx: ExtensionContext, signal?: AbortSignal) {
+			const expected = documents;
+			try {
+				if (!expected) throw new Error("本轮没有可核实的规划文档授权");
+				const cwd = ctx.cwd;
+				const current = () => {
+					signal?.throwIfAborted();
+					if (documents !== expected) throw new Error("文档授权已失效或被新的请求替换");
+					if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("文档授权只供原父 TUI 会话核实");
+					if (ctx.sessionManager.getSessionId() !== expected.approval.sessionId
+						|| ctx.sessionManager.getSessionFile() !== expected.sessionFile || ctx.cwd !== cwd) {
+						throw new Error("文档授权的 Session、文件或当前目录已变化");
+					}
+				};
+				current();
+				const workspace = await resolveWorkspaceIdentity(cwd);
+				current();
+				if (workspace.key !== expected.approval.workspaceKey) throw new Error("文档授权不属于当前 worktree");
+				const [approval, proposal] = await persisted<Approval | Proposal>(ctx,
+					[APPROVAL_ENTRY, expected.approval.id], [PROPOSAL_ENTRY, expected.proposal.id]);
+				current();
+				if (!isDeepStrictEqual(approval.data, expected.approval) || !isDeepStrictEqual(proposal.data, expected.proposal)) {
+					throw new Error("文档授权与本轮真实确认的正文或来源不一致");
+				}
+				return { approvalId: expected.approval.id, proposalId: expected.proposal.id,
+					sessionId: expected.approval.sessionId, workspace, paths: [...expected.proposal.paths], signal: expected.controller.signal };
+			} catch (error) {
+				if (documents === expected) invalidateDocuments();
+				throw error;
+			}
+		},
+	};
 }
