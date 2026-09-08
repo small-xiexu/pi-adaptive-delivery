@@ -5,17 +5,19 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TestContext } from "node:test";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createPiFixture, testEnvironment } from "./pi-fixture.ts";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
 // 文件开发与容器组合共用同一个 SDK 父/模拟选择、真实 CLI 子宿主。
-export async function createDevelopmentHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void) {
+export async function createDevelopmentHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void,
+	configureFixture?: (fixture: Awaited<ReturnType<typeof createPiFixture>>) => Promise<void>) {
 	const fixture = await createPiFixture(source, `development-${scenario}`);
 	await fixture.rpc.send("get_state");
 	await fixture.rpc.stop();
+	await configureFixture?.(fixture);
 	const originalEnv = { ...process.env };
 	Object.assign(process.env, testEnvironment(fixture.root), { ADAPTIVE_FIXTURE_SCENARIO: `development-${scenario}` });
 	if (scenario === "separate-git") execFileSync("git", ["init", "--quiet", "--separate-git-dir", "metadata"], { cwd: fixture.cwd });
@@ -28,6 +30,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 	const modelRuntime = await ModelRuntime.create({ authPath: path.join(fixture.agentDir, "auth.json"), modelsPath: path.join(fixture.agentDir, "models.json") });
 	const sm = SessionManager.create(fixture.cwd, path.join(fixture.root, "parent-sessions"));
 	const { session } = await createAgentSession({ cwd: fixture.cwd, agentDir: fixture.agentDir, settingsManager, resourceLoader, modelRuntime, sessionManager: sm });
+	initTheme("dark");
 	const notices: string[] = [];
 	const choices: string[] = [];
 	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[1]; };
@@ -42,7 +45,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		}
 	});
 	await session.bindExtensions({ mode: "tui", abortHandler: () => { session.clearQueue(); void session.abort(); },
-		uiContext: { select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args),
+		uiContext: { ...session.extensionRunner.getUIContext(), select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args),
 		confirm: (...args: Parameters<ExtensionUIContext["confirm"]>) => confirm(...args), input: (...args: Parameters<ExtensionUIContext["input"]>) => input(...args),
 		notify: (text: string) => { notices.push(text); } } as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
 	const model = modelRuntime.getModel("adaptive-fixture", "fake");

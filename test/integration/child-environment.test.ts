@@ -7,6 +7,53 @@ import { createPiFixture } from "../support/pi-fixture.ts";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
+test("项目显式启用查找工具后，真实父子保留 read/grep/find/ls 并实际查找读回", { timeout: 40_000 }, async (t) => {
+	const fixture = await createPiFixture(source, "readonly-search");
+	const { rpc } = fixture;
+	t.after(() => rpc.stop());
+	await rpc.send("prompt", { message: "/delivery-status" });
+	const status = rpc.records.find((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes("当前已启用原生只读工具"));
+	assert.match(status?.message, /read.*grep.*find.*ls/);
+	await rpc.send("prompt", { message: "fixture-delegate" });
+	await rpc.waitFor((row) => row.type === "agent_settled");
+	const result = rpc.records.find((row) => row.type === "tool_execution_end" && row.toolName === "delivery_readonly");
+	assert.equal(result?.isError, false, JSON.stringify(result));
+	const rows = (await readFile(result!.result.details.sessionFile, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	const tools = rows.filter((row) => row.type === "message" && row.message.role === "toolResult").map((row) => row.message);
+	assert.deepEqual(tools.map((row) => row.toolName), ["ls", "find", "grep", "read"]);
+	assert.ok(tools.every((row) => row.isError === false));
+	assert.ok(tools.every((row) => /input.txt|fixture-read-ok/.test(JSON.stringify(row.content))));
+	const model = (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line)).filter((row) => row.phase === "model");
+	for (const row of model) for (const name of ["read", "grep", "find", "ls"]) assert.ok(row.tools.includes(name));
+	assert.ok(model.every((row) => !row.tools.includes("bash") && !row.tools.includes("write")));
+	assert.throws(() => process.kill(result!.result.details.pid, 0), { code: "ESRCH" });
+	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: rpc.process.pid, childPid: result!.result.details.pid }));
+});
+
+test("真实父调用固定 Git 状态入口，保留既有改动并拒绝参数与同名覆盖", { timeout: 40_000 }, async (t) => {
+	const fixture = await createPiFixture(source);
+	const { rpc } = fixture;
+	t.after(() => rpc.stop());
+	const invoke = async (id: string, args: unknown) => {
+		await rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id, name: "delivery_git_status", arguments: args })}` });
+		const cursor = rpc.records.length;
+		await rpc.send("prompt", { message: "核对 Git 现状" });
+		await rpc.waitFor((row) => row.type === "agent_settled", cursor);
+		return rpc.records.slice(cursor).find((row) => row.type === "tool_execution_end" && row.toolName === "delivery_git_status")!;
+	};
+	const result = await invoke("git-status", {});
+	assert.equal(result.isError, false);
+	assert.equal(result.result.details.head, null);
+	assert.equal(result.result.details.workspace, fixture.cwd);
+	assert.ok(result.result.details.changes.some((row: any) => row.path === "input.txt" && row.status === "??"));
+	assert.equal((await invoke("git-args", { command: "touch forbidden.txt" })).isError, true);
+	await rpc.send("prompt", { message: "/fixture-replace-tool delivery_git_status" });
+	assert.equal((await invoke("git-replacement", {})).isError, true);
+	assert.equal(await readFile(path.join(fixture.cwd, "input.txt"), "utf8"), "fixture-read-ok\n");
+	await assert.rejects(access(path.join(fixture.cwd, "forbidden.txt")), { code: "ENOENT" });
+	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: rpc.process.pid }));
+});
+
 for (const scenario of ["normal", "rules-missing", "instructions-missing", "skills-missing", "tool-replaced", "hook-deny", "hook-error"]) {
 	test(`真实 Pi 按配置重建只读环境：${scenario}`, { timeout: 40_000 }, async (t) => {
 		const fixture = await createPiFixture(source, `environment-${scenario}`);
@@ -41,7 +88,7 @@ for (const scenario of ["normal", "rules-missing", "instructions-missing", "skil
 				assert.equal(replacement.sourceInfo.path, path.join(fixture.packageDir, "provider.ts"));
 			}
 		} else if (scenario === "hook-error") {
-			assert.match(ended.error, /子任务存在工具失败/);
+			assert.match(ended.error, /已记录的工具失败/);
 			assert.equal(model.length, 2);
 			const failed = model[1].messages.find((message: any) => message.role === "toolResult");
 			assert.equal(failed?.isError, true);

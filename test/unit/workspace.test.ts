@@ -12,9 +12,46 @@ import {
 	parseWriterLeaseReference,
 	resolveWorkspaceIdentity,
 	getWriterStateRoot,
+	readGitStatus,
 } from "../../extensions/delivery-gate/src/workspace.ts";
 
 const execFileAsync = promisify(execFile);
+
+test("固定 Git 状态保留 unborn、暂存/未暂存/未跟踪、重命名及特殊路径，不运行 fsmonitor 或内容过滤器", async () => {
+	const repo = await gitRepo("adaptive-git-status-");
+	const git = (...args: string[]) => execFileAsync("/usr/bin/git", args, { cwd: repo });
+	const name = "文件 空格\n\t.txt";
+	await writeFile(path.join(repo, name), "before\n");
+	let status = await readGitStatus(repo);
+	assert.equal(status.head, null);
+	assert.deepEqual(status.changes, [{ status: "??", path: name }]);
+	await git("add", "--", name);
+	await git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture");
+	await writeFile(path.join(repo, name), "after!\n");
+	await writeFile(path.join(repo, "new.txt"), "new\n");
+	await git("config", "core.fsmonitor", "touch FS_MONITOR_EXECUTED");
+	await git("config", "filter.fixture.clean", "touch FILTER_EXECUTED; cat");
+	await git("config", "filter.fixture.required", "true");
+	await writeFile(path.join(repo, ".gitattributes"), "*.txt filter=fixture\n");
+	const index = await readFile(path.join(repo, ".git/index"));
+	status = await readGitStatus(repo);
+	assert.ok(status.head);
+	assert.ok(status.branch);
+	assert.ok(status.changes.some((item) => item.status === ".M" && item.path === name));
+	assert.ok(status.changes.some((item) => item.status === "??" && item.path === "new.txt"));
+	assert.deepEqual(await readFile(path.join(repo, ".git/index")), index);
+	await assert.rejects(access(path.join(repo, "FS_MONITOR_EXECUTED")), { code: "ENOENT" });
+	await assert.rejects(access(path.join(repo, "FILTER_EXECUTED")), { code: "ENOENT" });
+	await git("config", "--unset", "core.fsmonitor");
+	await git("config", "--unset", "filter.fixture.clean");
+	await git("config", "--unset", "filter.fixture.required");
+	await git("mv", "--", name, "renamed.txt");
+	status = await readGitStatus(repo);
+	assert.ok(status.changes.some((item) => item.path === "renamed.txt" && item.originalPath === name));
+	await git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "rename");
+	await git("checkout", "--detach", "--quiet");
+	assert.equal((await readGitStatus(repo)).branch, null);
+});
 
 async function gitRepo(prefix: string): Promise<string> {
 	const repo = await mkdtemp(path.join(os.tmpdir(), prefix));

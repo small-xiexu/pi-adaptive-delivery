@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -10,7 +10,31 @@ async function audit(agentDir: string): Promise<any[]> {
 	return (await readFile(path.join(agentDir, "fixture-events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 }
 
-for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi", "boot-failure", "tool-fail", "recursive", "corrupt", "crash", "persistence", "ui", "cancel"]) {
+test("真实 Pi 同回合两个只读子并发运行，卡片事件和原始记录按调用归属", { timeout: 40_000 }, async (t) => {
+	const f = await createPiFixture(source, "readonly-parallel");
+	t.after(() => f.rpc.stop());
+	await writeFile(path.join(f.cwd, "input-a.txt"), "EVIDENCE_A\n");
+	await writeFile(path.join(f.cwd, "input-b.txt"), "EVIDENCE_B\n");
+	await f.rpc.send("prompt", { message: "fixture-delegate" });
+	await f.rpc.waitFor((event) => event.type === "agent_settled");
+	const results = f.rpc.records.filter((event) => event.type === "tool_execution_end" && event.toolName === "delivery_readonly");
+	assert.equal(results.length, 2);
+	const firstEnd = f.rpc.records.findIndex((event) => results.includes(event));
+	assert.equal(f.rpc.records.slice(0, firstEnd).filter((event) => event.type === "tool_execution_start" && event.toolName === "delivery_readonly").length, 2);
+	for (const suffix of ["a", "b"]) {
+		const result = results.find((event) => event.toolCallId === `parallel-${suffix}`)!;
+		assert.equal(result.isError, false, JSON.stringify(result));
+		assert.match(JSON.stringify(result.result.content), new RegExp(`EVIDENCE_${suffix.toUpperCase()}`));
+		const views = f.rpc.records.filter((event) => event.type === "tool_execution_update" && event.toolCallId === result.toolCallId).map((event) => event.partialResult.details.progress);
+		assert.ok(views.some((view) => view.action.includes(`read input-${suffix}.txt`)));
+		assert.ok(views.every((view) => view.id === result.toolCallId && !view.action.includes(`input-${suffix === "a" ? "b" : "a"}.txt`)));
+		assert.throws(() => process.kill(result.result.details.pid, 0), { code: "ESRCH" });
+	}
+	assert.notEqual(results[0].result.details.sessionFile, results[1].result.details.sessionFile);
+});
+
+for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi", "boot-failure", "tool-fail", "readonly-recover", "recursive", "corrupt", "crash", "persistence", "ui", "cancel",
+	"readonly-record-missing-newline", "readonly-record-duplicate-exit", "readonly-record-message-after-exit"]) {
 	test(`普通 Extension 的真实 RPC 委派：${scenario}`, { timeout: 40_000 }, async (t) => {
 		const fixture = await createPiFixture(source, scenario);
 		const { rpc } = fixture;
@@ -26,6 +50,13 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 				if (Date.now() > deadline) throw new Error("未观察到子模型等待，不能作为取消证据");
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
+			const running = (await rpc.send("get_entries")).data.entries.findLast((row: any) => row.customType === "delivery-delegation")?.data;
+			const statusCursor = rpc.records.length;
+			await rpc.send("prompt", { message: "/delivery-status" });
+			const status = rpc.records.slice(statusCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify");
+			assert.ok(status?.message.includes(running.sessionFile));
+			assert.ok(status?.message.includes(running.id));
+			assert.match(status?.message, /只读.*运行中/);
 			await rpc.send("follow_up", { message: "fixture-must-not-resume" });
 			const cleared = await rpc.send("clear_queue");
 			assert.match(JSON.stringify(cleared), /fixture-must-not-resume/);
@@ -35,6 +66,15 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		const tool = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_readonly");
 		assert.ok(tool, "必须通过实际模型工具调用进入正式委派");
 		const success = scenario === "normal" || scenario === "task-command";
+		const progress = rpc.records.filter((row) => row.type === "tool_execution_update" && row.toolName === "delivery_readonly").map((row) => row.partialResult.details.progress);
+		assert.ok(progress.length);
+		assert.ok(progress.every((row) => row.id === tool.toolCallId));
+		if (success) {
+			assert.ok(progress.some((row) => row.action === "正在执行：read input.txt"));
+			assert.ok(progress.some((row) => row.action === "已完成：read input.txt"));
+			assert.equal(progress.at(-1).status, "执行结束，结果待核实");
+		}
+		if (scenario === "cancel") assert.equal(progress.at(-1).status, "已取消");
 		assert.equal(tool.isError, !success, JSON.stringify(tool.result));
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.type === "custom" && entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
@@ -51,6 +91,32 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		}
 		if (scenario === "missing-tools") assert.match(ended.error, /需要 read.*实际 \[\]/);
 		if (scenario === "crash") assert.equal(ended.status, "unknown");
+		if (scenario === "tool-fail" || scenario === "readonly-recover") {
+			const text = tool.result.content[0].text;
+			assert.ok(text.includes(`原始子 Session：${ended.sessionFile}`));
+			assert.ok(text.includes(`父 Session ID：${parent.sessionId}`));
+			assert.ok(text.includes(`本次工具调用：${tool.toolCallId}`));
+			assert.match(text, /已记录的工具失败/);
+			assert.match(text, /进程收尾：已正常关闭.*无在途工具/);
+			assert.match(text, /持久关闭记录：已核实/);
+			assert.match(await readFile(ended.sessionFile, "utf8"), /"stopReason":"stop"/);
+			if (scenario === "readonly-recover") {
+				const read = rpc.records.find((record) => record.type === "tool_execution_start" && record.toolName === "read");
+				assert.equal(read?.args.path, ended.sessionFile, "父直接使用失败正文返回的路径读取既有证据");
+				assert.equal(rpc.records.find((record) => record.type === "tool_execution_end" && record.toolCallId === read?.toolCallId)?.isError, false);
+				assert.equal(rpc.records.filter((record) => record.type === "tool_execution_start" && record.toolName === "delivery_readonly").length, 1);
+			}
+		}
+		if (scenario.startsWith("readonly-record-")) {
+			assert.equal(ended.status, "failed");
+			assert.match(tool.result.content[0].text, /持久关闭记录：未核实/);
+			assert.ok(tool.result.content[0].text.includes(ended.sessionFile));
+			assert.ok(!JSON.stringify(tool.result).includes("FORBIDDEN_POST_EXIT_RESULT"));
+			const content = await readFile(ended.sessionFile, "utf8");
+			if (scenario.endsWith("missing-newline")) assert.equal(content.endsWith("\n"), false);
+			if (scenario.endsWith("duplicate-exit")) assert.equal(content.split("\n").filter((line) => line.includes('"customType":"delivery-child-exit"')).length, 2);
+			if (scenario.endsWith("message-after-exit")) assert.match(content, /FORBIDDEN_POST_EXIT_RESULT/);
+		}
 		if (ended?.pid) assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
 		const events = await audit(fixture.agentDir);
 		const childStart = events.find((event) => event.child && event.phase === "start");

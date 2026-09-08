@@ -6,6 +6,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { truncateHead, type BuildSystemPromptOptions, type ExtensionContext, type RpcCommand, type RpcExtensionUIResponse, type RpcSessionState, type SessionEntry, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
+import { createTaskProgress, type ProgressUpdate } from "./progress.ts";
 
 export const CHILD_ENV = "PI_ADAPTIVE_DELIVERY_CHILD";
 export const DELEGATE_TOOL = "delivery_readonly";
@@ -22,6 +23,7 @@ export interface ReadOnlyEnvironment {
 	instructions: string;
 	rules: string;
 	skills: string;
+	structured?: { entry: string; version: string };
 }
 
 // 只核对 Pi 已加载的基础输入，不重新发现资源，也不将规则正文复制到握手记录。
@@ -36,6 +38,7 @@ export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, t
 }
 
 export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?: ReadOnlyEnvironment): void {
+	if (JSON.stringify(expected.structured) !== JSON.stringify(actual?.structured)) throw new Error("Structured 插件模式或来源未对齐，未发送任务");
 	if (JSON.stringify(expected.tools) !== JSON.stringify(actual?.tools)) {
 		throw new Error(`只读工具定义或来源未对齐：需要 ${expected.tools.map((tool) => tool.name).join(",")}；实际 ${JSON.stringify(actual?.tools)}。未发送任务`);
 	}
@@ -287,12 +290,13 @@ export interface ChildTask {
 	thinking: string;
 	environment: ReadOnlyEnvironment;
 	projectTrusted: boolean;
+	readPaths?: string[];
 }
 
 export async function startChild(input: ChildTask, kind: "readonly" | "development"): Promise<ChildRpc> {
 	const tools = input.environment.tools.map((tool) => tool.name);
 	if (!tools.length) throw new Error("没有已启用的原生只读工具，未启动子 Pi");
-	if (kind === "development") tools.push("edit", "write", "bash");
+	if (kind === "development" && !input.environment.structured) tools.push("edit", "write", "bash");
 	const { workspacePath } = await resolveWorkspaceIdentity(input.cwd);
 	const outside = (file: string) => {
 		const relative = path.relative(workspacePath, file);
@@ -319,7 +323,8 @@ export async function startChild(input: ChildTask, kind: "readonly" | "developme
 		"--mode", "rpc", "--extension", input.entryPath,
 		"--provider", input.model.provider, "--model", input.model.id, "--thinking", input.thinking,
 		"--tools", tools.join(","), input.projectTrusted ? "--approve" : "--no-approve",
-	], { cwd: input.cwd, env: { ...process.env, [CHILD_ENV]: kind === "development" ? "development" : "1" }, stdio: ["pipe", "pipe", "pipe"] }));
+	], { cwd: input.cwd, env: { ...process.env, [CHILD_ENV]: kind === "development" ? "development" : "1",
+		PI_ADAPTIVE_DELIVERY_READ_PATHS: JSON.stringify(input.readPaths ?? []) }, stdio: ["pipe", "pipe", "pipe"] }));
 }
 
 export async function readyChild(rpc: ChildRpc, input: ChildTask, signal: AbortSignal, recordState: (state: RpcSessionState) => void) {
@@ -341,12 +346,28 @@ export async function readyChild(rpc: ChildRpc, input: ChildTask, signal: AbortS
 	return { state, data };
 }
 
+// 原生 JSONL 的最终读取边界；关闭后的消息不能成为本次子任务结果。
+export function parseReadOnlySession(content: string, sessionId: string, pid: number): any[] {
+	if (!content.endsWith("\n")) throw new Error("只读子 Session 记录不完整：缺少最后一个换行");
+	const rows = content.slice(0, -1).split("\n").map((line) => JSON.parse(line));
+	const exits = rows.filter((row) => row.type === "custom" && row.customType === CHILD_EXIT);
+	if (rows[0]?.type !== "session" || rows[0].id !== sessionId || exits.length !== 1
+		|| exits[0].data?.pid !== pid || exits[0].data?.sessionId !== sessionId
+		|| rows.slice(rows.indexOf(exits[0]) + 1).some((row) => row.type === "message")) {
+		throw new Error("只读子 Session 的唯一持久关闭记录、归属或关闭后消息不符");
+	}
+	const structured = exits[0].data?.structured;
+	if (structured !== undefined && (structured.clean !== true || typeof structured.incomplete !== "boolean")) throw new Error("Structured 只读容器的持久清理证明未核实");
+	return rows;
+}
+
 export async function delegateReadOnly(
 	input: ChildTask,
 	signal: AbortSignal,
 	record: (data: Record<string, unknown>) => void,
-	update: (message: string) => void,
+	update: ProgressUpdate,
 	ctx: DialogContext,
+	progress = createTaskProgress(input.id, "只读", input.task, update),
 ): Promise<{ text: string; sessionId: string; sessionFile: string; pid: number }> {
 	signal.throwIfAborted();
 	const rpc = await startChild(input, "readonly");
@@ -356,48 +377,61 @@ export async function delegateReadOnly(
 	let state: RpcSessionState | undefined;
 	let text: string | null = null;
 	let problem: unknown;
+	let stopped = false;
+	let recordProblem: unknown;
+	let recordedClose = false;
 	const reference = () => ({ id: input.id, parentSessionId: input.parentSessionId, cwd: input.cwd,
 		pid: rpc.process.pid, sessionId: state?.sessionId, sessionFile: state?.sessionFile });
 	try {
 		rpc.onEvent = (event) => {
-			if (event.type === "tool_execution_start") update(`子任务调用 ${event.toolName}`);
+			progress.event(event);
 			dialogs.handle(event);
 		};
 		await readyChild(rpc, input, operation, (value) => { state = value; });
 		record({ ...reference(), phase: "started" });
-		update(`只读子任务已启动，PID ${rpc.process.pid}`);
+		progress.phase("运行中", "子任务已启动", state?.sessionFile);
 		await Promise.all([
 			rpc.waitSettled(operation),
 			// 不让任务正文以斜线命令的身份执行，避免绕过模型工具边界。
 			rpc.request({ type: "prompt", message: `只读子任务。仅分析并提供证据，不修改文件，不继续委派。\n\n${input.task}` }, operation),
 		]);
-		if (rpc.toolError || rpc.openTools.size) throw new Error("子任务存在工具失败或未确认的执行终态");
+		if (rpc.openTools.size) throw new Error("子任务存在未确认的工具执行终态");
+		if (rpc.toolError) throw new Error("子任务存在已记录的工具失败；请先核对原始记录中的错误及已有分析，再裁决后续动作");
 	} catch (error) { problem = error; }
+	progress.phase(operation.aborted ? "正在取消" : "核对收尾中");
 	try { await dialogs.close(); }
 	catch (error) { problem ??= error; }
-	try { await rpc.stop(input.entryPath); }
+	try { await rpc.stop(input.entryPath); stopped = true; }
 	catch (error) { problem = new Error(`${problem ? `${String(problem)}；` : ""}收尾失败：${String(error)}`, { cause: error }); }
 	if (!problem && (rpc.exit?.code !== 0 || rpc.exit.signal !== null || rpc.failure || rpc.openTools.size)) {
 		problem = new Error("子 Pi 的关闭或工具终态未核实");
 	}
-	if (!problem && state?.sessionFile) {
+	if (rpc.exit && state?.sessionFile) {
 		try {
-			const rows = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-			if (rows[0]?.id !== state.sessionId || !rows.some((row) => row.type === "custom" && row.customType === CHILD_EXIT
-				&& row.data?.pid === rpc.process.pid && row.data?.sessionId === state!.sessionId)) {
-				throw new Error("未找到子 Pi 的持久关闭记录");
+			const rows = parseReadOnlySession(await readFile(state.sessionFile, "utf8"), state.sessionId, rpc.process.pid!);
+			recordedClose = true;
+			if (input.environment.structured) {
+				const cleanup = rows.find((row) => row.customType === CHILD_EXIT)?.data?.structured;
+				if (cleanup?.clean !== true || cleanup.incomplete !== false) throw new Error("Structured 子命令未完整交回或清理未核实");
 			}
 			// 最终正文只从已关闭进程的原生记录取得，不把 RPC 内存读回当成落盘证明。
 			const last = rows.findLast((row) => row.type === "message" && row.message?.role === "assistant")?.message;
 			if (last?.stopReason !== "stop") throw new Error("子任务没有正常完成的持久模型终态");
 			text = last.content.filter((item: any) => item.type === "text").map((item: any) => item.text).join("").trim();
 			if (!text) throw new Error("子任务没有可核对的最终正文");
-		} catch (error) { problem = error; }
+		} catch (error) { recordProblem = error; problem ??= error; }
 	}
+	if (!problem && (!recordedClose || !text)) problem = new Error("子任务原始记录或最终正文未核实");
 	if (operation.aborted) problem ??= operation.reason;
 	record({ ...reference(), phase: "ended", status: !rpc.exit || rpc.openTools.size ? "unknown" : operation.aborted ? "cancelled" : problem ? "failed" : "completed",
 		exit: rpc.exit, error: problem ? String(problem) : undefined });
-	if (problem) throw new Error(`只读委派未成功：${String(problem)}`);
+	progress.end(!rpc.exit || rpc.openTools.size || !stopped ? "收尾未知" : operation.aborted ? "已取消" : problem ? "失败" : "执行结束，结果待核实");
+	if (problem) throw new Error(`只读委派未成功：${String(problem)}`
+		+ (state?.sessionFile ? `\n原始子 Session：${state.sessionFile}` : "\n子 Session 引用尚未取得。")
+		+ `\n进程收尾：${stopped && rpc.exit?.code === 0 && rpc.exit.signal === null && !rpc.failure ? "已正常关闭" : "未核实正常关闭"}；工具终态：${rpc.openTools.size ? "仍有未确认执行" : "无在途工具"}。`
+		+ `\n持久关闭记录：${recordedClose ? "已核实" : "未核实"}。${recordProblem ? `记录核对：${String(recordProblem)}` : ""}`
+		+ `\n父 Session ID：${input.parentSessionId}\n本次工具调用：${input.id}`
+		+ "\n此结果仍为失败；先读取已有原始证据，不据此自动重试或放宽权限。", { cause: problem });
 	const output = truncateHead(text!);
 	return { text: `${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}`,
 		sessionId: state!.sessionId, sessionFile: state!.sessionFile!, pid: rpc.process.pid! };

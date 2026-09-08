@@ -9,7 +9,25 @@ import path from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { createReadTool, type BuildSystemPromptOptions, type ExtensionUIContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import test from "node:test";
-import { ChildRpc, createChildDialogs, delegateReadOnly, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
+import { ChildRpc, createChildDialogs, delegateReadOnly, parseReadOnlySession, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
+
+test("只读持久结果拒绝截断、关闭记录重复、归属不符及关闭后消息，保留 Unicode 正文", () => {
+	const rows = [{ type: "session", id: "session" },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "中文\u2028✅\u2029" }], stopReason: "stop" } },
+		{ type: "custom", customType: "delivery-child-exit", data: { pid: 42, sessionId: "session" } }];
+	const encode = (value: unknown[]) => value.map((row) => JSON.stringify(row)).join("\n") + "\n";
+	assert.deepEqual(parseReadOnlySession(encode(rows), "session", 42), rows);
+	assert.throws(() => parseReadOnlySession(encode(rows).slice(0, -1), "session", 42), /不完整/);
+	assert.throws(() => parseReadOnlySession(encode([...rows, rows[2]]), "session", 42), /唯一持久关闭记录/);
+	assert.throws(() => parseReadOnlySession(encode([...rows, rows[1]]), "session", 42), /关闭后消息/);
+	assert.throws(() => parseReadOnlySession(encode(rows.slice(0, 2)), "session", 42), /唯一持久关闭记录/);
+	assert.throws(() => parseReadOnlySession(encode(rows), "different", 42), /归属/);
+	assert.throws(() => parseReadOnlySession(encode(rows), "session", 43), /归属/);
+	for (const structured of [{ clean: false, incomplete: true }, { clean: true }]) {
+		const unsafe = [...rows.slice(0, 2), { ...rows[2], data: { ...rows[2]!.data, structured } }];
+		assert.throws(() => parseReadOnlySession(encode(unsafe), "session", 42), /持久清理证明未核实/);
+	}
+});
 
 function fixture() {
 	const process = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),

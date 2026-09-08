@@ -1,9 +1,10 @@
 import { chmod, readdir, readFile, writeFile } from "node:fs/promises";
-import { appendFileSync, unlinkSync, writeSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, unlinkSync, writeSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createAssistantMessageEventStream, type AssistantMessage, type ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -15,9 +16,11 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	const document = scenario.startsWith("document-entry-");
 	const environment = scenario.startsWith("environment-");
 	const development = scenario.startsWith("development-");
+	const structured = scenario.includes("structured");
 	const isChild = () => Boolean(process.env.PI_ADAPTIVE_DELIVERY_CHILD);
 	let dialogAsked = false;
 	let nextTool: ToolCall | undefined;
+	let developerSent = false;
 	const audit = (phase: string, details: Record<string, unknown> = {}) => appendFileSync(
 		path.join(process.env.PI_CODING_AGENT_DIR!, "fixture-events.jsonl"),
 		`${JSON.stringify({ pid: process.pid, child: isChild(), phase, scenario, ...details })}\n`,
@@ -31,6 +34,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		},
 	});
 	pi.on("session_start", (_event, ctx) => {
+		developerSent = false;
 		audit("start", { sessionId: ctx.sessionManager.getSessionId(), commands: pi.getCommands().map((command) => command.name),
 			tools: pi.getAllTools().map((tool) => tool.name) });
 		if (isChild() && scenario === "missing-tools") pi.setActiveTools([]);
@@ -43,7 +47,16 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", () => {
 		if (isChild() && scenario === "corrupt") writeSync(1, "fixture: invalid JSONL\n");
 	});
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", async (event) => {
+		if (structured && !developerSent) {
+			const command = pi.getCommands().find((item) => item.name === "codex");
+			if (command?.sourceInfo.path) {
+				const { trySendCodexDeveloperMessage } = await import(pathToFileURL(command.sourceInfo.path).href);
+				const accepted = trySendCodexDeveloperMessage(pi, isChild() ? "STRUCTURED_CHILD_CONTEXT_PROOF" : "STRUCTURED_PARENT_CONTEXT_PROOF", { triggerTurn: false });
+				audit("codex-developer-message", { accepted });
+				developerSent = true;
+			}
+		}
 		if (environment || development) {
 			audit("environment-before-agent");
 			return { systemPrompt: `${event.systemPrompt}\nCONFIGURED_BEFORE_AGENT_HOOK` };
@@ -88,6 +101,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		return undefined;
 	});
 	pi.on("tool_result", async (event, ctx) => {
+		if (isChild() && scenario.endsWith("structured-crash")) process.kill(process.pid, "SIGKILL");
 		if (isChild() && process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-child-persistence")) await chmod(ctx.sessionManager.getSessionFile()!, 0o400);
 		if (isChild() && (scenario === "crash" || process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-crash"))) process.kill(process.pid, "SIGKILL");
 		if (isChild() && scenario.endsWith("validation-mask-error") && event.toolName === "bash") return { isError: false, content: [{ type: "text", text: "配置钩子声称通过" }] };
@@ -117,8 +131,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerProvider("adaptive-fixture", {
-		name: "禁网测试替身", api: "adaptive-fixture", baseUrl: "http://127.0.0.1", apiKey: "fixture-not-a-credential",
-		models: [{ id: "fake", name: "Fake", reasoning: false, input: ["text"],
+		name: "禁网测试替身", api: structured ? "openai-responses" : "adaptive-fixture", baseUrl: "http://127.0.0.1", apiKey: "fixture-not-a-credential",
+		models: [{ id: "fake", name: "Fake", reasoning: false, input: structured ? ["text", "image"] : ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1024 }],
 		streamSimple(model, context, options) {
 			calls++;
@@ -126,9 +140,15 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 			nextTool = undefined;
 			const stream = createAssistantMessageEventStream();
 			audit("model", { parentMarkerSeen: JSON.stringify(context.messages).includes("PARENT_ONLY_HISTORY_SENTINEL"),
-				tools: context.tools?.map((tool) => tool.name), ...(environment || development ? { systemPrompt: context.systemPrompt,
+				tools: context.tools?.map((tool) => tool.name), ...(environment || development || structured ? { systemPrompt: context.systemPrompt,
 					messages: context.messages } : {}) });
 			queueMicrotask(async () => {
+				if (structured) {
+					const payload = { model: model.id, instructions: context.systemPrompt, input: context.messages.map((message) => ({ role: message.role === "assistant" ? "assistant" : "user",
+						content: [{ type: "input_text", text: typeof message.content === "string" ? message.content : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") }] })),
+						tools: context.tools?.map((tool) => ({ type: "function", name: tool.name, parameters: tool.parameters, description: tool.description })) };
+					audit("provider-payload", { payload: await options?.onPayload?.(payload, model) ?? payload });
+				}
 				if (isChild() && scenario === "cancel") {
 					audit("waiting");
 					await new Promise<void>((resolve) => {
@@ -139,6 +159,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				}
 				const messages = writer || development ? context.messages.slice(context.messages.findLastIndex((message) => message.role === "user")) : context.messages;
 				const read = messages.findLast((message) => message.role === "toolResult");
+				const recoverRead = !isChild() && scenario === "readonly-recover" && read?.role === "toolResult" && read.toolName === "delivery_readonly";
+				const searchStep = scenario === "readonly-search" && isChild() ? messages.filter((message) => message.role === "toolResult").length : undefined;
 				const developmentChild = development && process.env.PI_ADAPTIVE_DELIVERY_CHILD === "development";
 				const containerChild = developmentChild && scenario.startsWith("development-container-");
 				const validationChild = developmentChild && JSON.stringify(context.messages).includes("固定候选验收。严格按下列");
@@ -159,20 +181,30 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				}
 				const reviewEvidence = reviewChild ? JSON.parse(taskText.split("\n").find((line) => line.startsWith("审查证据："))!.slice("审查证据：".length)) : undefined;
 				const readonlyEscalation = development && isChild() && !developmentChild && JSON.stringify(user?.content).includes("fixture-read-then-write");
-				const finished = !planned && read && !readSkill && (reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
+				const finished = !planned && read && !readSkill && !recoverRead && (structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
+					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
 					: !developmentChild || developmentStep >= (containerChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
 					&& (!readonlyEscalation || step >= 2 || read.isError);
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write") || readonlyEscalation && step === 1;
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
-				const toolName = planned?.name ?? (validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
+				const toolName = planned?.name ?? (structured && isChild() ? developmentChild && !validationChild && step === 0 ? "apply_patch" : developmentChild && scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
 					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && containerChild ? "bash" : "read"
 					: writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
 					: document ? scenario.endsWith("edit") ? "delivery_document_edit" : "delivery_document_write" : approval ? "delivery_approval" : write ? "write" : "read");
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
 				const target = scenario === "development-outside" ? "../outside.js" : scenario === "development-plan" ? "plan.md"
 					: scenario === "development-git" ? ".git/forbidden.js" : scenario === "development-separate-git" ? "metadata/forbidden.js" : "src/value.js";
-				const args = planned?.arguments ?? (validationChild ? scenario.endsWith("validation-edit") ? { path: target, content: "forbidden validation edit\n" }
+				const args = planned?.arguments ?? (structured && isChild() ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
+					: toolName === "write_stdin" ? { session_id: (read as any)?.details?.session_id, chars: "TTY_INPUT_PROOF\n", yield_time_ms: 30_000 }
+					: { cmd: validationChild ? "python inputs/check.py" : reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile}'`
+						: developmentChild ? step === 1 ? scenario.endsWith("structured-pty") ? "read value; printf '%s' \"$value\" > src/typed.txt"
+							: scenario.endsWith("structured-cancel") ? "python -c 'import pathlib,time; pathlib.Path(\"src/ready.txt\").write_text(\"ready\"); print(\"LONG_COMMAND_STARTED\",flush=True); time.sleep(120)'"
+							: scenario.endsWith("structured-unfinished") ? "sleep 120" : "python inputs/check.py" : "cat src/value.js" : "cat input.txt",
+						yield_time_ms: /structured-(unfinished|pty)$/.test(scenario) ? 250 : 30_000, ...(scenario.endsWith("structured-pty") ? { tty: true } : {}) } : searchStep !== undefined ? searchStep === 0 ? { path: "." } : searchStep === 1 ? { pattern: "*.txt", path: "." }
+					: searchStep === 2 ? { pattern: "fixture-read-ok", path: ".", glob: "*.txt" } : { path: "input.txt" }
+					: recoverRead ? { path: read!.content.filter((part) => part.type === "text").map((part) => part.text).join("\n").match(/原始子 Session：([^\n]+)/)?.[1] ?? "missing-evidence" }
+					: validationChild ? scenario.endsWith("validation-edit") ? { path: target, content: "forbidden validation edit\n" }
 					: { command: scenario.endsWith("validation-wrong") ? "echo unapproved" : step === 1 ? "node inputs/second.cjs" : "node inputs/command.cjs",
 						timeout: scenario.endsWith("validation-timeout") ? 1 : 10 }
 					: developmentChild ? developmentStep === 0 ? { path: target, content: "export const value = 1;\n" }
@@ -184,13 +216,19 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					: toolName === "delivery_readonly" ? { task: scenario === "task-command" ? "/fixture-dangerous" : "读取 input.txt，提供独立证据。" }
 					: write ? { path: "forbidden.txt", content: "unexpected" } : { path: reviewChild ? step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile
 						: readSkill ? path.join(process.env.PI_CODING_AGENT_DIR!, "skills", "environment-proof", "SKILL.md")
-						: scenario === "tool-fail" && isChild() ? "missing.txt" : "input.txt" });
+						: ["tool-fail", "readonly-recover"].includes(scenario) && isChild() ? "missing.txt" : "input.txt" });
 				const aborted = options?.signal?.aborted === true;
+				if (isChild() && scenario.endsWith("readonly-parallel")) {
+					const target = taskText.includes("input-b.txt") ? "input-b.txt" : "input-a.txt";
+					Object.assign(args, structured ? { cmd: `cat ${target}` } : { path: target });
+				}
 				const output: AssistantMessage = {
 					role: "assistant", api: model.api, provider: model.provider, model: model.id,
 					content: aborted ? [] : finished ? [{ type: "text", text: reviewChild ? `FAKE_REVIEW_MECHANISM：${JSON.stringify(messages.find((message) => message.role === "toolResult")?.content).includes("value = 1") ? "P1 src/value.js:1 需要父会话裁决并修复 value" : "未发现本夹具范围内问题"}`
 						: `隔离✅\u2028保留\u2029JSONL ${JSON.stringify(read!.content)}` }]
-						: [{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: args }],
+					: !isChild() && delegate && scenario.endsWith("readonly-parallel") ? ["a", "b"].map((target) => ({ type: "toolCall", id: `parallel-${target}`, name: "delivery_readonly", arguments: { task: `读取 input-${target}.txt 并说明事实` } }))
+					: !isChild() && scenario === "structured-command-parallel" ? ["a", "b"].map((target) => ({ type: "toolCall", id: `command-${target}`, name: "exec_command", arguments: { cmd: "sleep 120", yield_time_ms: 250 } }))
+					: [{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: args }],
 					stopReason: aborted ? "aborted" : finished ? "stop" : "toolUse", timestamp: Date.now(),
 					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
@@ -229,5 +267,27 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (_event, ctx) => {
 		pi.appendEntry("fixture-shutdown", { pid: process.pid });
 		if (isChild() && scenario === "persistence") unlinkSync(ctx.sessionManager.getSessionFile()!);
+		if (isChild() && (scenario.startsWith("readonly-record-") || scenario.endsWith("structured-dev-unclean")
+			|| process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("structured-review-unclean"))) {
+			const file = ctx.sessionManager.getSessionFile()!;
+			process.once("exit", () => {
+				const content = readFileSync(file, "utf8");
+				const rows = content.trimEnd().split("\n").map((line) => JSON.parse(line));
+				const exit = rows.findLast((row) => row.customType === "delivery-child-exit");
+				if (!exit) throw new Error("测试夹具未取得真实关闭记录");
+				if (scenario.endsWith("unclean")) {
+					if (exit.data.development) exit.data.development.structured = { clean: false, incomplete: true };
+					else exit.data.structured = { clean: false, incomplete: true };
+					writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+				}
+				if (scenario.endsWith("missing-newline")) writeFileSync(file, content.slice(0, -1));
+				if (scenario.endsWith("duplicate-exit")) writeFileSync(file, content + JSON.stringify({ ...exit, id: "duplicate-exit", parentId: rows.at(-1).id }) + "\n");
+				if (scenario.endsWith("message-after-exit")) {
+					const last = rows.findLast((row) => row.type === "message" && row.message.role === "assistant");
+					writeFileSync(file, content + JSON.stringify({ ...last, id: "after-exit", parentId: rows.at(-1).id,
+						message: { ...last.message, content: [{ type: "text", text: "FORBIDDEN_POST_EXIT_RESULT" }] } }) + "\n");
+				}
+			});
+		}
 	});
 }

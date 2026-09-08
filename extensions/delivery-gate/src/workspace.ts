@@ -6,8 +6,11 @@ import { isDeepStrictEqual, promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_TOKEN_KEY = Symbol.for("pi-adaptive-delivery.process-owner-token.v1");
+const gitEnvironment = { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null",
+	GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", LC_ALL: "C" };
 
 export const WRITER_LEASE_VERSION = 2 as const;
+export const GIT_STATUS_TOOL = "delivery_git_status";
 
 export interface WorkspaceIdentity {
 	key: string;
@@ -58,7 +61,7 @@ export async function resolveWorkspaceIdentity(cwd: string): Promise<WorkspaceId
 	const cwdPath = await realpath(cwd);
 	let stdout: string;
 	try {
-		({ stdout } = await execFileAsync("/usr/bin/git", ["rev-parse", "--show-toplevel"], { cwd: cwdPath }));
+		({ stdout } = await execFileAsync("/usr/bin/git", ["rev-parse", "--show-toplevel"], { cwd: cwdPath, env: gitEnvironment, timeout: 15_000 }));
 	} catch (error) {
 		throw new Error(`Writer lease requires a Git repository: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -72,8 +75,49 @@ export async function resolveWorkspaceIdentity(cwd: string): Promise<WorkspaceId
 }
 
 export async function getWriterStateRoot(workspace: WorkspaceIdentity): Promise<string> {
-	const { stdout } = await execFileAsync("/usr/bin/git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace.workspacePath });
+	const { stdout } = await execFileAsync("/usr/bin/git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace.workspacePath, env: gitEnvironment, timeout: 15_000 });
 	return path.join(await realpath(stdout.trim()), "pi-adaptive-delivery");
+}
+
+export async function readGitStatus(cwd: string, signal?: AbortSignal) {
+	const workspace = await resolveWorkspaceIdentity(cwd);
+	// Git status 比较内容时也会运行 clean/process；在同次固定查询中禁用已配置过滤器。
+	let filters = "";
+	try {
+		({ stdout: filters } = await execFileAsync("/usr/bin/git", ["config", "--includes", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process|required)$"], {
+			cwd: workspace.workspacePath, env: gitEnvironment, signal, timeout: 15_000, maxBuffer: 50 * 1024,
+		}));
+	} catch (error) { if ((error as { code?: unknown }).code !== 1) throw error; }
+	const overrides = [...new Set(filters.split("\0").filter(Boolean))].flatMap((key) => ["-c", `${key}=${key.endsWith(".required") ? "false" : ""}`]);
+	const { stdout } = await execFileAsync("/usr/bin/git", ["--no-optional-locks", "--no-replace-objects", "--no-pager",
+		"-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.excludesFile=/dev/null",
+		...overrides, "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--ignore-submodules=dirty"], {
+		cwd: workspace.workspacePath, signal, timeout: 15_000, maxBuffer: 50 * 1024,
+		env: gitEnvironment, encoding: "buffer",
+	});
+	const text = stdout.toString("utf8");
+	if (!Buffer.from(text).equals(stdout)) throw new Error("Git 状态路径无法无损表示为 UTF-8，未返回不完整清单");
+	const rows = text.split("\0").filter(Boolean);
+	let head: string | null | undefined;
+	let branch: string | null | undefined;
+	const changes: { status: string; path: string; originalPath?: string; submodule?: string }[] = [];
+	for (let i = 0; i < rows.length; i++) {
+		const row = rows[i]!;
+		if (row.startsWith("# branch.oid ")) head = row.slice(13) === "(initial)" ? null : row.slice(13);
+		else if (row.startsWith("# branch.head ")) branch = row.slice(14) === "(detached)" ? null : row.slice(14);
+		else if (row.startsWith("# ")) continue;
+		else if (row.startsWith("? ")) changes.push({ status: "??", path: row.slice(2) });
+		else {
+			const fields = row.split(" ");
+			const prefix = fields[0] === "1" ? 8 : fields[0] === "2" ? 9 : fields[0] === "u" ? 10 : 0;
+			if (!prefix || fields.length <= prefix) throw new Error("Git 状态记录无法解析，未返回不完整清单");
+			const originalPath = fields[0] === "2" ? rows[++i] : undefined;
+			if (fields[0] === "2" && !originalPath) throw new Error("Git 重命名原路径缺失");
+			changes.push({ status: fields[1]!, path: fields.slice(prefix).join(" "), submodule: fields[2], ...(originalPath ? { originalPath } : {}) });
+		}
+	}
+	if (head === undefined || branch === undefined) throw new Error("Git 分支或 HEAD 未取得，未猜测工作区状态");
+	return { workspace: workspace.workspacePath, head, branch, changes, submodules: "仅报告提交指针变化；子模块内部改动需在其工作区另查" };
 }
 
 function referenceFor(record: WriterLeaseRecord): WriterLeaseReference {

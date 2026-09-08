@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
+import { request as httpRequest } from "node:http";
 import path from "node:path";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import type { WorkspaceIdentity } from "./workspace.ts";
@@ -31,6 +32,19 @@ export interface ContainerScope {
 	writePaths: readonly string[];
 	protectedPaths: readonly string[];
 	beforeCreate: (reference: ContainerReference) => Promise<void>;
+	// Structured 使用原绝对路径；只读角色额外挂载已知资源/证据，不开放宿主 HOME。
+	hostPaths?: boolean;
+	readonlyWorkspace?: readonly string[];
+	helper?: string;
+}
+
+export interface ContainerCommand {
+	shell?: string;
+	login?: boolean;
+	tty?: boolean;
+	workdir?: string;
+	onInput?: (write: (chars: string) => Promise<void>) => void;
+	onStarted?: () => void;
 }
 
 function within(root: string, target: string) {
@@ -79,6 +93,32 @@ function docker(config: string, executable: string) {
 		});
 	};
 	return {
+		attach(id: string, timeout: number) {
+			return new Promise<{ closed: Promise<void>; write: (chars: string) => Promise<void> }>((resolve, reject) => {
+				// Docker 公开 HTTP attach，仅使用现有本地 socket 和已核实容器 ID；日志仍走 logs。
+				const request = httpRequest({ socketPath: "/var/run/docker.sock", path: `/v1.47/containers/${id}/attach?stream=1&stdin=1&stdout=0&stderr=0`,
+					method: "POST", headers: { Connection: "Upgrade", Upgrade: "tcp" } });
+				const connecting = setTimeout(() => request.destroy(new Error("Docker attach 连接超时")), 15_000);
+				request.on("error", (error) => { clearTimeout(connecting); reject(error); });
+				request.on("response", (response) => {
+					let body = "";
+					response.on("data", (chunk: Buffer) => { body = (body + chunk.toString("utf8")).slice(-8000); });
+					response.on("end", () => { clearTimeout(connecting); reject(new Error(`Docker attach 未升级连接：HTTP ${response.statusCode} ${body}`)); });
+					response.on("error", (error) => { clearTimeout(connecting); reject(error); });
+				});
+				request.on("upgrade", (response, socket) => {
+					clearTimeout(connecting);
+					if (response.statusCode !== 101) { socket.destroy(); reject(new Error("Docker attach 协议状态不符")); return; }
+					let failure: unknown;
+					const timer = setTimeout(() => socket.destroy(new Error("Docker attach 客户端等待超时")), timeout);
+					socket.resume();
+					socket.on("error", (error) => { failure = error; });
+					const closed = new Promise<void>((done, fail) => socket.once("close", () => { clearTimeout(timer); if (failure) fail(failure); else done(); }));
+					resolve({ closed, write: (chars) => new Promise<void>((done, fail) => socket.write(chars, (error) => error ? fail(error) : done())) });
+				});
+				request.end();
+			});
+		},
 		async request(command: string[]) {
 			const stdout: Buffer[] = [];
 			const stderr: Buffer[] = [];
@@ -143,7 +183,7 @@ export function createContainerOperations(scope: ContainerScope) {
 	let active = false;
 	let cleanupFailed = false;
 	let lastExecution: ContainerExecution | undefined;
-	const operations: BashOperations = { exec: async (command, cwd, { onData, signal, timeout = 300 }) => {
+	const execute = async (command: string, cwd: string, { onData, signal, timeout = 300 }: Parameters<BashOperations["exec"]>[2], input: ContainerCommand = {}) => {
 		if (active || cleanupFailed) throw new Error("容器命令尚未收尾或状态未知，未开始新执行");
 		signal?.throwIfAborted();
 		if (cwd !== scope.workspace.cwdPath || !/^sha256:[a-f0-9]{64}$/.test(scope.image)) throw new Error("容器工作目录或固定镜像身份未核实");
@@ -161,7 +201,38 @@ export function createContainerOperations(scope: ContainerScope) {
 		let timedOut = false;
 		let stop: (() => void) | undefined;
 		try {
-			const mounts = await containerMounts(scope, signal);
+			let mounts: { source: string; target: string; readonly: boolean }[];
+			if (scope.readonlyWorkspace) {
+				if (scope.writePaths.length || !scope.hostPaths || await realpath(scope.workspace.workspacePath) !== scope.workspace.workspacePath) throw new Error("只读命令范围无效");
+				mounts = [{ source: scope.workspace.workspacePath, target: scope.workspace.workspacePath, readonly: true }];
+				for (const file of new Set(scope.readonlyWorkspace)) {
+					const source = await realpath(file);
+					if (within(scope.workspace.workspacePath, source)) continue;
+					const info = await lstat(source);
+					if (!info.isFile() && !info.isDirectory()) throw new Error("额外只读资源必须是明确的文件或目录");
+					mounts.push({ source, target: source, readonly: true });
+				}
+				// 只读 bind 仍能暴露宿主 Unix socket；禁止把 IPC/设备随目录带入容器。
+				const inspectRead = async (file: string): Promise<void> => {
+					signal?.throwIfAborted();
+					const info = await lstat(file);
+					if (info.isDirectory()) for (const name of await readdir(file)) await inspectRead(path.join(file, name));
+					else if (!info.isFile() && !info.isSymbolicLink()) throw new Error("只读挂载包含宿主 socket、FIFO 或设备，未执行命令");
+				};
+				for (const mount of mounts) await inspectRead(mount.source);
+			} else {
+				mounts = await containerMounts(scope, signal);
+				if (scope.hostPaths) mounts = mounts.map((mount) => ({ ...mount, target: mount.source }));
+			}
+			if (scope.helper) {
+				const source = await realpath(scope.helper);
+				if (within(scope.workspace.workspacePath, source) || !(await lstat(source)).isFile()) throw new Error("Structured helper 必须在工作区外");
+				mounts.push({ source, target: "/adaptive-helper", readonly: true });
+			}
+			const workdir = input.workdir ? path.resolve(cwd, input.workdir) : cwd;
+			if (!within(scope.workspace.workspacePath, workdir)) throw new Error("命令工作目录必须在本 worktree 内");
+			const shell = input.shell ?? "/bin/sh";
+			if (!path.posix.isAbsolute(shell)) throw new Error("shell 必须是容器内绝对路径");
 			const executable = await dockerClient(scope.workspace.workspacePath);
 			await scope.beforeCreate({ name: execution.name, image: execution.image });
 			signal?.throwIfAborted();
@@ -177,8 +248,9 @@ export function createContainerOperations(scope: ContainerScope) {
 				"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=1", "--log-opt", "compress=false",
 				"--init", "--pids-limit", "128", "--memory", "512m", "--memory-swap", "512m", "--cpus", "2", "--no-healthcheck", "--restart", "no",
 				"--tmpfs", "/tmp:rw,nosuid,nodev,size=64m,mode=1777", "--env", "HOME=/tmp", "--workdir",
-				path.posix.join("/workspace", path.relative(scope.workspace.workspacePath, cwd).split(path.sep).join("/")),
-				...mountArgs, "--entrypoint", "/bin/sh", scope.image, "-c", command]);
+				scope.hostPaths ? workdir : path.posix.join("/workspace", path.relative(scope.workspace.workspacePath, workdir).split(path.sep).join("/")),
+				...(input.tty ? ["--interactive", "--tty"] : []),
+				...mountArgs, "--entrypoint", shell, scope.image, input.login ? "-lc" : "-c", command]);
 			if (!/^[a-f0-9]{64}$/.test(execution.id)) throw new Error("Docker 创建返回的容器 ID 无效");
 			const inspect = async () => {
 				const data = JSON.parse(await cli.request(["inspect", "--format", STATE_FORMAT, execution.id!]));
@@ -195,13 +267,17 @@ export function createContainerOperations(scope: ContainerScope) {
 				signal?.addEventListener("abort", stop, { once: true });
 				if (signal?.aborted) stop();
 				timer = setTimeout(() => { timedOut = true; stop!(); }, timeout * 1000);
+				const attached = input.tty ? await cli.attach(execution.id, (timeout + 20) * 1000) : undefined;
+				if (attached) input.onInput?.(attached.write);
+				input.onStarted?.();
 				const clients = await Promise.allSettled([
 					cli.follow(["wait", execution.id], () => {}, (timeout + 20) * 1000),
 					cli.follow(["logs", "--follow", execution.id], onData, (timeout + 20) * 1000),
+					...(attached ? [attached.closed] : []),
 				].map((client) => client.catch((error) => { stop!(); throw error; })));
 				const failures = clients.filter((client) => client.status === "rejected").map((client) => client.reason);
 				if (failures.length) throw new AggregateError(failures, failures.map(String).join("\n"));
-			} catch (error) { problem ??= error; }
+			} catch (error) { problem ??= error; stop?.(); }
 			clearTimeout(timer);
 			if (stop) signal?.removeEventListener("abort", stop);
 			await stopping;
@@ -229,6 +305,7 @@ export function createContainerOperations(scope: ContainerScope) {
 			if (config) await rm(config, { recursive: true });
 			active = false;
 		}
-	} };
-	return { operations, get cleanupFailed() { return cleanupFailed; }, get lastExecution() { return lastExecution ? structuredClone(lastExecution) : undefined; } };
+	};
+	const operations: BashOperations = { exec: (command, cwd, options) => execute(command, cwd, options) };
+	return { operations, execute, get cleanupFailed() { return cleanupFailed; }, get lastExecution() { return lastExecution ? structuredClone(lastExecution) : undefined; } };
 }

@@ -30,10 +30,19 @@ for (const name of ["git", "pi", "node"]) test(`未批准时状态查询和只�
 
 test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾后父重新取得文档 writer", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
+	const progress: any[] = [];
+	const unsubscribe = h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName === "delivery_develop") progress.push(event.partialResult.details.progress); });
+	t.after(unsubscribe);
 	await h.prepare();
 	await h.session.prompt("/fixture-parent-history");
 	const result = await h.call("delivery_develop", { task: "创建 src/value.js，将 value 从 1 改为 2 并读取文件核对。" });
 	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.ok(progress.every((view) => view.id === result.toolCallId && view.name.startsWith("开发")));
+	for (const tool of ["write", "edit", "read"]) {
+		assert.ok(progress.some((view) => view.action === `正在执行：${tool} src/value.js`));
+		assert.ok(progress.some((view) => view.action === `已完成：${tool} src/value.js`));
+	}
+	assert.match(progress.at(-1).status, /开发结束/);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const events = await h.audit();
@@ -143,6 +152,9 @@ test("独立审查缺少本轮验收时不启动子任务，拒绝后不占住�
 
 test("真实 Pi 独立审查在 Git replace 存在时仍收到真实修改差异", { timeout: 40_000 }, async (t) => {
 	const h = await reviewHost(t);
+	const progress: any[] = [];
+	const unsubscribe = h.session.subscribe((event) => { if (event.type === "tool_execution_update" && ["delivery_validate", "delivery_review"].includes(event.toolName)) progress.push(event.partialResult.details.progress); });
+	t.after(unsubscribe);
 	const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: h.cwd, encoding: "utf8" }).trim();
 	git("add", "src");
 	git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "isolated review baseline");
@@ -150,9 +162,16 @@ test("真实 Pi 独立审查在 Git replace 存在时仍收到真实修改差异
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 2;\n");
 	const replacement = git("hash-object", "-w", "src/value.js");
 	git("replace", old, replacement);
-	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const validation = await h.call("delivery_validate", {});
+	assert.equal(validation.isError, false);
 	const review = await h.call("delivery_review", { task: "检查原始 HEAD 与当前源码的差异" });
 	assert.equal(review.isError, false, JSON.stringify(review));
+	assert.ok(progress.filter((view) => view.id === validation.toolCallId).every((view) => view.name.startsWith("验收")));
+	assert.ok(progress.filter((view) => view.id === review.toolCallId).every((view) => view.name.startsWith("审查")));
+	assert.ok(progress.some((view) => view.id === validation.toolCallId && view.action === "正在执行：bash node inputs/command.cjs"));
+	assert.ok(progress.some((view) => view.id === review.toolCallId && view.action === "已完成：read src/value.js"));
+	assert.match(progress.findLast((view) => view.id === validation.toolCallId).status, /固定验收通过/);
+	assert.match(progress.at(-1).status, /审查结束/);
 	const diffFile = (review.details as any).diffFile;
 	assert.match(await readFile(diffFile, "utf8"), /-export const value = 1;\n\+export const value = 2;/);
 	const events = await h.audit();

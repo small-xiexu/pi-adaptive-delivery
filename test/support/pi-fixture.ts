@@ -204,8 +204,12 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 	}
 	await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({
 		packages: [packageDir, ...(productDir && !writerFixture ? [productDir] : [])], defaultProvider: "adaptive-fixture", defaultModel: "fake",
-		defaultProjectTrust: "never", retry: { enabled: false }, compaction: { enabled: false },
+		defaultProjectTrust: scenario === "readonly-search" ? "always" : "never", retry: { enabled: false }, compaction: { enabled: false },
 	}));
+	if (scenario === "readonly-search") {
+		await mkdir(path.join(cwd, ".pi"));
+		await writeFile(path.join(cwd, ".pi/settings.json"), JSON.stringify({ defaultTools: ["read", "bash", "edit", "write", "grep", "find", "ls"] }));
+	}
 	await writeFile(path.join(cwd, "AGENTS.md"), "# 临时规则\n仅操作测试夹具。\n");
 	await writeFile(path.join(cwd, "input.txt"), "fixture-read-ok\n");
 	if (scenario?.startsWith("environment-")) {

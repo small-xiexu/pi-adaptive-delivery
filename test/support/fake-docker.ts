@@ -45,22 +45,27 @@ if (process.argv[2] === "--config" && process.argv[4] === "--host") {
 			console.log(JSON.stringify(state));
 		} else if (command === "start") {
 			if (scenario === "start-error") fail("fixture confirmed start failure");
-			state.state.Status = scenario === "running" ? "running" : "exited";
-			state.state.Running = scenario === "running";
-			state.state.Pid = scenario === "running" ? 123 : 0;
+			const running = ["running", "structured-wait"].includes(scenario);
+			state.state.Status = running ? "running" : "exited";
+			state.state.Running = running;
+			state.state.Pid = running ? 123 : 0;
 			save(state);
 			console.log(state.id);
 		} else if (command === "wait") {
+			if (scenario === "structured-wait") while (JSON.parse(readFileSync(stateFile, "utf8")).state.Running) await new Promise((resolve) => setTimeout(resolve, 20));
 			await new Promise((resolve) => setTimeout(resolve, 300));
 			audit("wait-ended");
 			console.log("0");
 		} else if (command === "logs") {
 			if (scenario === "logs-error") fail("fixture log client failed");
-			console.log("fixture output");
+			console.log(scenario === "structured-output" ? "A".repeat(100_000) + "OUTPUT_TAIL" : "fixture output");
 		} else if (command === "rm") {
 			if (scenario === "remove-error") fail("fixture remove failed");
 			console.log(state.id);
-		} else if (command === "stop") console.log(state.id);
+		} else if (command === "stop") {
+			if (scenario === "structured-wait") { state.state = { ...state.state, Status: "exited", Running: false, Pid: 0, ExitCode: 143 }; save(state); }
+			console.log(state.id);
+		}
 		else fail(`unexpected fixture command ${command}`);
 	}
 }
