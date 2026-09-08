@@ -127,6 +127,27 @@ for (const kind of ["message", "execution"]) test(`子已有 ${kind} 后丢失 S
 	await assert.rejects(h.writer.finish(h.ctx), { code: "ENOENT" });
 });
 
+for (const field of ["content", "isError"]) test(`失败结果的证据或错误标记 ${field} 被改写时不能交接`, async () => {
+	const h = await host();
+	const first = h.sm.getBranch()[0]!;
+	assert.ok(first.type === "message" && first.message.role === "assistant");
+	h.sm.appendMessage({ ...first.message, content: [{ type: "toolCall", id: "failed-run", name: "delivery_develop", arguments: { task: "核对失败" } }] });
+	const call = structuredClone(h.sm.getBranch().at(-1)!);
+	const result = { content: [{ type: "text" as const, text: `工具失败\n原始子 Session：${path.join(h.root, "original.jsonl")}` }], details: {}, isError: true };
+	h.sm.appendMessage({ role: "toolResult", toolCallId: "failed-run", toolName: "delivery_develop", ...structuredClone(result), timestamp: Date.now() });
+	const state: Parameters<typeof verifyRecordedResult>[0] = { id: "failed-run", name: "delivery_develop", cwd: h.cwd,
+		sessionId: h.sm.getSessionId(), sessionFile: h.sm.getSessionFile()!, lifetime: new AbortController(),
+		finished: true, attemptedLease: false, call, result: structuredClone(result) };
+	await verifyRecordedResult(state, h.ctx);
+	const entry = h.sm.getEntries().findLast((row) => row.type === "message" && row.message.role === "toolResult");
+	assert.ok(entry?.type === "message" && entry.message.role === "toolResult");
+	if (field === "content") entry.message.content = [{ type: "text", text: `工具失败\n原始子 Session：${path.join(h.root, "substituted.jsonl")}` }];
+	else entry.message.isError = false;
+	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	await writeFile(h.sm.getSessionFile()!, rows.map((row) => JSON.stringify(row.id === entry.id ? entry : row)).join("\n") + "\n");
+	await assert.rejects(verifyRecordedResult(state, h.ctx), /父开发工具终态未唯一落盘或与实际结果不符/);
+});
+
 for (const kind of ["disk", "memory-and-disk"]) test(`审查终态依赖原验收的私有引用，${kind} 改写不能沿用通过`, async () => {
 	const h = await host();
 	const first = h.sm.getBranch()[0]!;

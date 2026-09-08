@@ -121,6 +121,7 @@ test("交接后任务发送前记录失败，正常退出的空子 Session 可�
 	assert.equal(injected, true);
 	assert.equal(result.isError, true);
 	assert.match(JSON.stringify(result), /fixture before-task record failure/);
+	assert.match(JSON.stringify(result.content), /子任务尚未发送，Session 文件可能尚未生成/);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const events = await h.audit();
 	assert.equal(events.filter((row) => row.child && row.phase === "model").length, 0);
@@ -608,7 +609,18 @@ for (const failure of ["close", "crash", "child-tamper", "child-persistence", "p
 		try {
 			const run = h.call("delivery_develop", { task: "验证收尾故障" });
 			if (failure === "parent-persistence") await assert.rejects(run, { code: "EACCES" });
-			else await run;
+			else {
+				const result = await run;
+				if (failure !== "parent-tamper") {
+					assert.equal(result.isError, true);
+					const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+					const started = h.sm.getEntries().find((row) => row.type === "custom" && row.customType === "delivery-development");
+					assert.ok(started?.type === "custom");
+					assert.ok(text.includes((started.data as { childSessionFile: string }).childSessionFile));
+					assert.match(text, /子收尾核验：未取得证明/);
+					assert.doesNotMatch(text, /子收尾核验：已取得证明/);
+				}
+			}
 			assert.equal((await h.readLease())?.owner.kind, "child", h.notices.join("\n"));
 			assert.ok(h.notices.some((notice) => notice.includes("开发 writer 未交回")));
 			if (parentFile) await chmod(parentFile, 0o600);
@@ -698,7 +710,10 @@ child.unref();`;
 
 test("正式开发入口没有实施或文档授权时不启动子模型", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
-	assert.equal((await h.call("delivery_develop", { task: "未授权变更" })).isError, true);
+	const unapproved = await h.call("delivery_develop", { task: "未授权变更" });
+	assert.equal(unapproved.isError, true);
+	assert.match(JSON.stringify(unapproved.content), /子 Session 引用尚未取得/);
+	assert.doesNotMatch(JSON.stringify(unapproved.content), /原始子 Session：|子收尾核验：已取得证明/);
 	await h.approve("design", []);
 	await h.approve("implementation", ["src"]);
 	assert.equal((await h.call("delivery_develop", { task: "缺少规划文档边界" })).isError, true);

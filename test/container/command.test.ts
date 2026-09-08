@@ -133,6 +133,39 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 	return { ...h, children };
 }
 
+test("开发初始读取失败后写入与真实自检成功，父沿失败结果取证并继续固定验收", { timeout: 60_000 }, async (t) => {
+	const h = await developmentHost(t, "read-before-write", `const assert = require("node:assert/strict");
+assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");
+console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
+	const result = await h.call("delivery_develop", { task: "先读取不存在的目标，然后创建、编辑并执行一次容器自检。" });
+	assert.equal(result.isError, true, "成功自检不覆盖之前的工具失败");
+	const [rows] = await h.children();
+	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
+	assert.deepEqual(tools.map((tool: any) => [tool.toolName, tool.isError]), [["read", true], ["write", false], ["edit", false], ["bash", false], ["read", false]]);
+	assert.match(JSON.stringify(tools[0].content), /ENOENT/);
+	assert.match(JSON.stringify(tools[3].content), /READ_RECOVERY_SELF_CHECK_OK/);
+	assert.equal(tools[3].details.container.exitCode, 0);
+	assert.equal(tools[3].details.container.clean, true);
+	assert.equal(rows.find((row: any) => row.customType === "delivery-child-exit").data.development.clean, true);
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+	assert.match(text, /子任务存在工具失败/);
+	const childFile = text.match(/^原始子 Session：(.+)$/m)?.[1];
+	assert.ok(childFile, "失败正文必须提供模型可直接读取的子记录路径");
+	assert.match(text, /子收尾核验：已取得证明/);
+	assert.ok(text.includes(h.sm.getSessionFile()!) && text.includes(result.toolCallId));
+	assert.match(text, /父 writer.*待.*落盘/);
+	const native = await h.call("read", { path: childFile });
+	assert.equal(native.isError, false);
+	assert.match(JSON.stringify(native.content), /READ_RECOVERY_SELF_CHECK_OK/);
+	assert.equal((await h.call("delivery_validate", {})).isError, false, "原批准仍有效时由既有门禁执行固定验收");
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "开发工具失败保留；原始自检已核实，独立固定验收通过。\n" })).isError, false);
+	assert.equal(h.choices.length, 4, "取证与验收不重复申请原范围批准");
+	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
+	assert.equal(children.length, 2, "补证不重复开发或自检，只增加独立验收子");
+	for (const child of children) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+});
+
 test("正式父批准/子 CLI/真实 Docker：文件开发、实际命令、持久收尾后父回写台账", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "normal", `const fs = require("node:fs");
 const source = fs.readFileSync("src/value.js", "utf8");

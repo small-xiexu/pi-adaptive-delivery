@@ -378,8 +378,16 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				state.result = snapshot({ ...result, isError: false });
 				return result;
 			} catch (error) {
-				state.result = { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: {}, isError: true };
-				throw error;
+				const childSession = state.child?.sessionFile ?? state.readonlyReference?.sessionFile;
+				const text = (error instanceof Error ? error.message : String(error))
+					+ (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。")
+					+ (state.child && !state.taskSent ? "\n子任务尚未发送，Session 文件可能尚未生成。" : "")
+					+ (state.rpc || state.readonlyReference?.pid ? `\n子收尾核验：${state.childTerminal || state.readonlyTerminal ? "已取得证明，交接时仍须复核。" : "未取得证明，保持关闭。"}` : "")
+					+ `\n父 Session：${state.sessionFile}\n本次工具调用：${state.id}`
+					+ (state.lease ? "\n父 writer 尚待本次工具结果落盘后核验交接；此失败结果不证明已交回，可用 /delivery-status 核对现场。" : "");
+				const failure = new Error(text, { cause: error });
+				state.result = { content: [{ type: "text", text }], details: {}, isError: true };
+				throw failure;
 			} finally {
 				state.finished = true;
 				if (!state.attemptedLease && active === state) active = undefined;

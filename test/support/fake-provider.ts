@@ -143,6 +143,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const containerChild = developmentChild && scenario.startsWith("development-container-");
 				const validationChild = developmentChild && JSON.stringify(context.messages).includes("固定候选验收。严格按下列");
 				const step = messages.filter((message) => message.role === "toolResult").length;
+				const readBeforeWrite = developmentChild && !validationChild && scenario === "development-container-read-before-write";
+				const developmentStep = step - (readBeforeWrite ? 1 : 0);
 				const readSkill = environment && isChild() && read && !read.isError && messages.filter((message) => message.role === "toolResult").length === 1;
 				const user = context.messages.findLast((message) => message.role === "user");
 				const taskText = typeof user?.content === "string" ? user.content : user?.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? "";
@@ -158,13 +160,13 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const reviewEvidence = reviewChild ? JSON.parse(taskText.split("\n").find((line) => line.startsWith("审查证据："))!.slice("审查证据：".length)) : undefined;
 				const readonlyEscalation = development && isChild() && !developmentChild && JSON.stringify(user?.content).includes("fixture-read-then-write");
 				const finished = !planned && read && !readSkill && (reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
-					: !developmentChild || step >= (containerChild ? 4 : 3) || read.isError)
+					: !developmentChild || developmentStep >= (containerChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
 					&& (!readonlyEscalation || step >= 2 || read.isError);
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write") || readonlyEscalation && step === 1;
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
 				const toolName = planned?.name ?? (validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
-					: developmentChild ? step === 0 ? "write" : step === 1 ? "edit" : step === 2 && containerChild ? "bash" : "read"
+					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && containerChild ? "bash" : "read"
 					: writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
 					: document ? scenario.endsWith("edit") ? "delivery_document_edit" : "delivery_document_write" : approval ? "delivery_approval" : write ? "write" : "read");
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
@@ -173,9 +175,9 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const args = planned?.arguments ?? (validationChild ? scenario.endsWith("validation-edit") ? { path: target, content: "forbidden validation edit\n" }
 					: { command: scenario.endsWith("validation-wrong") ? "echo unapproved" : step === 1 ? "node inputs/second.cjs" : "node inputs/command.cjs",
 						timeout: scenario.endsWith("validation-timeout") ? 1 : 10 }
-					: developmentChild ? step === 0 ? { path: target, content: "export const value = 1;\n" }
-					: step === 1 ? { path: target, edits: [{ oldText: "value = 1", newText: containerChild && JSON.stringify(user?.content).includes("fixture-container-repair") ? "value = 3" : "value = 2" }] }
-					: step === 2 && containerChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-container-timeout" ? 1 : 10 } : { path: target }
+					: developmentChild ? developmentStep === 0 ? { path: target, content: "export const value = 1;\n" }
+					: developmentStep === 1 ? { path: target, edits: [{ oldText: "value = 1", newText: containerChild && JSON.stringify(user?.content).includes("fixture-container-repair") ? "value = 3" : "value = 2" }] }
+					: developmentStep === 2 && containerChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-container-timeout" ? 1 : 10 } : { path: target }
 					: toolName === "delivery_document_write" ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
 					: toolName === "delivery_document_edit" ? { path: "plan.md", edits: [{ oldText: "原文", newText: "禁止" }] }
 					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: stage === "design" ? [] : ["plan.md"], validationCommands: [] }
