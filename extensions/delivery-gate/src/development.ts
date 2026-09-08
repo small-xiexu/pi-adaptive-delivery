@@ -311,15 +311,16 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						if (candidate.digest !== validation.validation!.after!.digest) throw new Error("实际候选已变化，旧验收证据失效；修复后重新验收");
 					} catch (error) { validated = undefined; throw error; }
 					const artifact = await prepareReview(scope, candidate);
-					const result = await delegateReadOnly({ ...input, readPaths: [...(input.readPaths ?? []), artifact.diffFile, validation.child!.sessionFile!], task: `独立候选代码审查。对照原始目标和批准要求读取当前代码、实际差异与原始验收记录，不只看实现者总结。发现由父会话裁决，不批准、不修改或继续委派。\n`
+					const result = await delegateReadOnly({ ...input, readPaths: [...(input.readPaths ?? []), artifact.directory, validation.child!.sessionFile!], task: `独立候选代码审查。对照原始目标和批准要求读取当前代码、实际差异与原始验收记录，不只看实现者总结。发现由父会话裁决，不批准、不修改或继续委派。\n`
 						+ `已批准方案：\n${grant.designBody}\n\n已批准实施计划：\n${grant.implementationBody}\n\n候选：${candidate.digest}\n`
 						+ `代码路径：${JSON.stringify(grant.paths)}\n只读输入：${JSON.stringify(grant.container.inputs)}\n固定验收命令：${JSON.stringify(grant.validationCommands)}\n`
-						+ `审查证据：${JSON.stringify({ diffFile: artifact.diffFile, validationSessionFile: validation.child!.sessionFile })}\n`
+						+ `审查证据：${JSON.stringify({ reviewDirectory: artifact.directory, diffFile: artifact.diffFile, validationSessionFile: validation.child!.sessionFile })}\n`
 						+ `差异基线：${artifact.baseHead ?? "无 HEAD，空基线"}；before/after 为原始 Git blob/当前文件副本。差异覆盖全部可写候选和 Git 常规列出的输入，忽略的只读依赖按原路径核对。\n重点：${input.task}` }, running,
 						(data) => {
 							if (data.phase === "started") state.readonlyStarted = true;
-							state.readonlyReference = snapshot(data);
-							pi.appendEntry(DELEGATION_ENTRY, data);
+							const reference = { ...data, reviewDirectory: artifact.directory };
+							state.readonlyReference = snapshot(reference);
+							pi.appendEntry(DELEGATION_ENTRY, reference);
 						}, update, ctx, progress);
 					if ((await captureCandidate(scope, grant.validationCommands, running)).digest !== candidate.digest) {
 						validated = undefined;
@@ -391,7 +392,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.review) {
 					const review = state.review;
 					progress.end("审查结束，待父裁决与交接核验");
-					const result = { content: [{ type: "text" as const, text: `独立审查已结束，发现仍由父会话裁决，不等于审查通过：\n${review.result.text}\n候选：${review.candidate.digest}\n审查原始记录：${review.result.sessionFile}\n实际差异：${review.artifact.diffFile}` }],
+					const result = { content: [{ type: "text" as const, text: `独立审查已结束，发现仍由父会话裁决，不等于审查通过：\n${review.result.text}\n候选：${review.candidate.digest}\n审查原始记录：${review.result.sessionFile}\n审查制品：${review.artifact.directory}\n实际差异：${review.artifact.diffFile}` }],
 						details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
 					state.result = snapshot({ ...result, isError: false });
 					return result;
@@ -414,6 +415,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				const childSession = state.child?.sessionFile ?? state.readonlyReference?.sessionFile;
 				const text = (error instanceof Error ? error.message : String(error))
 					+ (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。")
+					+ (typeof state.readonlyReference?.reviewDirectory === "string" ? `\n审查制品：${state.readonlyReference.reviewDirectory}` : "")
 					+ (state.child && !state.taskSent ? "\n子任务尚未发送，Session 文件可能尚未生成。" : "")
 					+ (state.rpc || state.readonlyReference?.pid ? `\n子收尾核验：${state.childTerminal || state.readonlyTerminal ? "已取得证明，交接时仍须复核。" : "未取得证明，保持关闭。"}` : "")
 					+ `\n父 Session：${state.sessionFile}\n本次工具调用：${state.id}`

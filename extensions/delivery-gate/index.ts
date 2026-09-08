@@ -27,17 +27,15 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		if (!promptOptions) throw new Error("本回合资源环境尚未核实");
 		const options = promptOptions;
 		const resources = [...(options.contextFiles ?? []).map((file) => file.path), ...(options.skills ?? []).map((skill) => skill.baseDir)];
-		if (ctx.sessionManager.getSessionFile()) resources.push(ctx.sessionManager.getSessionFile()!);
+		// 子只接收父明确给定的证据；自身 Session 仍在追加，收尾后由父按委派引用读取。
+		if (!child && ctx.sessionManager.getSessionFile()) resources.push(ctx.sessionManager.getSessionFile()!);
 		if (child) resources.push(...JSON.parse(process.env.PI_ADAPTIVE_DELIVERY_READ_PATHS ?? "[]"));
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type === "custom" && [DELEGATION_ENTRY, "delivery-development"].includes(entry.customType)) {
-				const data = entry.data as { sessionFile?: string; childSessionFile?: string };
+				const data = entry.data as { sessionFile?: string; childSessionFile?: string; reviewDirectory?: string };
 				if (data.sessionFile) resources.push(data.sessionFile);
 				if (data.childSessionFile) resources.push(data.childSessionFile);
-			}
-			if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === REVIEW_TOOL) {
-				const data = entry.message.details as { diffFile?: string } | undefined;
-				if (data?.diffFile) resources.push(data.diffFile);
+				if (data.reviewDirectory) resources.push(data.reviewDirectory);
 			}
 		}
 		return [...new Set(resources)];
@@ -54,7 +52,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		if (!structured) return;
 		for (const tool of structured.tools) pi.registerTool({
 			name: tool.name, label: tool.name, parameters: tool.parameters as any,
-			description: `${tool.description}\n交付隔离：exec_command/write_stdin 只在本地禁网 Docker 中运行，最长 300 秒、至多一个未交回命令；使用容器内 /bin/sh 与镜像已有程序，workdir 和文件使用本 worktree 原绝对路径，不继承宿主 Shell、PATH 或凭据。只读角色的工作树不可写；开发须原实施确认中的容器授权，apply_patch 仅修改原可写挂载，镜像须支持 glibc helper。父文档仍使用 delivery_document_edit/write。`,
+			description: `${tool.description}\n交付隔离：exec_command/write_stdin 只在本地禁网 Docker 中运行，最长 300 秒、至多一个未交回命令；max_output_tokens 须大于 0 且不超过 12500，默认 4000；yield_time_ms 为 0–30000，返回 session_id 后用 write_stdin 取回最终退出。使用容器内 /bin/sh 与镜像已有程序，workdir 和文件使用本 worktree 原绝对路径，不继承宿主 Shell、PATH 或凭据。父/只读子镜像 node:22-alpine 提供 Node 和 BusyBox，不能假定有 rg、Python 或 GNU find。工作树、明确审查目录（before/after/diff.patch）及原始 Session 均只读；长 JSONL 可用 Node fs 按换行逐条 JSON.parse，按角色和记录位置选取 content 中的 text 或工具结果，分段输出原文，不输出 thinking；grep 单行可能截断，不能据此判定原文不可读。开发须原实施确认中的容器授权，apply_patch 仅修改原可写挂载，镜像须支持 glibc helper。父文档仍使用 delivery_document_edit/write。`,
 			execute: async (id, args: any, signal, update, context) => {
 				if (!structuredAllowed(tool.name)) throw new Error("Structured 工具来源已变化，未执行");
 				if (tool.name === "view_image") {

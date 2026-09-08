@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -13,11 +13,11 @@ async function fixture(t: TestContext, scenario = "normal") {
 	const cwd = path.join(root, "repo");
 	await mkdir(cwd); execFileSync("git", ["init", "--quiet"], { cwd });
 	const fake = await installFakeDocker(t, root, scenario);
-	const scope = { workspace: await resolveWorkspaceIdentity(cwd), image: `sha256:${"a".repeat(64)}`, readPaths: [], writePaths: [], protectedPaths: [], hostPaths: true, readonlyWorkspace: [] };
+	const scope = { workspace: await resolveWorkspaceIdentity(cwd), image: `sha256:${"a".repeat(64)}`, readPaths: [], writePaths: [], protectedPaths: [], hostPaths: true, readonlyWorkspace: [] as string[] };
 	let references = 0;
 	const create = () => createStructuredCommands(scope, async () => { references++; });
 	const runner = create();
-	return { cwd, fake, runner, create, references: () => references };
+	return { root, cwd, scope, fake, runner, create, references: () => references };
 }
 
 test("Structured 无效参数与跨会话 session_id 在创建容器前拒绝", async (t) => {
@@ -84,4 +84,31 @@ test("只读挂载中的宿主 FIFO 在任何 Docker 创建前拒绝", async (t)
 	await assert.rejects(h.runner.exec("start", { cmd: "true", yield_time_ms: 30_000 }), /socket、FIFO 或设备/);
 	assert.equal(h.references(), 0);
 	assert.equal(h.runner.cleanupFailed, false);
+});
+
+test("外部审查目录仅按明确路径只读挂载，不带入其父目录与邻接资源", async (t) => {
+	const h = await fixture(t);
+	const directory = path.join(h.root, "review");
+	await mkdir(path.join(directory, "after"), { recursive: true });
+	await writeFile(path.join(directory, "after/source.txt"), "candidate");
+	await writeFile(path.join(h.root, "unapproved.txt"), "outside");
+	h.scope.readonlyWorkspace.push(directory);
+	await h.runner.exec("read-review", { cmd: "true", yield_time_ms: 30000 });
+	const args = h.fake.audit().find((row) => row.command === "create").args as string[];
+	assert.deepEqual(args.flatMap((arg, index) => arg === "--mount" ? [args[index + 1]] : []), [h.cwd, directory].map((source) =>
+		`"type=bind","src=${source}","target=${source}","bind-recursive=disabled","readonly"`));
+	assert.equal(h.runner.lastExecution?.clean, true);
+	await h.runner.finish();
+});
+
+test("新增审查资源目录内的 FIFO 仍在容器创建前拒绝", async (t) => {
+	const h = await fixture(t);
+	const directory = path.join(h.root, "review");
+	await mkdir(path.join(directory, "before"), { recursive: true });
+	execFileSync("mkfifo", [path.join(directory, "before/host-ipc")]);
+	h.scope.readonlyWorkspace.push(directory);
+	await assert.rejects(h.runner.exec("read-review", { cmd: "true", yield_time_ms: 30000 }), /socket、FIFO 或设备/);
+	assert.equal(h.references(), 0);
+	assert.equal(h.runner.cleanupFailed, false);
+	await h.runner.finish();
 });

@@ -172,6 +172,53 @@ test("真实 Structured 完成独立批准、补丁开发、自检、固定验�
 	assertEnhancements(await h.audit());
 });
 
+for (const failed of [false, true]) test(`真实 Structured ${failed ? "失败" : "成功"}审查的父子均能读取只读快照和完整长记录`, { timeout: 90_000 }, async (t) => {
+	const h = await development(t, failed ? "evidence-fail" : "evidence");
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: h.cwd, env: process.env });
+	git("add", "src/value.js");
+	git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--no-gpg-sign", "-m", "isolated evidence baseline");
+	assert.equal((await h.call("delivery_develop", { task: "按授权更新源码" })).isError, false);
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	const review = await h.call("delivery_review", { task: "读取 before/after、差异和原始验收；禁止写入快照" });
+	assert.equal(review.isError, failed, JSON.stringify(review));
+	assert.equal(await h.readLease(), undefined);
+	const parentRows = await jsonl(h.sm.getSessionFile()!);
+	const reference = parentRows.findLast((row) => row.customType === "delivery-delegation" && row.data.phase === "ended").data;
+	const rows = await jsonl(reference.sessionFile);
+	const commands = rows.filter((row) => row.message?.toolName === "exec_command");
+	assert.equal(commands[0].message.details.exit_code, 0, JSON.stringify(commands[0].message));
+	assert.match(JSON.stringify(commands[0].message.content), /value = 1/);
+	assert.match(JSON.stringify(commands[0].message.content), /value = 2/);
+	assert.match(JSON.stringify(commands[1].message.content), /STRUCTURED_REAL_CHECK_OK/);
+	const directory = reference.reviewDirectory;
+	assert.equal(typeof directory, "string");
+	await assert.rejects(access(path.join(directory, "forbidden")), { code: "ENOENT" });
+	const sibling = `${directory}-unapproved`;
+	await writeFile(sibling, "UNAPPROVED_SIBLING");
+	const script = `const fs=require('node:fs');
+const d=${JSON.stringify(directory)};
+console.log(fs.readFileSync(d+'/before/src/value.js','utf8'));
+console.log(fs.readFileSync(d+'/after/src/value.js','utf8'));
+if(fs.existsSync(${JSON.stringify(sibling)})) throw Error('制品父目录不应挂载');
+const body=fs.readFileSync(${JSON.stringify(reference.sessionFile)},'utf8');
+require('node:assert/strict').equal(Buffer.byteLength(body),${Buffer.byteLength(await readFile(reference.sessionFile))},'首次读取须包含完整原记录');
+const rows=body.split('\\n').filter(Boolean).map(JSON.parse);
+const texts=rows.filter(row=>row.message?.role==='assistant').flatMap(row=>row.message.content.filter(part=>part.type==='text').map(part=>part.text));
+if(!texts.length) throw Error('原始正文缺失');
+console.log(texts.join('\\n'));`;
+	const recovered = await h.call("exec_command", { cmd: `node - <<'JS'\n${script}\nJS`, yield_time_ms: 30000, max_output_tokens: 4000 });
+	assert.equal(recovered.isError, false, JSON.stringify(recovered));
+	assert.equal((recovered.details as any).exit_code, 0, JSON.stringify(recovered));
+	const text = (recovered.details as any).output;
+	assert.match(text, /LONG_REVIEW_BEGIN/);
+	assert.match(text, /LONG_REVIEW_END/);
+	assert.ok(text.length > 500);
+	assert.doesNotMatch(text, /较早输出已截断/);
+	assert.equal(await readFile(path.join(directory, "after/src/value.js"), "utf8"), "export const value = 2;\n");
+	assertEnhancements(await h.audit());
+});
+
 for (const scenario of ["outside", "cancel", "unfinished", "crash"]) test(`真实 Structured ${scenario} 保留失败和原始证据，按实际终态决定交接`, { timeout: 60_000 }, async (t) => {
 	const h = await development(t, scenario);
 	const run = h.call("delivery_develop", { task: "验证执行失败和收尾边界" });

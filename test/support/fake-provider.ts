@@ -222,13 +222,23 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					const target = taskText.includes("input-b.txt") ? "input-b.txt" : "input-a.txt";
 					Object.assign(args, structured ? { cmd: `cat ${target}` } : { path: target });
 				}
+				if (reviewChild && scenario.includes("structured-evidence")) {
+					const directory = path.dirname(reviewEvidence.diffFile);
+					const script = step === 0
+						? `const fs=require('node:fs'); const d=${JSON.stringify(directory)}; console.log(fs.readFileSync(d+'/before/src/value.js','utf8')); console.log(fs.readFileSync(d+'/after/src/value.js','utf8')); console.log(fs.readFileSync(d+'/diff.patch','utf8')); try { fs.writeFileSync(d+'/forbidden','bad'); throw Error('快照可写'); } catch(e) { if (!['EROFS','EACCES'].includes(e.code)) throw e; }`
+						: `const fs=require('node:fs'); const rows=fs.readFileSync(${JSON.stringify(reviewEvidence.validationSessionFile)},'utf8').split('\\n').filter(Boolean).map(JSON.parse); for(const row of rows) if(row.message?.role==='toolResult') for(const part of row.message.content) if(part.type==='text') console.log(part.text);`;
+					Object.assign(args, { cmd: `node - <<'JS'\n${script}\nJS`, max_output_tokens: step === 2 && scenario.endsWith("-fail") ? 13000 : 4000 });
+				}
+				const longReview = `LONG_REVIEW_BEGIN\n${"原始审查正文中文🔎\u2028".repeat(180)}\nLONG_REVIEW_END`;
 				const output: AssistantMessage = {
 					role: "assistant", api: model.api, provider: model.provider, model: model.id,
-					content: aborted ? [] : finished ? [{ type: "text", text: reviewChild ? `FAKE_REVIEW_MECHANISM：${JSON.stringify(messages.find((message) => message.role === "toolResult")?.content).includes("value = 1") ? "P1 src/value.js:1 需要父会话裁决并修复 value" : "未发现本夹具范围内问题"}`
+					content: aborted ? [] : finished ? [{ type: "text", text: reviewChild && scenario.includes("structured-evidence") ? longReview
+						: reviewChild ? `FAKE_REVIEW_MECHANISM：${JSON.stringify(messages.find((message) => message.role === "toolResult")?.content).includes("value = 1") ? "P1 src/value.js:1 需要父会话裁决并修复 value" : "未发现本夹具范围内问题"}`
 						: `隔离✅\u2028保留\u2029JSONL ${JSON.stringify(read!.content)}` }]
 					: !isChild() && delegate && scenario.endsWith("readonly-parallel") ? ["a", "b"].map((target) => ({ type: "toolCall", id: `parallel-${target}`, name: "delivery_readonly", arguments: { task: `读取 input-${target}.txt 并说明事实` } }))
 					: !isChild() && scenario === "structured-command-parallel" ? ["a", "b"].map((target) => ({ type: "toolCall", id: `command-${target}`, name: "exec_command", arguments: { cmd: "sleep 120", yield_time_ms: 250 } }))
-					: [{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: args }],
+					: [...(reviewChild && scenario.endsWith("structured-evidence-fail") && step === 2 ? [{ type: "text" as const, text: longReview }] : []),
+						{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: args }],
 					stopReason: aborted ? "aborted" : finished ? "stop" : "toolUse", timestamp: Date.now(),
 					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
