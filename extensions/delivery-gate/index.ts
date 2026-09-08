@@ -58,7 +58,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	const developer = createDevelopmentDelegator(pi, approvals);
 	pi.registerTool({ name: REVIEW_TOOL, label: "独立候选审查",
 		description: "在本轮可信固定验收和当前候选一致时，沿只读子路径独立审查批准目标、当前代码、实际差异及原始验收记录。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险，不只提供实现者总结" }) }, { additionalProperties: false }),
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径、实际差异及验收记录，无须重述全部需求，不以实现者总结代替证据" }) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始审查");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
@@ -80,7 +80,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	});
 	pi.registerTool({ name: DEVELOPMENT_TOOL, label: "开发文件委派",
 		description: "将一次开发任务交给独立标准 Pi。要求本轮父 TUI 的方案、实施及规划文档授权；支持受控原生 edit/write 与只读工具，命令须在实施确认中明确批准容器镜像/输入，不能用宿主 Bash 或未知工具覆盖替代。子任务不能修改父规划文档，不递归委派；原生终态落盘后才交回 writer，结果仍需核实。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次文件变更目标、必要上下文和预期证据，不复制完整父历史" }) }, { additionalProperties: false }),
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据；工具自动附带已批准方案、实施正文、路径及命令，无须再次抄写或复制完整父历史" }) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未委派");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);

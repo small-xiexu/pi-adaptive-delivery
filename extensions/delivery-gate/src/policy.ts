@@ -4,7 +4,7 @@ import { APPROVAL_TOOL } from "./approvals.ts";
 import { DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./parent-writer.ts";
 import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
 
-export const CAPABILITY_NOTICE = "当前支持原生只读、父 TUI 批准的文档编辑与受控子开发、明确批准的本地容器命令、固定候选验收及独立只读审查。宿主 Shell 关闭，旧权限和证据不自动恢复；真实用户 TUI 及完整交付效果仍待验收。";
+export const CAPABILITY_NOTICE = "当前支持原生只读、父 TUI 批准的文档编辑与受控子开发、明确批准的本地容器命令、固定候选验收及独立只读审查。宿主 Shell 关闭，旧权限和证据不自动恢复；当前任务的权限与完成情况仍须按实际工具和证据核实。";
 const NATIVE_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">): string[] {

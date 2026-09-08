@@ -15,7 +15,7 @@ export const APPROVAL_ENTRY = "delivery-approval";
 
 const parameters = Type.Object({
 	stage: StringEnum(["documents", "design", "implementation"] as const),
-	body: Type.String({ minLength: 1, description: "本任务待确认的完整正文，不是全文台账或摘要 ID。实施阶段应包含计划、验证方式与停止条件。" }),
+	body: Type.String({ minLength: 1, description: "本阶段待确认的决策正文，不以文件路径或摘要 ID 代替。documents 说明文档编辑用途与边界；design 说明目标、范围、关键设计及验收方向；implementation 说明步骤、依赖、验证、操作范围与停止条件。实施时工具会重新展示原方案，无须重复抄写；不复制全文台账。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "documents 为确切 Markdown 路径；design 为空；implementation 为允许修改的文件或目录。路径按 cwd 解析，不是 glob。" }),
 	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
 	container: Type.Optional(Type.Object({
@@ -197,7 +197,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				if (proposal.stage === "documents") documents = live;
 				if (proposal.stage === "implementation") implementation = live;
 				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。${request.stage === "documents" ? "后续回合可使用专用文档工具，每次写入仍须核验本轮授权、路径和父 writer。"
-					: request.stage === "implementation" ? `后续可在本轮文档边界和 writer 交接下委派开发；${container ? "仅按已确认镜像和挂载执行容器命令；固定验收使用本次命令清单。" : "本次不授权容器命令，固定验收不可用。"}独立审查仍需当前候选的可信验收，不开放宿主 Shell。` : "本次确认不扩大操作范围，实施仍须独立确认。"}` }],
+					: request.stage === "implementation" ? `用户未要求暂停且没有未决问题时，继续在本轮文档边界和 writer 交接下委派开发，无须额外的“继续”；${container ? "仅按已确认镜像和挂载执行容器命令；固定验收使用本次命令清单。" : "本次不授权容器命令，固定验收不可用。"}独立审查仍需当前候选的可信验收，不开放宿主 Shell。` : "用户未要求暂停且没有未决问题时，继续在已有文档授权内编制实施计划；本次不扩大操作范围，实施仍须独立确认。"}` }],
 					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
 			} finally {
 				pending = undefined;
