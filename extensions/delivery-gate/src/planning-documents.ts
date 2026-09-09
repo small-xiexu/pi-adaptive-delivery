@@ -20,7 +20,7 @@ function within(root: string, target: string): boolean {
 	return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-// 内部执行底层，不是批准入口。调用方须提供已核实的文档授权并负责 lease 的完整生命周期。
+// 内部执行底层。父 Markdown 默认可编辑；调用方绑定本次目标路径并负责 lease 的完整生命周期。
 export function createPlanningDocumentTools(scope: DocumentScope, protectedPaths: readonly string[] = []) {
 	return createFileTools(scope, "parent", protectedPaths);
 }

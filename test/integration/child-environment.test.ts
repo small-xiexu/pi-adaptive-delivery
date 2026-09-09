@@ -66,11 +66,13 @@ for (const scenario of ["normal", "rules-missing", "instructions-missing", "skil
 		await rpc.waitFor((record) => record.type === "agent_settled");
 		const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_readonly");
 		assert.ok(result);
-		assert.equal(result.isError, scenario !== "normal", JSON.stringify(result.result));
+		const toolErrors = scenario === "hook-deny" || scenario === "hook-error";
+		assert.equal(result.isError, scenario !== "normal" && !toolErrors, JSON.stringify(result.result));
+		if (toolErrors) assert.equal(result.result.details.progress.status, "已结束，有工具错误待核对");
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
 		assert.ok(ended?.pid);
-		assert.equal(ended.status, scenario === "normal" ? "completed" : "failed");
+		assert.equal(ended.status, scenario === "normal" || toolErrors ? "completed" : "failed");
 		assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
 		const events = (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 		const child = events.filter((event) => event.child);
@@ -89,7 +91,7 @@ for (const scenario of ["normal", "rules-missing", "instructions-missing", "skil
 				assert.equal(replacement.sourceInfo.path, path.join(fixture.packageDir, "provider.ts"));
 			}
 		} else if (scenario === "hook-error") {
-			assert.match(ended.error, /已记录的工具失败/);
+			assert.equal(ended.toolErrors, true);
 			assert.equal(model.length, 2);
 			const failed = model[1].messages.find((message: any) => message.role === "toolResult");
 			assert.equal(failed?.isError, true);

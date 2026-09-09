@@ -66,6 +66,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		const tool = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_readonly");
 		assert.ok(tool, "必须通过实际模型工具调用进入正式委派");
 		const success = scenario === "normal" || scenario === "task-command";
+		const toolErrors = ["tool-fail", "readonly-recover", "recursive"].includes(scenario);
 		const progress = rpc.records.filter((row) => row.type === "tool_execution_update" && row.toolName === "delivery_readonly").map((row) => row.partialResult.details.progress);
 		assert.ok(progress.length);
 		assert.ok(progress.every((row) => row.id === tool.toolCallId));
@@ -75,7 +76,8 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 			assert.equal(progress.at(-1).status, "执行结束，结果待核实");
 		}
 		if (scenario === "cancel") assert.equal(progress.at(-1).status, "已取消");
-		assert.equal(tool.isError, !success, JSON.stringify(tool.result));
+		assert.equal(tool.isError, !success && !toolErrors, JSON.stringify(tool.result));
+		if (toolErrors) assert.equal(tool.result.details.progress.status, "已结束，有工具错误待核对");
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.type === "custom" && entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
 		if (scenario === "missing-pi") {
@@ -87,22 +89,20 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		} else {
 			assert.ok(ended, "原生父会话应记录实际委派引用与结果");
 			assert.equal(ended.parentSessionId, parent.sessionId);
-			assert.equal(ended.status === "completed", success);
+			assert.equal(ended.status === "completed", success || toolErrors);
 		}
 		if (scenario === "missing-tools") assert.match(ended.error, /需要 read.*实际 \[\]/);
 		if (scenario === "crash") assert.equal(ended.status, "unknown");
 		if (scenario === "tool-fail" || scenario === "readonly-recover") {
 			const text = tool.result.content[0].text;
-			assert.ok(text.includes(`原始子 Session：${ended.sessionFile}`));
-			assert.ok(text.includes(`父 Session ID：${parent.sessionId}`));
-			assert.ok(text.includes(`本次工具调用：${tool.toolCallId}`));
-			assert.match(text, /已记录的工具失败/);
-			assert.match(text, /进程收尾：已正常关闭.*无在途工具/);
-			assert.match(text, /持久关闭记录：已核实/);
+			assert.ok(text.includes(ended.sessionFile));
+			assert.match(text, /过程中有工具错误/);
+			assert.match(text, /不证明错误已修复或任务已验收/);
+			assert.equal(ended.toolErrors, true);
 			assert.match(await readFile(ended.sessionFile, "utf8"), /"stopReason":"stop"/);
 			if (scenario === "readonly-recover") {
 				const read = rpc.records.find((record) => record.type === "tool_execution_start" && record.toolName === "read");
-				assert.equal(read?.args.path, ended.sessionFile, "父直接使用失败正文返回的路径读取既有证据");
+				assert.equal(read?.args.path, ended.sessionFile, "父按返回路径读取带有过程错误的原始证据");
 				assert.equal(rpc.records.find((record) => record.type === "tool_execution_end" && record.toolCallId === read?.toolCallId)?.isError, false);
 				assert.equal(rpc.records.filter((record) => record.type === "tool_execution_start" && record.toolName === "delivery_readonly").length, 1);
 			}
@@ -161,7 +161,7 @@ for (const stage of ["documents", "design", "implementation", "combined"]) {
 		const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_approval");
 		assert.ok(result);
 		assert.equal(result.isError, true);
-		if (stage !== "combined") assert.match(JSON.stringify(result.result), /真实 TUI/);
+		assert.match(JSON.stringify(result.result), ["documents", "combined"].includes(stage) ? /stage: must be equal to one of the allowed values/ : /真实 TUI/);
 		assert.ok(!rpc.records.some((record) => record.type === "extension_ui_request" && ["select", "confirm"].includes(record.method)));
 		const log = await readFile(state.sessionFile, "utf8");
 		assert.ok(!log.includes('"customType":"delivery-approval"'));
@@ -177,12 +177,19 @@ test("真实子 Pi 不注册批准工具，子模型请求不能扩大权限", {
 	await rpc.send("prompt", { message: "fixture-delegate" });
 	await rpc.waitFor((record) => record.type === "agent_settled");
 	const ended = (await rpc.send("get_entries")).data.entries.findLast((entry: any) => entry.customType === "delivery-delegation" && entry.data.phase === "ended").data;
-	assert.notEqual(ended.status, "completed");
+	assert.equal(ended.status, "completed");
+	assert.equal(ended.toolErrors, true);
+	const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_readonly");
+	assert.equal(result?.isError, false);
+	assert.equal(result.result.details.progress.status, "已结束，有工具错误待核对");
 	assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
 	const child = (await audit(agentDir)).find((row) => row.child && row.phase === "start");
 	assert.ok(!child.tools.includes("delivery_approval"));
 	const log = await readFile(ended.sessionFile, "utf8");
-	assert.match(log, /delivery_approval/);
+	const denied = log.trimEnd().split("\n").map((line) => JSON.parse(line)).find((row) => row.message?.role === "toolResult" && row.message.toolName === "delivery_approval");
+	assert.equal(denied?.message.isError, true);
+	assert.match(JSON.stringify(denied.message.content), /Tool delivery_approval not found/);
 	assert.ok(!log.includes('"customType":"delivery-approval"'));
+	assert.ok(!log.includes('"customType":"delivery-approval-proposal"'));
 	t.diagnostic(JSON.stringify({ root, pid: rpc.process.pid, childPid: ended.pid }));
 });

@@ -93,7 +93,7 @@ test("取消中断等待；收尾按 clear_queue→abort，并等待真实 close
 test("取消和无只读能力在启动进程前拒绝", async () => {
 	const controller = new AbortController();
 	const input = { id: "test", task: "read", cwd: "/not-used", entryPath: "/not-used", parentSessionId: "parent",
-		model: { provider: "fake", id: "fake" }, thinking: "off", environment: snapshotReadOnlyEnvironment({ cwd: "/not-used" }, []), projectTrusted: false };
+		model: { provider: "fake", id: "fake" }, thinking: "off", selectionReason: "测试", toolInput: {}, environment: snapshotReadOnlyEnvironment({ cwd: "/not-used" }, []), projectTrusted: false };
 	const ctx = { mode: "rpc" as const, ui: {} as ExtensionUIContext, abort() {} };
 	await assert.rejects(delegateReadOnly(input, controller.signal, () => {}, () => {}, ctx), /没有已启用/);
 	controller.abort(new Error("fixture before launch"));
@@ -113,7 +113,7 @@ for (const kind of ["file", "symlink"]) test(`子 Pi 启动前拒绝工作区 ${
 	process.env.PATH = `${bin}${path.delimiter}${original}`;
 	t.after(() => { process.env.PATH = original; });
 	const input = { id: "run", task: "read", cwd, entryPath: "/unused", parentSessionId: "parent", model: { provider: "fake", id: "fake" },
-		thinking: "off", projectTrusted: false, environment: { tools: [{ name: "read", digest: "unused" }], instructions: "", rules: "", skills: "" } };
+		thinking: "off", selectionReason: "测试", toolInput: {}, projectTrusted: false, environment: { tools: [{ name: "read", digest: "unused" }], instructions: "", rules: "", skills: "" } };
 	await assert.rejects(async () => {
 		const rpc = await startChild(input, "readonly");
 		await rpc.closed;

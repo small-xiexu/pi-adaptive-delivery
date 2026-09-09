@@ -17,6 +17,7 @@ export interface TaskDetail {
 	result?: string;
 	sessionFile?: string;
 	progress?: TaskProgress;
+	agent?: TaskProgress["agent"];
 }
 
 // 当前分支的原生调用、结果和既有委派引用；不保存第二份任务列表。
@@ -30,19 +31,21 @@ export function taskDetails(ctx: Pick<ExtensionContext, "sessionManager">, live:
 			const task = tasks.get(entry.message.toolCallId);
 			if (!task) continue;
 			const progress = (entry.message.details as { progress?: TaskProgress } | undefined)?.progress;
-			task.status = entry.message.isError ? progress && ["已取消", "收尾未知"].includes(progress.status) ? progress.status : "失败" : "执行结束，结果待核实";
+			task.status = entry.message.isError ? progress && ["已取消", "收尾未知"].includes(progress.status) ? progress.status : "失败" : progress?.endedAt ? progress.status : "执行结束，结果待核实";
 			task.result = text(entry.message);
 			task.progress = progress;
+			if (progress?.agent) task.agent = progress.agent;
 			if (progress?.sessionFile) task.sessionFile = progress.sessionFile;
 		} else if (entry.type === "custom" && [DELEGATION_ENTRY, "delivery-development"].includes(entry.customType)) {
-			const data = entry.data as { id: string; sessionFile?: string; childSessionFile?: string };
+			const data = entry.data as { id: string; sessionFile?: string; childSessionFile?: string; agent?: TaskProgress["agent"] };
 			const task = tasks.get(data.id);
 			if (task && (data.childSessionFile || data.sessionFile)) task.sessionFile = data.childSessionFile ?? data.sessionFile;
+			if (task && data.agent) task.agent = data.agent;
 		}
 	}
 	for (const progress of live) {
 		const task = tasks.get(progress.id);
-		if (task && task.result === undefined) Object.assign(task, { status: progress.status, progress, sessionFile: progress.sessionFile ?? task.sessionFile });
+		if (task && task.result === undefined) Object.assign(task, { status: progress.status, progress, agent: progress.agent ?? task.agent, sessionFile: progress.sessionFile ?? task.sessionFile });
 	}
 	return [...tasks.values()];
 }
@@ -56,7 +59,6 @@ interface DetailEntry {
 	output?: string;
 	resultLine?: number;
 	failed?: boolean;
-	metadata?: unknown;
 	live?: boolean;
 }
 interface TaskRecord { task: TaskDetail; entries: DetailEntry[]; cwd?: string; notice?: string }
@@ -89,7 +91,7 @@ export async function readTaskRecord(task: TaskDetail): Promise<TaskRecord> {
 					call = { id: `call:${message.toolCallId}`, callId: message.toolCallId, line: index + 1, name: message.toolName };
 					record.entries.push(call);
 				}
-				Object.assign(call, { output: text(message), resultLine: index + 1, failed: Boolean(message.isError), metadata: message.details });
+				Object.assign(call, { output: text(message), resultLine: index + 1, failed: Boolean(message.isError) });
 			}
 		}
 		if (partial) record.notice = "原始记录末行未完整写入，等待更新。";
@@ -110,64 +112,39 @@ const entryStatus = (entry: DetailEntry) => entry.failed ? "失败" : entry.resu
 
 export class TaskDetailsPanel {
 	private record: TaskRecord;
-	private tab = 0;
 	private full = false;
-	private selected?: string;
-	private offsets = [0, 0, 0, 0, 0];
-	private following = [true, false, false, false, false];
-	private frozen = new Map<number, string>();
-	private inspected?: string;
+	private offsets = [0, 0];
+	private following = true;
+	private frozen?: string;
 	private pageSize = 1;
 	private total = 0;
-	private tabs: { start: number; end: number }[] = [];
 	private wrapped?: { body: string; width: number; lines: string[] };
 	constructor(task: TaskDetail, private readonly tui: TUI, private readonly theme: Theme, private readonly done: () => void) {
 		this.record = { task, entries: [], notice: "正在读取原始记录…" };
 	}
 	update(record: TaskRecord) {
 		this.record = record;
-		if (!record.entries.some((entry) => entry.id === this.selected)) this.selected = record.entries.at(-1)?.id;
 		this.tui.requestRender();
 	}
 	showError(message: string) { this.record.notice = message; this.tui.requestRender(); }
 	invalidate() { this.wrapped = undefined; }
-	private get slot() { return this.tab === 2 ? 4 : this.tab * 2 + Number(this.full); }
+	private get slot() { return Number(this.full); }
 	private get offset() { return this.offsets[this.slot]!; }
 	private set offset(value: number) { this.offsets[this.slot] = value; }
-	private get listing() { return this.tab === 1 && !this.full; }
-	private get overview() { return this.tab === 0 && !this.full; }
-	private switchTab(tab: number) { this.tab = (tab + 3) % 3; this.full = false; this.tui.requestRender(); }
-	private expand() {
-		if (this.tab === 1 && this.inspected !== this.selected) {
-			this.inspected = this.selected;
-			this.offsets[3] = 0;
-			this.frozen.delete(3);
-			this.following[3] = Boolean(this.record.entries.find((entry) => entry.id === this.selected)?.live);
-		}
-		this.full = true;
-	}
 	private move(delta: number) {
-		if (this.listing) {
-			const index = Math.max(0, this.record.entries.findIndex((entry) => entry.id === this.selected));
-			this.selected = this.record.entries[Math.max(0, Math.min(this.record.entries.length - 1, index + delta))]?.id;
-			this.offsets[3] = 0;
-		} else {
-			const bottom = Math.max(0, this.total - this.pageSize);
-			this.offset = Math.max(0, Math.min(bottom, this.offset + delta));
-			if (this.overview || this.slot === 3 && (this.following[3] || this.frozen.has(3))) {
-				if (delta < 0 && this.following[this.slot] && this.wrapped) this.frozen.set(this.slot, this.wrapped.body);
-				this.following[this.slot] = delta > 0 && this.offset === bottom;
-				if (this.following[this.slot]) this.frozen.delete(this.slot);
-			}
+		const bottom = Math.max(0, this.total - this.pageSize);
+		this.offset = Math.max(0, Math.min(bottom, this.offset + delta));
+		if (!this.full) {
+			if (delta < 0 && this.following && this.wrapped) this.frozen = this.wrapped.body;
+			this.following = delta > 0 && this.offset === bottom;
+			if (this.following) this.frozen = undefined;
 		}
 		this.tui.requestRender();
 	}
 	handleInput(data: string) {
 		if (matchesKey(data, "escape")) { this.done(); return; }
-		if (matchesKey(data, "tab") || matchesKey(data, "right")) this.switchTab(this.tab + 1);
-		else if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) this.switchTab(this.tab - 1);
-		else if (matchesKey(data, "return") && this.tab !== 2) this.expand();
-		else if (matchesKey(data, "backspace")) this.full = false;
+		if (matchesKey(data, "return")) { this.full = !this.full; this.wrapped = undefined; }
+		else if (matchesKey(data, "backspace")) { this.full = false; this.wrapped = undefined; }
 		else if (matchesKey(data, "up")) this.move(-1);
 		else if (matchesKey(data, "down")) this.move(1);
 		else if (matchesKey(data, "pageUp")) this.move(-this.pageSize);
@@ -178,15 +155,6 @@ export class TaskDetailsPanel {
 	}
 	handleMouse(event: TuiMouseEvent) {
 		if (event.type === "wheel") this.move(event.wheelDelta ?? 0);
-		if (event.type === "click" && event.button === "left") {
-			if (event.y === 3) {
-				const tab = this.tabs.findIndex(({ start, end }) => event.x >= start && event.x < end);
-				if (tab >= 0) this.switchTab(tab);
-			} else if (this.listing && event.y >= 5 && event.y < 5 + this.pageSize) {
-				const entry = this.record.entries[this.offset + event.y - 5];
-				if (entry) { this.selected = entry.id; this.expand(); this.tui.requestRender(); }
-			}
-		}
 		return { handled: true };
 	}
 	private summary(entry: DetailEntry) {
@@ -198,28 +166,15 @@ export class TaskDetailsPanel {
 	private content(width: number): string[] {
 		const { task, entries, notice } = this.record;
 		let body: string;
-		if (this.frozen.has(this.slot)) body = this.frozen.get(this.slot)!;
-		else if (this.overview) {
+		if (this.full) body = `完整任务\n\n${task.task}${task.agent ? `\n\n模型：${task.agent.provider}/${task.agent.id} · ${task.agent.thinking}\n选择理由：${task.agent.reason}` : ""}\n\n原始子 Session\n${task.sessionFile ?? "尚未取得"}`;
+		else if (this.frozen !== undefined) body = this.frozen;
+		else {
 			body = entries.map((entry) => `${truncateToWidth(`${short(entry.name)} · ${entryStatus(entry)}${entry.callId ? ` · ${this.summary(entry)}` : ""}`, width)}\n`
 				+ (entry.output || (entry.live ? "等待输出…" : entry.callId ? "尚未取得工具返回。" : ""))).join("\n\n") || "等待子任务输出…";
+			if (task.result && (!entries.length || ["失败", "已取消", "收尾未知"].includes(task.status))) body += `\n\n任务返回\n${task.result}`;
 			if (notice) body += `\n\n${notice}`;
+			if (!this.following) this.frozen = body;
 		}
-		else if (this.tab === 0) body = `完整任务\n\n${task.task}\n\n原始子 Session\n${task.sessionFile ?? "尚未取得"}`;
-		else if (this.tab === 2) body = `任务结果\n\n${task.result ?? "尚未收到父工具结果。当前进展可在「概览」查看。"}`;
-		else {
-			const entry = entries.find((entry) => entry.id === this.selected);
-			if (!entry) return ["还没有工具过程记录。"];
-			body = `${entry.name} · ${entryStatus(entry)}\n\n`;
-			if (entry.args !== undefined) body += `参数\n${JSON.stringify(entry.args, null, 2)}\n\n`;
-			if (!entry.live) {
-				body += `原始记录\n${task.sessionFile ?? "尚未取得"}${entry.line ? `\n第 ${entry.line} 行` : ""}${entry.resultLine ? ` · 返回第 ${entry.resultLine} 行` : ""}\n`;
-				if (entry.callId) body += `调用 ID：${entry.callId}\n`;
-				if (entry.metadata && Object.keys(entry.metadata).length) body += `\n返回元数据\n${JSON.stringify(entry.metadata, null, 2)}\n`;
-				body += "\n";
-			}
-			body += `${entry.callId ? "输出" : "正文"}\n${entry.output || (entry.live ? "等待输出…" : "尚未取得工具返回。")}`;
-		}
-		if (notice && !this.overview && !this.frozen.has(this.slot)) body += `\n\n${notice}`;
 		if (this.wrapped?.body !== body || this.wrapped.width !== width) this.wrapped = { body, width, lines: wrapTextWithAnsi(clean(body), width) };
 		return this.wrapped.lines;
 	}
@@ -230,47 +185,24 @@ export class TaskDetailsPanel {
 		const fit = (value: string, size: number) => { const clipped = truncateToWidth(value, size); return clipped + " ".repeat(Math.max(0, size - visibleWidth(clipped))); };
 		const row = (value: string) => th.bg("customMessageBg", th.fg("border", "│") + "  " + fit(value, inner) + "  " + th.fg("border", "│"));
 		const rule = (left: string, right: string) => th.bg("customMessageBg", th.fg("border", left + "─".repeat(width - 2) + right));
-		const footer = width >= 72 ? ["Tab 切换 · ↑↓ / PgUp/PgDn 滚动 · Esc 关闭"] : ["Tab 切换 · ↑↓ 滚动", "Esc 关闭"];
+		const footer = width >= 72 ? ["↑↓ / PgUp/PgDn 滚动 · End 最新 · Esc 关闭"] : ["↑↓ 滚动 · End 最新", "Esc 关闭"];
 		const task = this.record.task;
-		const context = this.overview ? [th.fg("muted", `任务：${short(task.task)}`),
-			th.fg("muted", short(task.progress?.action ?? (task.result === undefined ? "等待进度更新" : "已收到结果，可切换到「结果」查看"))),
-			th.fg("accent", this.following[0] ? "实时输出 · 跟随最新" : "实时输出 · 暂停跟随 · End 查看最新")] : [];
+		const context = !this.full ? [th.fg("muted", `任务：${short(task.task)}`),
+			...(task.agent ? [th.fg("muted", `模型：${short(task.agent.id)} · ${short(task.agent.thinking)} · Enter 查看选择理由`)] : []),
+			...(task.result === undefined ? [th.fg("muted", short(task.progress?.action ?? "等待进度更新"))] : []),
+			th.fg("accent", this.following ? "实时输出 · 跟随最新" : "实时输出 · 暂停跟随 · End 查看最新")] : [];
 		context.splice(Math.max(0, Math.floor(this.tui.terminal.rows * 0.85) - 10));
-		this.pageSize = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 8 - footer.length - context.length);
-		let cursor = 3;
-		const tabs = (width < 44 ? ["概览", "过程", "结果"] : ["概览", "工具过程", "结果"]).map((label, index) => {
-			const title = this.tab === index ? `[${label}]` : ` ${label} `;
-			this.tabs[index] = { start: cursor, end: cursor + visibleWidth(title) };
-			cursor += visibleWidth(title) + 2;
-			return this.tab === index ? th.fg("accent", th.bold(title)) : th.fg("muted", title);
-		}).join("  ");
-		let page: string[];
-		let position: string;
-		if (this.listing) {
-			const entries = this.record.entries;
-			this.total = entries.length;
-			const index = Math.max(0, entries.findIndex((entry) => entry.id === this.selected));
-			this.offset = Math.max(0, Math.min(this.offset, index, Math.max(0, entries.length - this.pageSize)));
-			if (index >= this.offset + this.pageSize) this.offset = index - this.pageSize + 1;
-			page = entries.slice(this.offset, this.offset + this.pageSize).map((entry) => {
-				const value = fit(`${entry.id === this.selected ? "›" : " "} ${entryStatus(entry)} · ${short(entry.name)}  ${this.summary(entry)}`, inner);
-				return entry.id === this.selected ? th.bg("selectedBg", th.fg("accent", value)) : entry.failed ? th.fg("error", value) : value;
-			});
-			if (!entries.length) page = ["还没有工具过程记录。"];
-			position = `${entries.length ? index + 1 : 0} / ${entries.length} 条 · Enter 查看${this.record.notice ? " · 记录不完整，概览查看原因" : ""}`;
-		} else {
-			const lines = this.content(inner);
-			this.total = lines.length;
-			const bottom = Math.max(0, this.total - this.pageSize);
-			this.offset = this.following[this.slot] ? bottom : Math.min(this.offset, bottom);
-			page = lines.slice(this.offset, this.offset + this.pageSize);
-			position = this.full ? "Backspace 返回" : this.tab === 0 ? "Enter 查看完整任务" : "父工具返回正文";
-			if (this.slot === 3 && (this.following[3] || this.frozen.has(3))) position += this.following[3] ? " · 跟随最新" : " · 暂停跟随 · End 最新";
-			if (this.total > this.pageSize) position += ` · ${this.offset + 1}–${Math.min(this.total, this.offset + this.pageSize)} / ${this.total} 行`;
-		}
+		this.pageSize = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 7 - footer.length - context.length);
+		const lines = this.content(inner);
+		this.total = lines.length;
+		const bottom = Math.max(0, this.total - this.pageSize);
+		this.offset = !this.full && this.following ? bottom : Math.min(this.offset, bottom);
+		const page = lines.slice(this.offset, this.offset + this.pageSize);
+		let position = this.full ? "Enter / Backspace 返回实时输出" : "Enter 查看完整任务";
+		if (this.total > this.pageSize) position += ` · ${this.offset + 1}–${Math.min(this.total, this.offset + this.pageSize)} / ${this.total} 行`;
 		while (page.length < this.pageSize) page.push("");
 		const status = task.status === "执行结束，结果待核实" ? "已结束，待核对" : task.status;
-		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)} · ${clean(status)}`)), row(""), row(tabs), rule("├", "┤"),
+		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)} · ${clean(status)}`)), row(""), rule("├", "┤"),
 			...context.map(row), ...page.map(row), rule("├", "┤"), row(th.fg("muted", position)), ...footer.map((line) => row(th.fg("muted", line))), rule("╰", "╯")];
 	}
 }

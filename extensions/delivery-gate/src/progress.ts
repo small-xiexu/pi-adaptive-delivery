@@ -11,9 +11,12 @@ export interface TaskProgress {
 	startedAt: number;
 	endedAt?: number;
 	sessionFile?: string;
+	agent?: { provider: string; id: string; thinking: string; reason: string };
 	pending?: { id: string; name: string; callId?: string; args?: unknown; output: string }[];
 }
 export type ProgressUpdate = (message: string, progress: TaskProgress) => void;
+export const TOOL_ERROR_STATUS = "已结束，有工具错误待核对";
+export const TOOL_ERROR_GUIDANCE = "过程中有工具错误。请核对原始错误、后续操作及最终产物，再决定是否返工或继续验证；此结果不证明错误已修复或任务已验收。";
 const short = (text: string, limit = 300) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, limit);
 const tail = (text: string) => text.length > 4000 ? `[预览已省略，详情查看完整内容]\n${text.slice(-4000)}` : text;
 const streamingTail = (text: string) => text.length > 64_000 ? `[在途输出仅保留最近片段，完成后可查看原始结果]\n${text.slice(-64_000)}` : text;
@@ -40,6 +43,7 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 	};
 	return {
 		snapshot,
+		agent(agent: NonNullable<TaskProgress["agent"]>) { view.agent = { ...agent }; emit(); },
 		phase(status: string, detail?: string, sessionFile?: string) {
 			view.status = status;
 			if (detail) action(detail);
@@ -117,15 +121,15 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			const body = outputText(result);
 			const status = isPartial ? latest?.status ?? "准备中" : context.isError ? (latest?.status === "已取消" || latest?.status === "收尾未知" ? latest.status : "失败") : latest?.status ?? "执行结束，结果待核实";
 			const heading = `${status === "执行结束，结果待核实" ? "已结束，待核对" : status} · ${label} · ${short((context.args as { task?: string })?.task ?? "固定候选验收", 64)}`;
-			const detail = latest?.action ?? (isPartial ? "核对任务环境" : short(body));
+			const detail = (latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking} · ` : "") + (latest?.action ?? (isPartial ? "核对任务环境" : short(body)));
 			const component = {
 				invalidate() {},
 				render(width: number) {
-					const lines = [truncateToWidth(theme.fg(context.isError ? "error" : "toolTitle", heading), width), truncateToWidth(theme.fg("muted", detail), width)];
+					const lines = [truncateToWidth(theme.fg(context.isError ? "error" : status === TOOL_ERROR_STATUS ? "warning" : "toolTitle", heading), width), truncateToWidth(theme.fg("muted", detail), width)];
 					if (expanded) {
 						if (open) lines.push(...new Text("点击卡片或 /delivery-tasks 查看详情 · Esc 返回", 0, 0).render(width));
 						const elapsed = latest ? `耗时 ${Math.max(0, ((latest.endedAt ?? Date.now()) - latest.startedAt) / 1000).toFixed(1)} 秒` : "";
-						const more = [elapsed, ...(latest?.recent ?? []), latest?.output, latest?.sessionFile ? `原始子 Session：${latest.sessionFile}` : "", !isPartial ? tail(body) : ""].filter(Boolean).join("\n");
+						const more = [latest?.agent ? `模型：${latest.agent.provider}/${latest.agent.id} · ${latest.agent.thinking}\n选择理由：${latest.agent.reason}` : "", elapsed, ...(latest?.recent ?? []), latest?.output, latest?.sessionFile ? `原始子 Session：${latest.sessionFile}` : "", !isPartial ? tail(body) : ""].filter(Boolean).join("\n");
 						// Text 处理宽度；终端控制字符不能通过子输出注入界面。
 						lines.push(...new Text(more.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""), 0, 0).render(width));
 					}

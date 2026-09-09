@@ -190,12 +190,7 @@ setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
 	assert.equal(panel!.render(100).join("\n"), paused);
 	panel!.handleInput("\x1b[F");
 	assert.ok(panel!.render(100).join("\n").includes("DETAIL_LATER_LATEST"));
-	panel!.handleInput("\t");
-	const activeRows = panel!.render(100);
-	const activeBash = activeRows.findIndex((line) => line.includes("执行中 · bash"));
-	assert.ok(activeBash >= 0);
-	panel!.handleMouse({ type: "click", button: "left", x: 4, y: activeBash, screenX: 4, screenY: activeBash, width: 100, height: 30, shift: false, alt: false, ctrl: false });
-	assert.ok(panel!.render(100).join("\n").includes("DETAIL_LATER_LATEST"));
+	assert.doesNotMatch(panel!.render(100).join("\n"), /工具过程|Tab 切换/);
 	panel!.handleInput("\x1b");
 	await showing;
 	assert.equal(ended, false, "关闭详情不能终止在途子命令");
@@ -203,17 +198,9 @@ setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.equal(await h.readLease(), undefined);
 	const finished = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
-	await until(() => Boolean(panel?.render(100).join("\n").includes("已结束，待核对")));
-	panel!.handleInput("\t");
-	const processRows = panel!.render(100);
-	const bashRow = processRows.findIndex((line) => line.includes("已返回 · bash"));
-	assert.ok(bashRow >= 0);
-	panel!.handleMouse({ type: "click", button: "left", x: 4, y: bashRow, screenX: 4, screenY: bashRow, width: 100, height: 30, shift: false, alt: false, ctrl: false });
-	panel!.render(100);
+	await until(() => Boolean(panel?.render(100).join("\n").includes("开发结束")));
 	panel!.handleInput("\x1b[F");
 	assert.ok(panel!.render(100).join("\n").includes("DETAIL_COMMAND_FINISHED"));
-	panel!.handleInput("\t");
-	assert.ok(panel!.render(100).join("\n").includes("开发子任务已结束"));
 	panel!.handleInput("\x1b");
 	await finished;
 });
@@ -233,15 +220,16 @@ test("真实容器命令完成后模型断流，恢复不重复命令或委派",
 	assert.equal(tools[2].details.container.exitCode, 0);
 	assert.equal(tools[2].details.container.clean, true);
 	assert.equal(await h.readLease(), undefined);
-	assert.equal(h.choices.length, 4);
+	assert.equal(h.choices.length, 3);
 });
 
-test("开发初始读取失败后写入与真实自检成功，父沿失败结果取证并继续固定验收", { timeout: 60_000 }, async (t) => {
+test("开发初始读取失败后写入与真实自检成功，父核对过程错误并继续固定验收", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "read-before-write", `const assert = require("node:assert/strict");
 assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");
 console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	const result = await h.call("delivery_develop", { task: "先读取不存在的目标，然后创建、编辑并执行一次容器自检。" });
-	assert.equal(result.isError, true, "成功自检不覆盖之前的工具失败");
+	assert.equal(result.isError, false, "正常收尾返回结果，原始工具错误仍保留");
+	assert.equal((result.details as any).progress.status, "已结束，有工具错误待核对");
 	const [rows] = await h.children();
 	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
 	assert.deepEqual(tools.map((tool: any) => [tool.toolName, tool.isError]), [["read", true], ["write", false], ["edit", false], ["bash", false], ["read", false]]);
@@ -252,18 +240,15 @@ console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	assert.equal(rows.find((row: any) => row.customType === "delivery-child-exit").data.development.clean, true);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-	assert.match(text, /子任务存在工具失败/);
-	const childFile = text.match(/^原始子 Session：(.+)$/m)?.[1];
-	assert.ok(childFile, "失败正文必须提供模型可直接读取的子记录路径");
-	assert.match(text, /子收尾核验：已取得证明/);
-	assert.ok(text.includes(h.sm.getSessionFile()!) && text.includes(result.toolCallId));
-	assert.match(text, /父 writer.*待.*落盘/);
+	assert.match(text, /过程中有工具错误/);
+	const childFile = (result.details as any).childSessionFile;
+	assert.ok(childFile && text.includes(childFile), "返回原始证据路径供父核对");
 	const native = await h.call("read", { path: childFile });
 	assert.equal(native.isError, false);
 	assert.match(JSON.stringify(native.content), /READ_RECOVERY_SELF_CHECK_OK/);
 	assert.equal((await h.call("delivery_validate", {})).isError, false, "原批准仍有效时由既有门禁执行固定验收");
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "开发工具失败保留；原始自检已核实，独立固定验收通过。\n" })).isError, false);
-	assert.equal(h.choices.length, 4, "取证与验收不重复申请原范围批准");
+	assert.equal(h.choices.length, 3, "取证与验收不重复申请原范围批准");
 	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(children.length, 2, "补证不重复开发或自检，只增加独立验收子");
 	for (const child of children) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
@@ -298,14 +283,16 @@ console.log("CONTAINER_REAL_COMMAND_OK");`);
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-call" && row.toolName === "bash").length, 1);
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-result" && row.toolName === "bash").length, 1);
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "真实容器命令已执行，完整独立验收仍待后续。" })).isError, false);
-	assert.equal(h.choices.length, 4, "节点回写不重复请求批准");
+	assert.equal(h.choices.length, 3, "节点回写不重复请求批准");
 });
 
 for (const kind of ["failure", "readonly", "hook-deny", "hook-error"]) test(`正式容器命令 ${kind} 保留失败，不误报成功或锁死已清理 writer`, { timeout: 60_000 }, async (t) => {
 	const script = kind === "readonly" ? 'require("node:fs").writeFileSync("inputs/command.cjs", "forbidden");'
 		: 'if (!require("node:fs").readFileSync("src/value.js", "utf8").includes("value = 3")) process.exit(7); console.log("repaired command");';
 	const h = await developmentHost(t, kind, script);
-	assert.equal((await h.call("delivery_develop", { task: "验证容器错误与配置检查" })).isError, true);
+	const outcome = await h.call("delivery_develop", { task: "验证容器错误与配置检查" });
+	assert.equal(outcome.isError, false);
+	assert.equal((outcome.details as any).progress.status, "已结束，有工具错误待核对");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	const result = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
@@ -316,7 +303,7 @@ for (const kind of ["failure", "readonly", "hook-deny", "hook-error"]) test(`正
 		assert.equal((await h.call("delivery_develop", { task: "fixture-container-repair：在原授权范围内修复源码并复验" })).isError, false);
 		assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
 		assert.equal(await readFile(path.join(h.cwd, "inputs/command.cjs"), "utf8"), script);
-		assert.equal(h.choices.length, 4);
+		assert.equal(h.choices.length, 3);
 	}
 });
 
@@ -330,7 +317,9 @@ for (const kind of ["cancel", "timeout"]) test(`正式父子容器 ${kind} 等�
 	}
 	assert.equal((await h.readLease())?.owner.kind, "child");
 	if (kind === "cancel") await h.session.abort();
-	assert.equal((await run).isError, true);
+	const result = await run;
+	assert.equal(result.isError, kind === "cancel");
+	if (kind === "timeout") assert.match(JSON.stringify(result.content), /有工具错误/);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	assert.ok(rows.some((row: any) => row.customType === "delivery-child-exit" && row.data.development.clean));
@@ -371,7 +360,7 @@ test("正式固定验收运行完整原清单，绑定稳定候选和真实子�
 	}
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: `固定验收通过，候选 ${proof.after.digest}；独立审查待实施。\n` })).isError, false);
-	assert.equal(h.choices.length, 4);
+	assert.equal(h.choices.length, 3);
 });
 
 test("独立审查读取原目标、代码、真实差异与原始验收记录，父裁决后原授权返工/复验/回写", { timeout: 90_000 }, async (t) => {
@@ -409,7 +398,7 @@ test("独立审查读取原目标、代码、真实差异与原始验收记录�
 	assert.equal((await h.call("delivery_document_edit", { path: "plan.md", edits: [{ oldText: `当前节点：进行中，父接受发现并安排修复；验收 ${details.candidate.digest}`,
 		newText: `当前节点：限定机制已验证；修复后候选 ${(checked.details as any).candidate.digest}。fake provider 不证明审查质量。` }] })).isError, false);
 	assert.match(await readFile(path.join(h.cwd, "plan.md"), "utf8"), /^用户无关内容，必须保留。\n当前节点：限定机制已验证/);
-	assert.equal(h.choices.length, 4, "同范围返工及节点回写不重复批准");
+	assert.equal(h.choices.length, 3, "同范围返工及节点回写不重复批准");
 });
 
 test("正式固定验收取消等待真实容器退出，不消费父排队消息或形成可审查证据", { timeout: 60_000 }, async (t) => {
@@ -471,7 +460,7 @@ for (const kind of ["failure", "changed", "wrong", "edit", "omit", "timeout", "m
 			assert.notEqual(newer.after.digest, proof.before.digest);
 			assert.equal(newer.before.digest, newer.after.digest);
 			assert.equal(await readFile(path.join(h.cwd, "inputs/command.cjs"), "utf8"), script);
-			assert.equal(h.choices.length, 4, "范围内修复/复验不重新批准");
+			assert.equal(h.choices.length, 3, "范围内修复/复验不重新批准");
 		}
 	});
 }

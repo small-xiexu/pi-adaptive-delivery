@@ -9,6 +9,29 @@ import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from
 import { createDevelopmentHost as host } from "../support/development-host.ts";
 import { installFakeDocker } from "../support/fake-docker.ts";
 import { FixtureRpc, testEnvironment } from "../support/pi-fixture.ts";
+import { TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
+
+test("真实子 edit 匹配不唯一后补充上下文修正，返回过程错误提示而非整项失败", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "edit-recovery");
+	await h.prepare();
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "first = 1\nsecond = 1\n");
+	const result = await h.call("delivery_develop", { task: "修正两处值，匹配不唯一时读取文件并补足上下文" });
+	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
+	assert.match(JSON.stringify(result.content), /不证明错误已修复或任务已验收/);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "first = 2\nsecond = 2\n");
+	const rows = (await readFile((result.details as any).childSessionFile, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	const tools = rows.filter((row) => row.message?.role === "toolResult").map((row) => row.message);
+	assert.deepEqual(tools.map((tool) => [tool.toolName, tool.isError]), [["edit", true], ["read", false], ["edit", false]]);
+	assert.match(JSON.stringify(tools[0].content), /Found 2 occurrences/);
+	assert.match(JSON.stringify(tools[2].content), /Successfully replaced 2 block/);
+	assert.equal(rows.find((row) => row.customType === "delivery-child-exit").data.development.clean, true);
+	assert.throws(() => process.kill((result.details as any).pid, 0), { code: "ESRCH" });
+	assert.equal(await h.readLease(), undefined);
+	assert.equal((await h.call("delivery_review", { task: "没有固定验收不能视作已验证" })).isError, true);
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "编辑结果已核对，待固定验收。" })).isError, false);
+});
 
 for (const name of ["git", "pi", "node"]) test(`未批准时状态查询和只读委派不执行项目 PATH ${name}`, { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
@@ -35,7 +58,8 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	t.after(unsubscribe);
 	await h.prepare();
 	await h.session.prompt("/fixture-parent-history");
-	const result = await h.call("delivery_develop", { task: "创建 src/value.js，将 value 从 1 改为 2 并读取文件核对。" });
+	const result = await h.call("delivery_develop", { task: "创建 src/value.js，将 value 从 1 改为 2 并读取文件核对。",
+		agent: { model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "medium", reason: "边界明确的局部开发" } });
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.ok(progress.every((view) => view.id === result.toolCallId && view.name.startsWith("开发")));
 	for (const tool of ["write", "edit", "read"]) {
@@ -51,6 +75,9 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 	const requests = events.filter((row) => row.child && row.phase === "model");
 	assert.equal(requests.length, 4);
+	assert.ok(requests.every((row) => row.modelId === "fake-reasoner" && row.reasoning === "medium"));
+	assert.deepEqual(progress.at(-1).agent, { provider: "adaptive-fixture", id: "fake-reasoner", thinking: "medium", reason: "边界明确的局部开发" });
+	assert.equal(h.session.model!.id, "fake");
 	assert.ok(requests.every((row) => !row.parentMarkerSeen));
 	assert.match(JSON.stringify(requests[0].messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
 	assert.ok(requests[0].tools.includes("write") && requests[0].tools.includes("edit"));
@@ -69,7 +96,7 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-context").length, requests.length);
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "父核对后记录文件变更，命令验证尚未执行。\n" })).isError, false);
 	assert.equal(await h.readLease(), undefined);
-	assert.equal(h.choices.length, 3, "文件节点回写不重复请求批准");
+	assert.equal(h.choices.length, 2, "文件节点回写不重复请求批准");
 });
 
 test("正式固定验收没有批准或命令时不启动子 Pi，不把零项算通过", { timeout: 40_000 }, async (t) => {
@@ -96,6 +123,55 @@ async function reviewHost(t: TestContext, scenario = "normal", configure?: (pi: 
 	assert.equal((await h.approve("implementation", ["src"], container, commands)).isError, false);
 	return { ...h, fake, container, commands };
 }
+
+test("真实父查询可用模型后选择只读子模型，未知模型和不支持级别在启动前拒绝", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	const catalog = await h.call("delivery_models", {});
+	assert.equal(catalog.isError, false, JSON.stringify(catalog));
+	assert.ok((catalog.details as any).models.some((model: any) => model.id === "fake-reasoner" && model.thinking.includes("high")));
+	for (const agent of [{ model: { provider: "unknown", id: "fake" }, reason: "无可用配置" }, { thinking: "high", reason: "非推理模型不能用 high" }]) {
+		assert.equal((await h.call("delivery_readonly", { task: "不能发出任务", agent })).isError, true);
+	}
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	const result = await h.call("delivery_readonly", { task: "检查 input.txt 并返回结论", agent: { model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "low", reason: "明确的事实查询" } });
+	assert.equal(result.isError, false, JSON.stringify(result));
+	const requests = (await h.audit()).filter((row) => row.child && row.phase === "model");
+	assert.ok(requests.length > 0 && requests.every((row) => row.modelId === "fake-reasoner" && row.reasoning === "low"));
+	assert.ok(requests.every((row) => !row.tools.includes("delivery_models") && !row.tools.includes("delivery_document_write")));
+	const record = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-delegation") as any;
+	assert.deepEqual(record.data.agent, { provider: "adaptive-fixture", id: "fake-reasoner", thinking: "low", reason: "明确的事实查询" });
+	assert.equal(h.choices.length, 0);
+});
+
+for (const tool of ["delivery_readonly", "delivery_develop"]) test(`${tool} 拒绝实际子启动级别被配置改写，不发送任务且正常收尾`, { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "selection-mismatch");
+	if (tool === "delivery_develop") await h.prepare();
+	const result = await h.call(tool, { task: "不得在被改写的模型配置下执行", agent: {
+		model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "high", reason: "检验关键边界" } });
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result), /模型或只读工具未核实，未发送任务/);
+	const events = (await h.audit()).filter((row) => row.child);
+	assert.equal(events.filter((row) => row.phase === "start").length, 1);
+	assert.ok(!events.some((row) => row.phase === "model" || row.phase === "environment-tool-call"));
+	assert.throws(() => process.kill(events.find((row) => row.phase === "start").pid, 0), { code: "ESRCH" });
+	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
+	await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
+});
+
+test("真实验收与审查子可分别选择级别，原批准与工具参数绑定保持", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t);
+	const model = { provider: "adaptive-fixture", id: "fake-reasoner" };
+	const validated = await h.call("delivery_validate", { agent: { model, thinking: "low", reason: "执行固定验收命令" } });
+	assert.equal(validated.isError, false, JSON.stringify(validated));
+	const reviewed = await h.call("delivery_review", { task: "对照候选与证据检查行为", agent: { model, thinking: "high", reason: "代码审查需检查遗漏边界" } });
+	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
+	assert.equal((validated.details as any).progress.agent.thinking, "low");
+	assert.equal((reviewed.details as any).progress.agent.thinking, "high");
+	const requests = (await h.audit()).filter((row) => row.child && row.phase === "model");
+	assert.ok(requests.some((row) => row.modelId === "fake-reasoner" && row.reasoning === "low"));
+	assert.ok(requests.some((row) => row.modelId === "fake-reasoner" && row.reasoning === "high"));
+	assert.equal(await h.readLease(), undefined);
+});
 
 test("验收候选准备失败不启动子 Pi 或锁住 writer，原授权可继续开发后复验", { timeout: 40_000 }, async (t) => {
 	const h = await host(t, "container-review-normal");
@@ -226,11 +302,12 @@ for (const kind of ["parent", "child"]) test(`独立审查拒绝篡改后的 ${k
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 });
 
-for (const kind of ["tool-replaced", "hook-deny", "hook-error", "write"]) test(`独立审查 ${kind} 明确失败且正常退出后可交回 writer`, { timeout: 40_000 }, async (t) => {
+for (const kind of ["tool-replaced", "hook-deny", "hook-error", "write"]) test(`独立审查 ${kind} 保留实际错误，核实收尾后可交回 writer`, { timeout: 40_000 }, async (t) => {
 	const h = await reviewHost(t, kind);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
 	const result = await h.call("delivery_review", { task: kind === "write" ? "fixture-read-then-write" : "检查实际能力失败" });
-	assert.equal(result.isError, true, JSON.stringify(result));
+	assert.equal(result.isError, kind === "tool-replaced", JSON.stringify(result));
+	if (kind !== "tool-replaced") assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(children.length, 2);
 	assert.throws(() => process.kill(children[1].pid, 0), { code: "ESRCH" });
@@ -435,7 +512,9 @@ for (const kind of ["live", "summary-only"]) test(`P5 正式压缩 ${kind} 不�
 	assert.equal(result.isError, kind === "summary-only", JSON.stringify(result));
 	if (kind === "summary-only") {
 		assert.equal((await h.call("delivery_develop", { task: "摘要不能提供源码权限" })).isError, true);
-		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "不能提供文档权限" })).isError, true);
+		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "默认编辑 Markdown；摘要不能提供源码或命令权限" })).isError, false);
+		assert.equal(h.choices.length, 0);
+		assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length, 0);
 		assert.ok(!(await h.audit()).some((row) => row.child));
 	}
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
@@ -504,7 +583,8 @@ for (const kind of ["readonly", "development", "readonly-write"]) test(`正式 $
 	h.setInput(async (title) => { titles.push(title); return "回答不提供写入授权"; });
 	const before = h.sm.getEntries().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length;
 	const result = await h.call(kind === "development" ? "delivery_develop" : "delivery_readonly", { task: kind === "readonly-write" ? "fixture-read-then-write" : "执行一次任务并提供证据" });
-	assert.equal(result.isError, kind === "readonly-write", JSON.stringify(result));
+	assert.equal(result.isError, false, JSON.stringify(result));
+	if (kind === "readonly-write") assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 	assert.equal(titles.length, 3);
 	const events = await h.audit();
 	const child = events.find((row) => row.child && row.phase === "start");
@@ -604,13 +684,15 @@ test("开发在途取消等待实际 I/O 与关闭，父不能提前取得 write
 test("开发部分写入不回滚，正常收尾后原授权内可重新委派修复", { timeout: 40_000 }, async (t) => {
 	const h = await host(t, "partial");
 	await h.prepare();
-	assert.equal((await h.call("delivery_develop", { task: "注入部分写入" })).isError, true);
+	const partial = await h.call("delivery_develop", { task: "注入部分写入" });
+	assert.equal(partial.isError, false);
+	assert.equal((partial.details as any).progress.status, TOOL_ERROR_STATUS);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "部分写入");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	await writeFile(path.join(h.agentDir, "development-fault-used"), "disable fixture fault");
 	assert.equal((await h.call("delivery_develop", { task: "修复原范围内的部分结果" })).isError, false);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
-	assert.equal(h.choices.length, 3);
+	assert.equal(h.choices.length, 2);
 });
 
 for (const failure of ["close", "crash", "child-tamper", "child-persistence", "parent-tamper", "parent-persistence"]) {
@@ -662,7 +744,9 @@ for (const scenario of ["hook-deny", "hook-error"]) {
 	test(`开发保留配置检查 ${scenario}，拒绝后没有源码写入`, { timeout: 40_000 }, async (t) => {
 		const h = await host(t, scenario);
 		await h.prepare();
-		assert.equal((await h.call("delivery_develop", { task: "执行文件检查" })).isError, true);
+		const result = await h.call("delivery_develop", { task: "执行文件检查" });
+		assert.equal(result.isError, false);
+		assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 		await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
 		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	});
@@ -674,11 +758,11 @@ for (const scenario of ["outside", "plan", "git", "separate-git"]) {
 		await h.prepare();
 		if (scenario === "separate-git") await h.approve("implementation", ["src", "metadata"]);
 		const result = await h.call("delivery_develop", { task: "尝试夹具中的越权路径" });
-		assert.equal(result.isError, true);
+		assert.equal(result.isError, false);
+		assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 		for (const target of ["../outside.js", "plan.md", scenario === "separate-git" ? "metadata/forbidden.js" : ".git/forbidden.js"]) await assert.rejects(access(path.resolve(h.cwd, target)), { code: "ENOENT" });
 		if (scenario === "separate-git") {
-			await h.approve("documents", ["metadata/forbidden.md", "plan.md"]);
 			assert.equal((await h.call("delivery_document_write", { path: "metadata/forbidden.md", content: "父也不能误写 Git 元数据" })).isError, true);
 			await assert.rejects(access(path.join(h.cwd, "metadata/forbidden.md")), { code: "ENOENT" });
 		}
@@ -727,14 +811,14 @@ child.unref();`;
 	}
 });
 
-test("正式开发入口没有实施或文档授权时不启动子模型", { timeout: 40_000 }, async (t) => {
+test("正式开发入口缺少实施确认或规划文档边界时不启动子模型", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	const unapproved = await h.call("delivery_develop", { task: "未授权变更" });
 	assert.equal(unapproved.isError, true);
 	assert.match(JSON.stringify(unapproved.content), /子 Session 引用尚未取得/);
 	assert.doesNotMatch(JSON.stringify(unapproved.content), /原始子 Session：|子收尾核验：已取得证明/);
-	await h.approve("design", []);
-	await h.approve("implementation", ["src"]);
+	assert.equal((await h.approve("design", [])).isError, true);
+	assert.equal((await h.approve("implementation", ["src"])).isError, true);
 	assert.equal((await h.call("delivery_develop", { task: "缺少规划文档边界" })).isError, true);
 	assert.ok(!(await h.audit()).some((row) => row.child));
 	assert.equal(await h.readLease(), undefined);
@@ -743,7 +827,9 @@ test("正式开发入口没有实施或文档授权时不启动子模型", { tim
 test("真实子 Pi 的文件批准不授予容器命令，不触达 Docker 或执行宿主脚本", { timeout: 40_000 }, async (t) => {
 	const h = await host(t, "container-unapproved");
 	await h.prepare();
-	assert.equal((await h.call("delivery_develop", { task: "夹具尝试未批准的命令" })).isError, true);
+	const result = await h.call("delivery_develop", { task: "夹具尝试未批准的命令" });
+	assert.equal(result.isError, false);
+	assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const reference = h.sm.getEntries().find((entry) => entry.type === "custom" && entry.customType === "delivery-development");
 	assert.ok(reference?.type === "custom");

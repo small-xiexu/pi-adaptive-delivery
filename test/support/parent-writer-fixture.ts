@@ -5,7 +5,7 @@ import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { createWriteToolDefinition, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// 仅隔离测试加载：替换批准来源，不加载正式入口，不更改 ctx.mode 或生成用户批准记录。
+// 仅隔离测试加载：在 CLI 中模拟父 TUI 上下文以注入 writer 故障，不加载正式入口或生成用户批准。
 export default async function parentWriterFixture(pi: ExtensionAPI) {
 	const scenario = process.env.ADAPTIVE_FIXTURE_SCENARIO!;
 	const audit = (phase: string, details: Record<string, unknown>) => appendFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fixture-events.jsonl"),
@@ -34,11 +34,7 @@ export default async function parentWriterFixture(pi: ExtensionAPI) {
 		const rows = (await readFile(file, "utf8")).trimEnd().split("\n").map((row) => JSON.parse(row));
 		await writeFile(file, rows.filter((row) => row.message?.role !== "toolResult" || row.message.toolName !== DOCUMENT_WRITE_TOOL).map((row) => JSON.stringify(row)).join("\n") + "\n");
 	});
-	const writer = createParentDocumentWriter(pi, { readDocumentApproval: async (ctx, signal) => {
-		signal?.throwIfAborted();
-		return { approvalId: "fixture-not-user-approval", proposalId: "fixture-proposal", sessionId: ctx.sessionManager.getSessionId(),
-			workspace: await resolveWorkspaceIdentity(ctx.cwd), paths: [path.resolve(ctx.cwd, "plan.md")], signal: grant.signal };
-	} });
+	const writer = createParentDocumentWriter(pi);
 	let target: string | undefined;
 	let operationSignal: AbortSignal | undefined;
 	const open = fs.open;
@@ -71,7 +67,7 @@ export default async function parentWriterFixture(pi: ExtensionAPI) {
 	}
 	pi.registerTool({ name: DOCUMENT_WRITE_TOOL, label: "测试父文档 writer", description: "仅测试内部生命周期，不是真实批准入口",
 		parameters: createWriteToolDefinition(process.cwd()).parameters,
-		execute: (id, input, signal, _update, ctx) => { target = path.resolve(ctx.cwd, "plan.md"); operationSignal = signal; return writer.write(id, input, signal, ctx); } });
+		execute: (id, input, signal, _update, ctx) => { target = path.resolve(ctx.cwd, "plan.md"); operationSignal = signal; return writer.write(id, input, signal, { ...ctx, mode: "tui", hasUI: true }); } });
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName !== DOCUMENT_WRITE_TOOL) return;
 		const { leases, workspace } = await state(ctx.cwd);

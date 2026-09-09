@@ -14,7 +14,6 @@ const inject = (h: Awaited<ReturnType<typeof createDevelopmentHost>>, remaining 
 
 test("真实 SDK 父断流自动续跑：已完成文档写入不重放，半截调用不执行，批准不重复", async (t) => {
 	const h = await createDevelopmentHost(t, "stream-retry-parent");
-	await h.approve("documents", ["plan.md"]);
 	const events: any[] = [];
 	h.session.subscribe((event) => events.push(event));
 	await inject(h, 1, 1);
@@ -29,7 +28,7 @@ test("真实 SDK 父断流自动续跑：已完成文档写入不重放，半截
 	assert.ok(!rows.some((row) => row.message?.role === "toolResult" && row.message.toolCallId === "incomplete-stream-call"));
 	assert.equal(rows.at(-1).message.stopReason, "stop");
 	assert.equal(events.filter((event) => event.type === "message_end" && event.message.role === "user").length, 1);
-	assert.equal(h.choices.length, 1);
+	assert.equal(h.choices.length, 0);
 	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "只写一次\n");
 	await assert.rejects(access(path.join(h.cwd, "src/incomplete.txt")), { code: "ENOENT" });
 	assert.equal(await h.readLease(), undefined);
@@ -103,7 +102,7 @@ for (const kind of ["once", "exhausted", "disabled"]) test(`真实开发 CLI 子
 	assert.equal(exit.data.development.clean, true);
 	assert.throws(() => process.kill(exit.data.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-	assert.equal(h.choices.length, 3);
+	assert.equal(h.choices.length, 2);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), `export const value = ${kind !== "once" ? 1 : 2};\n`);
 	await assert.rejects(access(path.join(h.cwd, "src/incomplete.txt")), { code: "ENOENT" });
 });

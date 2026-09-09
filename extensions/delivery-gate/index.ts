@@ -13,6 +13,7 @@ import { createStructuredCommands, structuredPackage, STRUCTURED_TOOLS, STRUCTUR
 import { resolveContainerImage } from "./src/container.ts";
 import { installTaskDetails } from "./src/task-details.ts";
 import { installStreamRetry } from "./src/stream-retry.ts";
+import { agentSelection, installModelCatalog, selectChildAgent } from "./src/agent-selection.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	const entryPath = fileURLToPath(import.meta.url);
@@ -65,7 +66,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 					return result;
 				}
 				if (childDevelopment) return childDevelopment.executeStructured(tool.name, id, args, path.join(structured!.root, `src/tools/apply-patch/bin/linux-${process.arch}/apply_patch`), signal, update);
-				if (tool.name === "apply_patch") throw new Error("父协调或只读子不提供 apply_patch 写入；父规划文档使用已授权的文档工具");
+				if (tool.name === "apply_patch") throw new Error("父协调或只读子不提供 apply_patch 写入；父规划文档使用默认可编辑 Markdown 的文档工具");
 				if (readonlyStarting) throw new Error("只读命令正在准备，不能同时启动另一命令");
 				if (tool.name === "write_stdin" && !readonlyCommands) throw new Error("session_id 不属于本次会话中的命令");
 				if (!readonlyCommands) {
@@ -129,7 +130,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。`
 				+ (childDevelopment ? "\n开发子会话只使用已交接的文件/容器工具，不修改父规划文档、不执行宿主 Shell、不批准或继续委派。"
-					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n文档编辑先读取现场，只在明确授权路径内维护；每个回合只发起一次文档变更，等待原生终态后再继续。"),
+					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n任务所需 Markdown 编辑默认允许，直接使用父文档工具，不申请单独文档授权；先读取现场并保留用户内容。每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择 agent 配置；delivery_models 查询可用模型，不统计费用。"),
 		};
 	});
 	if (child) {
@@ -159,7 +160,8 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		return;
 	}
 	const approvals = installApprovals(pi);
-	const writer = createParentDocumentWriter(pi, approvals);
+	const writer = createParentDocumentWriter(pi);
+	installModelCatalog(pi);
 	const developer = createDevelopmentDelegator(pi, approvals);
 	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
 	const tasks = () => [...active.values()].map((item) => item.progress.snapshot()).concat(developer.progress ? [developer.progress] : []);
@@ -177,48 +179,48 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	pi.registerTool({ name: REVIEW_TOOL, label: "独立候选审查",
 		...taskRenderers("审查", openTask),
 		description: "在本轮可信固定验收和当前候选一致时，沿只读子路径独立审查批准目标、当前代码、实际差异及原始验收记录。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径、实际差异及验收记录，无须重述全部需求，不以实现者总结代替证据" }) }, { additionalProperties: false }),
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径、实际差异及验收记录，无须重述全部需求，不以实现者总结代替证据" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始审查");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			return developer.review({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), parentSessionId: ctx.sessionManager.getSessionId(),
-				model: ctx.model, thinking: pi.getThinkingLevel(), environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
+				...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
 				(message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
 		},
 	});
 	pi.registerTool({ name: VALIDATION_TOOL, label: "固定候选验收",
 		...taskRenderers("验收", openTask),
 		description: "用独立标准 Pi 子会话执行本轮已批准的固定容器验收命令，不能修改或替换命令。实际输入、源码、镜像与前后候选必须一致，全部真实命令通过才报告本次验收通过；不代替独立审查。缺少容器授权或命令时明确未运行。",
-		parameters: Type.Object({}, { additionalProperties: false }),
-		execute: async (id, _input, signal, update, ctx) => {
+		parameters: Type.Object({ agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
+		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始验收");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			return developer.validate({ id, task: "执行本轮批准的固定候选验收，不编辑文件、不改变验收要求。", cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx),
-				parentSessionId: ctx.sessionManager.getSessionId(), model: ctx.model, thinking: pi.getThinkingLevel(), environment: environment(promptOptions),
+				parentSessionId: ctx.sessionManager.getSessionId(), ...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions),
 				projectTrusted: ctx.isProjectTrusted() }, signal, ctx, (message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
 		},
 	});
 	pi.registerTool({ name: DEVELOPMENT_TOOL, label: "开发文件委派",
 		...taskRenderers("开发", openTask),
-		description: "将一次开发任务交给独立标准 Pi。要求本轮父 TUI 的方案、实施及规划文档授权；原生环境使用受控 edit/write，Structured 使用批准容器内的 apply_patch/exec_command/write_stdin。命令须在实施确认中明确批准容器镜像/输入，不能用宿主 Shell 或未知工具覆盖替代。子任务不能修改父规划文档，不递归委派；原生终态落盘后才交回 writer，结果仍需核实。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据；工具自动附带已批准方案、实施正文、路径及命令，无须再次抄写或复制完整父历史" }) }, { additionalProperties: false }),
+		description: "将一次开发任务交给独立标准 Pi。要求本轮父 TUI 的方案与实施确认；原生环境使用受控 edit/write，Structured 使用批准容器内的 apply_patch/exec_command/write_stdin。命令须在实施确认中明确批准容器镜像/输入，不能用宿主 Shell 或未知工具覆盖替代。子任务不能修改父规划文档，不递归委派；原生终态落盘后才交回 writer，结果仍需核实。",
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据；工具自动附带已批准方案、实施正文、路径及命令，无须再次抄写或复制完整父历史" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未委派");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			return developer.execute({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), parentSessionId: ctx.sessionManager.getSessionId(),
-				model: ctx.model, thinking: pi.getThinkingLevel(), environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
+				...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
 				(message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
 		},
 	});
 	pi.registerTool({
 		name: DOCUMENT_EDIT_TOOL, label: "编辑规划文档",
-		description: "在本轮父 TUI 的文档授权范围内精确编辑 Markdown，保留其他内容。每回合一次文档变更，原生结果落盘后才交回 writer；不编辑源码。",
+		description: "默认允许父 TUI 精确编辑任务所需的 worktree 内 Markdown，无须文档授权。先读取现场并保留其他内容，每回合一次变更，原生结果落盘后才交回 writer；不编辑源码。",
 		parameters: createEditTool(".").parameters,
 		execute: (id, input, signal, _onUpdate, ctx) => writer.edit(id, input, signal, ctx),
 	});
 	pi.registerTool({
 		name: DOCUMENT_WRITE_TOOL, label: "写入规划文档",
-		description: "在本轮父 TUI 的文档授权范围内创建或完整重写 Markdown。已有文件先读取并保留用户内容，局部修改使用 delivery_document_edit。每回合一次文档变更；不编辑源码。",
+		description: "默认允许父 TUI 创建或完整重写任务所需的 worktree 内 Markdown，无须文档授权。已有文件先读取并保留用户内容，局部修改使用 delivery_document_edit。每回合一次变更；不编辑源码。",
 		parameters: createWriteTool(".").parameters,
 		execute: (id, input, signal, _onUpdate, ctx) => writer.write(id, input, signal, ctx),
 	});
@@ -226,11 +228,12 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		name: DELEGATE_TOOL, label: "只读委派",
 		...taskRenderers("只读", openTask),
 		description: "在独立标准 Pi 会话中执行一次只读分析。使用父已启用的原生 read/grep/find/ls，或已核实 Structured 的只读容器命令/图片读取；发送任务前核对工具定义、基础指令、规则和 Skills。子不可写入或继续委派，不复制父完整历史。结果最多 2000 行或 50KB，原始证据保留在子 Session。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "目标、必要背景、只读边界及预期证据；不要复制父完整历史" }) }),
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "目标、必要背景、只读边界及预期证据；不要复制父完整历史" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, params, signal, onUpdate, ctx) => {
 			if (!ctx.model) throw new Error("当前模型未确定，未委派");
 			if (!promptOptions) throw new Error("当前回合的基础环境未取得，未委派");
 			const expectedEnvironment = environment(promptOptions);
+			const selectedAgent = selectChildAgent(pi, ctx, params.agent);
 			const controller = new AbortController();
 			const operation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 			const notify = (message: string, progress: ReturnType<ReturnType<typeof createTaskProgress>["snapshot"]>) => onUpdate?.({ content: [{ type: "text" as const, text: message }], details: { progress } });
@@ -239,7 +242,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 			const run = (async () => {
 				const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 				const result = await delegateReadOnly({ id, task: params.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx),
-					parentSessionId: ctx.sessionManager.getSessionId(), model: ctx.model!, thinking: pi.getThinkingLevel(),
+					parentSessionId: ctx.sessionManager.getSessionId(), ...selectedAgent, toolInput: params,
 					environment: expectedEnvironment, projectTrusted: ctx.isProjectTrusted() }, operation,
 					(data) => pi.appendEntry(DELEGATION_ENTRY, data),
 					notify, ctx, progress);

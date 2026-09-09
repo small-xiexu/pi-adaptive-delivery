@@ -6,7 +6,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { truncateHead, type BuildSystemPromptOptions, type ExtensionContext, type RpcCommand, type RpcExtensionUIResponse, type RpcSessionState, type SessionEntry, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
-import { createTaskProgress, type ProgressUpdate } from "./progress.ts";
+import { createTaskProgress, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 
 export const CHILD_ENV = "PI_ADAPTIVE_DELIVERY_CHILD";
 export const DELEGATE_TOOL = "delivery_readonly";
@@ -288,6 +288,8 @@ export interface ChildTask {
 	parentSessionId: string;
 	model: { provider: string; id: string };
 	thinking: string;
+	selectionReason: string;
+	toolInput: Record<string, unknown>;
 	environment: ReadOnlyEnvironment;
 	projectTrusted: boolean;
 	readPaths?: string[];
@@ -368,7 +370,7 @@ export async function delegateReadOnly(
 	update: ProgressUpdate,
 	ctx: DialogContext,
 	progress = createTaskProgress(input.id, "只读", input.task, update),
-): Promise<{ text: string; sessionId: string; sessionFile: string; pid: number }> {
+): Promise<{ text: string; sessionId: string; sessionFile: string; pid: number; toolErrors: boolean }> {
 	signal.throwIfAborted();
 	const rpc = await startChild(input, "readonly");
 	const interrupt = new AbortController();
@@ -381,13 +383,14 @@ export async function delegateReadOnly(
 	let recordProblem: unknown;
 	let recordedClose = false;
 	const reference = () => ({ id: input.id, parentSessionId: input.parentSessionId, cwd: input.cwd,
-		pid: rpc.process.pid, sessionId: state?.sessionId, sessionFile: state?.sessionFile });
+		pid: rpc.process.pid, sessionId: state?.sessionId, sessionFile: state?.sessionFile, agent: progress.snapshot().agent });
 	try {
 		rpc.onEvent = (event) => {
 			progress.event(event);
 			dialogs.handle(event);
 		};
 		await readyChild(rpc, input, operation, (value) => { state = value; });
+		progress.agent({ provider: state!.model!.provider, id: state!.model!.id, thinking: state!.thinkingLevel, reason: input.selectionReason });
 		record({ ...reference(), phase: "started" });
 		progress.phase("运行中", "子任务已启动", state?.sessionFile);
 		await Promise.all([
@@ -396,7 +399,6 @@ export async function delegateReadOnly(
 			rpc.request({ type: "prompt", message: `只读子任务。仅分析并提供证据，不修改文件，不继续委派。\n\n${input.task}` }, operation),
 		]);
 		if (rpc.openTools.size) throw new Error("子任务存在未确认的工具执行终态");
-		if (rpc.toolError) throw new Error("子任务存在已记录的工具失败；请先核对原始记录中的错误及已有分析，再裁决后续动作");
 	} catch (error) { problem = error; }
 	progress.phase(operation.aborted ? "正在取消" : "核对收尾中");
 	try { await dialogs.close(); }
@@ -424,8 +426,8 @@ export async function delegateReadOnly(
 	if (!problem && (!recordedClose || !text)) problem = new Error("子任务原始记录或最终正文未核实");
 	if (operation.aborted) problem ??= operation.reason;
 	record({ ...reference(), phase: "ended", status: !rpc.exit || rpc.openTools.size ? "unknown" : operation.aborted ? "cancelled" : problem ? "failed" : "completed",
-		exit: rpc.exit, error: problem ? String(problem) : undefined });
-	progress.end(!rpc.exit || rpc.openTools.size || !stopped ? "收尾未知" : operation.aborted ? "已取消" : problem ? "失败" : "执行结束，结果待核实");
+		exit: rpc.exit, toolErrors: rpc.toolError, error: problem ? String(problem) : undefined });
+	progress.end(!rpc.exit || rpc.openTools.size || !stopped ? "收尾未知" : operation.aborted ? "已取消" : problem ? "失败" : rpc.toolError ? TOOL_ERROR_STATUS : "执行结束，结果待核实");
 	if (problem) throw new Error(`只读委派未成功：${String(problem)}`
 		+ (state?.sessionFile ? `\n原始子 Session：${state.sessionFile}` : "\n子 Session 引用尚未取得。")
 		+ `\n进程收尾：${stopped && rpc.exit?.code === 0 && rpc.exit.signal === null && !rpc.failure ? "已正常关闭" : "未核实正常关闭"}；工具终态：${rpc.openTools.size ? "仍有未确认执行" : "无在途工具"}。`
@@ -433,6 +435,6 @@ export async function delegateReadOnly(
 		+ `\n父 Session ID：${input.parentSessionId}\n本次工具调用：${input.id}`
 		+ "\n此结果仍为失败；先读取已有原始证据，不据此自动重试或放宽权限。", { cause: problem });
 	const output = truncateHead(text!);
-	return { text: `${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}`,
-		sessionId: state!.sessionId, sessionFile: state!.sessionFile!, pid: rpc.process.pid! };
+	return { text: `${rpc.toolError ? `${TOOL_ERROR_GUIDANCE}\n\n` : ""}${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}`,
+		sessionId: state!.sessionId, sessionFile: state!.sessionFile!, pid: rpc.process.pid!, toolErrors: rpc.toolError };
 }

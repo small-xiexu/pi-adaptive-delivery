@@ -36,7 +36,7 @@ test("离线 npm tarball 在无 node_modules 的隔离目录加载完整自有�
 	t.after(() => fixture.rpc.stop());
 	await assert.rejects(access(path.join(fixture.productDir!, "node_modules")), { code: "ENOENT" });
 	const commands = (await fixture.rpc.send("get_commands")).data.commands;
-	for (const name of ["delivery-status", "delivery-shape", "delivery-plan", "delivery-run", "skill:adaptive-delivery"]) assert.ok(commands.some((command: any) => command.name === name));
+	for (const name of ["delivery-status", "delivery-resume", "delivery-shape", "delivery-plan", "delivery-run", "skill:adaptive-delivery"]) assert.ok(commands.some((command: any) => command.name === name));
 	await fixture.rpc.send("prompt", { message: "读取 input.txt，验证打包制品加载" });
 	await fixture.rpc.waitFor((row) => row.type === "agent_settled");
 	assert.match((await fixture.rpc.send("get_last_assistant_text")).data.text, /fixture-read-ok/);
@@ -47,7 +47,7 @@ test("无 node_modules 的正式 Package 加载自身资源并完成真实只读
 	const fixture = await createPiFixture(source);
 	t.after(() => fixture.rpc.stop());
 	const commands = (await fixture.rpc.send("get_commands")).data.commands;
-	for (const name of ["delivery-status", "delivery-shape", "delivery-plan", "delivery-run", "skill:adaptive-delivery"]) {
+	for (const name of ["delivery-status", "delivery-resume", "delivery-shape", "delivery-plan", "delivery-run", "skill:adaptive-delivery"]) {
 		assert.ok(commands.some((command: any) => command.name === name), name);
 	}
 	assert.ok(!commands.some((command: any) => command.sourceInfo?.path?.includes("pi-subagents")));
@@ -104,7 +104,7 @@ test("标准 CLI 开发入口拒绝无批准 RPC；开发角色标记本身不�
 	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: fixture.rpc.process.pid, childPid: child.process.pid }));
 });
 
-for (const kind of ["write", "edit"]) for (const boundary of ["unapproved", "replacement", "child"]) {
+for (const kind of ["write", "edit"]) for (const boundary of ["rpc", "replacement", "child"]) {
 	test(`标准 CLI 正式文档 ${kind} 拒绝 ${boundary}`, { timeout: 30_000 }, async (t) => {
 		const fixture = await createPiFixture(source, `document-entry-${kind}`);
 		const { rpc } = fixture;
@@ -112,7 +112,7 @@ for (const kind of ["write", "edit"]) for (const boundary of ["unapproved", "rep
 		const state = (await rpc.send("get_state")).data;
 		const name = `delivery_document_${kind}`;
 		if (boundary === "replacement") await rpc.send("prompt", { message: `/fixture-replace-tool ${name}` });
-		await rpc.send("prompt", { message: boundary === "child" ? "fixture-delegate" : "尝试未授权文档变更" });
+		await rpc.send("prompt", { message: boundary === "child" ? "fixture-delegate" : "验证父 TUI 之外的文档编辑边界" });
 		await rpc.waitFor((record) => record.type === "agent_settled");
 		if (boundary === "child") {
 			const rows = (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
@@ -123,7 +123,7 @@ for (const kind of ["write", "edit"]) for (const boundary of ["unapproved", "rep
 		} else {
 			const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === name);
 			assert.ok(result?.isError);
-			assert.match(JSON.stringify(result.result), boundary === "replacement" ? /不在当前已验证/ : /本轮没有/);
+			assert.match(JSON.stringify(result.result), boundary === "replacement" ? /不在当前已验证/ : /只供父 Pi TUI/);
 		}
 		const native = await readFile(state.sessionFile, "utf8");
 		assert.ok(!native.includes('"customType":"delivery-approval"'));

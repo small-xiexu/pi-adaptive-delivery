@@ -68,7 +68,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		stage, body: `APPROVED_${stage.toUpperCase()}_BODY`, paths, validationCommands, ...(container ? { container } : {}),
 	});
 	const prepare = async () => {
-		for (const [stage, paths] of [["documents", ["plan.md"]], ["design", []], ["implementation", ["src", "plan.md"]]] as const) {
+		for (const [stage, paths] of [["design", ["plan.md"]], ["implementation", ["src", "plan.md"]]] as const) {
 			assert.equal((await approve(stage, [...paths])).isError, false);
 		}
 	};

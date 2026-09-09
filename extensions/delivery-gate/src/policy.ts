@@ -5,7 +5,7 @@ import { DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./parent-writer.ts";
 import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
 import { GIT_STATUS_TOOL } from "./workspace.ts";
 
-export const CAPABILITY_NOTICE = "当前支持原生工具或已核实的 Structured 工具、父 TUI 批准的文档编辑与受控子开发、本地禁网容器命令、固定候选验收及独立只读审查。父与普通子仅可只读；开发写入和命令须实施批准。宿主 Shell 关闭，旧权限和证据不自动恢复；当前任务的权限与完成情况仍须按实际工具和证据核实。";
+export const CAPABILITY_NOTICE = "当前支持原生工具或已核实的 Structured 工具、父 TUI 默认 Markdown 编辑与受控子开发、本地禁网容器命令、固定候选验收及独立只读审查。父使用专用文档工具，普通子仅可只读；源码开发和命令须方案及实施确认。宿主 Shell 关闭，旧批准和验收不自动恢复；当前任务的权限与完成情况仍须按实际工具和证据核实。";
 const NATIVE_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">): string[] {
@@ -15,7 +15,7 @@ export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActi
 }
 
 export function installPolicy(pi: ExtensionAPI, coordinatorPath?: string, developerPath?: string, structuredAllowed: (name: string) => boolean = () => false): void {
-	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [GIT_STATUS_TOOL, DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL].includes(name)
+	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [GIT_STATUS_TOOL, "delivery_models", DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL].includes(name)
 		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === coordinatorPath);
 	const developerAllowed = (name: string) => developerPath !== undefined && ["edit", "write", "bash"].includes(name)
 		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === developerPath);

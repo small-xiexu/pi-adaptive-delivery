@@ -1,10 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentToolResult, EditToolInput, ExtensionAPI, ExtensionContext, SessionEntry, WriteToolInput } from "@earendil-works/pi-coding-agent";
-import type { installApprovals } from "./approvals.ts";
 import { createPlanningDocumentTools } from "./planning-documents.ts";
 import path from "node:path";
-import { getWriterStateRoot, type WriterLeaseOwner, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
+import { getWriterStateRoot, resolveWorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
 
 export const DOCUMENT_EDIT_TOOL = "delivery_document_edit";
 export const DOCUMENT_WRITE_TOOL = "delivery_document_write";
@@ -19,6 +18,7 @@ export interface SessionBinding {
 interface DocumentRun extends SessionBinding {
 	id: string;
 	name: string;
+	io: AbortController;
 	run?: Promise<AgentToolResult<unknown>>;
 	attemptedLease: boolean;
 	finished: boolean;
@@ -58,7 +58,7 @@ export async function nativeEntries(state: SessionBinding, ctx: ExtensionContext
 }
 
 // 仅协调本轮父文档操作；不注册工具、不授予批准、不从旧记录恢复 writer，也不管理外部进程。
-export function createParentDocumentWriter(pi: ExtensionAPI, approvals: Pick<ReturnType<typeof installApprovals>, "readDocumentApproval">) {
+export function createParentDocumentWriter(pi: ExtensionAPI) {
 	let active: DocumentRun | undefined;
 	let stopped = false;
 	let finishing: Promise<void> | undefined;
@@ -67,17 +67,19 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: Pick<Ret
 	async function execute(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput,
 		signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
 		if (stopped || active) throw new Error("父文档 writer 尚未完成终态核验或已关闭，未开始新的写入");
+		if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("默认 Markdown 编辑只供父 Pi TUI 使用");
 		signal?.throwIfAborted();
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("没有持久 Session，未取得父 writer");
 		const state: DocumentRun = { id, name: kind === "edit" ? DOCUMENT_EDIT_TOOL : DOCUMENT_WRITE_TOOL,
 			cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), sessionFile, lifetime: new AbortController(),
-			attemptedLease: false, finished: false };
+			io: new AbortController(), attemptedLease: false, finished: false };
 		active = state;
-		const operation = signal ? AbortSignal.any([signal, state.lifetime.signal]) : state.lifetime.signal;
+		const operation = AbortSignal.any([state.io.signal, state.lifetime.signal, ...(signal ? [signal] : [])]);
 		state.run = Promise.resolve().then(async () => {
 			try {
-				const grant = await approvals.readDocumentApproval(ctx, operation);
+				const workspace = await resolveWorkspaceIdentity(ctx.cwd);
+				const target = path.resolve(workspace.cwdPath, input.path.startsWith("@") ? input.path.slice(1) : input.path);
 				current(state, ctx);
 				const before = await nativeEntries(state, ctx);
 				const call = before.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
@@ -89,22 +91,21 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: Pick<Ret
 					throw new Error("文档工具调用已有结果，不能重放取得 writer");
 				}
 				state.call = call;
-				const stateRoot = await getWriterStateRoot(grant.workspace);
+				const stateRoot = await getWriterStateRoot(workspace);
 				state.leases = new WriterLeaseManager(stateRoot);
 				current(state, ctx);
 				operation.throwIfAborted();
-				grant.signal.throwIfAborted();
 				state.attemptedLease = true;
-				const acquired = await state.leases.acquire(grant.workspace, { kind: "parent", sessionId: state.sessionId, pid: process.pid, runId: id });
+				const acquired = await state.leases.acquire(workspace, { kind: "parent", sessionId: state.sessionId, pid: process.pid, runId: id });
 				if (!acquired.ok) { state.attemptedLease = false; throw new Error(acquired.reason); }
 				state.lease = { ...acquired.reference };
 				state.owner = { ...acquired.record.owner };
-				state.tools = createPlanningDocumentTools({ ...grant, lease: state.lease, leases: state.leases, owner: state.owner,
+				state.tools = createPlanningDocumentTools({ workspace, paths: [target], signal: operation, lease: state.lease, leases: state.leases, owner: state.owner,
 					authorize: async () => {
 						current(state, ctx);
-						const latest = await approvals.readDocumentApproval(ctx, operation);
-						current(state, ctx);
-						if (latest.approvalId !== grant.approvalId) throw new Error("本次文档授权已被替换");
+						if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("默认 Markdown 编辑只供父 Pi TUI 使用");
+						const records = await nativeEntries(state, ctx);
+						records.requireEntry(state.call!);
 					} }, [path.dirname(stateRoot), sessionFile]);
 				const result = kind === "edit" ? await state.tools.edit(id, input as EditToolInput, operation)
 					: await state.tools.write(id, input as WriteToolInput, operation);
@@ -170,6 +171,8 @@ export function createParentDocumentWriter(pi: ExtensionAPI, approvals: Pick<Ret
 		stopped = true;
 		const state = active;
 		if (!state) return;
+		// 先取消 I/O，原生终态仍可在会话关闭前核实并交回 writer。
+		state.io.abort(new Error("父会话正在关闭或重载，停止文档操作"));
 		const settled = !ctx.isIdle() ? new Promise<void>((resolve) => { shutdownSettled = resolve; }) : undefined;
 		if (settled) ctx.abort();
 		await Promise.allSettled([state.run, finishing, settled]);

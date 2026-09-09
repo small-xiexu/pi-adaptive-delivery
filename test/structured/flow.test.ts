@@ -94,7 +94,7 @@ for (const seven of [false, true]) test(`真实 Structured ${seven ? "显式七�
 		await rpc.waitFor((row) => row.type === "agent_settled", cursor);
 		return rpc.records.slice(cursor).find((row) => row.type === "tool_execution_end" && row.toolCallId === id)!;
 	};
-	const approval = await invoke("rpc-approval", { stage: "documents", body: "模型不能批准", paths: ["plan.md"], validationCommands: [] }, "delivery_approval");
+	const approval = await invoke("rpc-approval", { stage: "design", body: "模型不能批准", paths: ["plan.md"], validationCommands: [] }, "delivery_approval");
 	assert.equal(approval.isError, true);
 	assert.match(JSON.stringify(approval.result.content), /真实 TUI/);
 	await writeFile(path.join(f.cwd, "pixel.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
@@ -151,17 +151,22 @@ test("真实 Structured 完成独立批准、补丁开发、自检、固定验�
 	await h.session.prompt("/fixture-parent-history");
 	const progress: any[] = [];
 	t.after(h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName.startsWith("delivery_")) progress.push(event.partialResult.details.progress); }));
-	const develop = await h.call("delivery_develop", { task: "使用 apply_patch 创建 src/value.js，再执行自检并读回" });
+	const model = { provider: "adaptive-fixture", id: "fake-reasoner" };
+	const develop = await h.call("delivery_develop", { task: "使用 apply_patch 创建 src/value.js，再执行自检并读回", agent: { model, thinking: "medium", reason: "局部实现" } });
 	assert.equal(develop.isError, false, JSON.stringify(develop));
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-	const validation = await h.call("delivery_validate", {});
+	const validation = await h.call("delivery_validate", { agent: { model, thinking: "low", reason: "执行固定命令" } });
 	assert.equal(validation.isError, false, JSON.stringify(validation));
 	assert.equal((validation.details as any).validation.results[0].exitCode, 0);
-	const review = await h.call("delivery_review", { task: "对照当前代码、实际差异和原始验收记录独立审查" });
+	const review = await h.call("delivery_review", { task: "对照当前代码、实际差异和原始验收记录独立审查", agent: { model, thinking: "high", reason: "核对代码与验收边界" } });
 	assert.equal(review.isError, false, JSON.stringify(review));
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "实际开发、自检、固定验收与审查已核对。\n" })).isError, false);
-	assert.equal(h.choices.length, 4);
+	assert.equal(h.choices.length, 3);
+	assert.deepEqual([develop, validation, review].map((result) => (result.details as any).progress.agent.thinking), ["medium", "low", "high"]);
+	const selectedRequests = (await h.audit()).filter((row) => row.child && row.phase === "model");
+	assert.ok(selectedRequests.every((row) => row.modelId === "fake-reasoner"));
+	for (const thinking of ["medium", "low", "high"]) assert.ok(selectedRequests.some((row) => row.reasoning === thinking));
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	for (const result of [develop, validation, review]) {
 		const own = progress.filter((view) => view?.id === result.toolCallId);
@@ -172,7 +177,7 @@ test("真实 Structured 完成独立批准、补丁开发、自检、固定验�
 	assertEnhancements(await h.audit());
 });
 
-for (const failed of [false, true]) test(`真实 Structured ${failed ? "失败" : "成功"}审查的父子均能读取只读快照和完整长记录`, { timeout: 90_000 }, async (t) => {
+for (const failed of [false, true]) test(`真实 Structured ${failed ? "有过程错误" : "正常"}审查的父子均能读取只读快照和完整长记录`, { timeout: 90_000 }, async (t) => {
 	const h = await development(t, failed ? "evidence-fail" : "evidence");
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
 	const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: h.cwd, env: process.env });
@@ -181,7 +186,8 @@ for (const failed of [false, true]) test(`真实 Structured ${failed ? "失败" 
 	assert.equal((await h.call("delivery_develop", { task: "按授权更新源码" })).isError, false);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
 	const review = await h.call("delivery_review", { task: "读取 before/after、差异和原始验收；禁止写入快照" });
-	assert.equal(review.isError, failed, JSON.stringify(review));
+	assert.equal(review.isError, false, JSON.stringify(review));
+	if (failed) assert.equal((review.details as any).progress.status, "已结束，有工具错误待核对");
 	assert.equal(await h.readLease(), undefined);
 	const parentRows = await jsonl(h.sm.getSessionFile()!);
 	const reference = parentRows.findLast((row) => row.customType === "delivery-delegation" && row.data.phase === "ended").data;
@@ -230,8 +236,11 @@ for (const scenario of ["outside", "cancel", "unfinished", "crash"]) test(`真�
 		await h.session.abort();
 	}
 	const result = await run;
-	assert.equal(result.isError, true, JSON.stringify(result));
-	assert.match(JSON.stringify(result.content), /原始子 Session/);
+	assert.equal(result.isError, scenario !== "outside", JSON.stringify(result));
+	if (scenario === "outside") {
+		assert.equal((result.details as any).progress.status, "已结束，有工具错误待核对");
+		assert.match(JSON.stringify(result.content), /过程中有工具错误/);
+	} else assert.match(JSON.stringify(result.content), /原始子 Session/);
 	if (scenario === "crash") assert.ok(await h.readLease(), "未知子记录不能自动释放 writer");
 	else assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	if (scenario === "unfinished") assert.match(JSON.stringify(result.content), /未通过原生工具交回/);

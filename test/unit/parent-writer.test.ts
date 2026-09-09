@@ -9,7 +9,6 @@ import path from "node:path";
 import test from "node:test";
 import { SessionManager, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
-import { installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "../../extensions/delivery-gate/src/parent-writer.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
@@ -26,15 +25,12 @@ async function host(existing?: string) {
 	const sm = SessionManager.create(cwd, path.join(root, "sessions"));
 	sm.appendMessage(assistant([{ type: "text", text: "模拟 TUI 前置，不是真实用户确认" }]));
 	const handlers = new Map<string, Function[]>();
-	let approval: any;
 	const notices: string[] = [];
 	const pi: any = { on: (name: string, handler: Function) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
-		registerTool: (tool: any) => { approval = tool; }, registerEntryRenderer() {}, appendEntry: (type: string, data: unknown) => sm.appendCustomEntry(type, data) };
+		registerTool() {}, registerCommand() {}, registerEntryRenderer() {}, appendEntry: (type: string, data: unknown) => sm.appendCustomEntry(type, data) };
 	const ctx: any = { cwd, mode: "tui", hasUI: true, sessionManager: sm, isIdle: () => true, abort: () => {},
 		ui: { custom: approvalUI(async (_title, choices) => choices[0]), notify: (text: string) => notices.push(text) } };
-	const approvals = installApprovals(pi);
-	await approval.execute("approve", { stage: "documents", body: "仅编辑 plan.md", paths: ["plan.md"], validationCommands: [] }, undefined, undefined, ctx);
-	const writer = createParentDocumentWriter(pi, approvals);
+	const writer = createParentDocumentWriter(pi);
 	const workspace = await resolveWorkspaceIdentity(cwd);
 	const stateRoot = await getWriterStateRoot(workspace);
 	const leases = new WriterLeaseManager(stateRoot);
@@ -48,7 +44,7 @@ async function host(existing?: string) {
 		const message = async (): Promise<ToolResultMessage> => ({ role: "toolResult", toolCallId: id, toolName: DOCUMENT_WRITE_TOOL, ...await outcome, timestamp: Date.now() });
 		return { id, run, message, persist: async () => { const result = await message(); sm.appendMessage(result); return result; } };
 	};
-	return { root, cwd, sm, pi, ctx, writer, approvals, begin, event, notices, workspace, leases, leaseFile,
+	return { root, cwd, sm, pi, ctx, writer, begin, event, notices, workspace, leases, leaseFile,
 		readLease: () => leases.read(workspace.key), disk: async () => (await readFile(sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((row) => JSON.parse(row)) };
 }
 
@@ -150,11 +146,15 @@ test("调用方改变返回对象不能同时改变私有终态依据", async ()
 	assert.ok(await h.readLease());
 });
 
-test("缺少本轮批准或原生调用时不获取 writer，也不创建文档", async () => {
+test("默认编辑仍要求原生调用，空闲时分支导航不引入文档授权步骤", async () => {
 	const h = await host();
 	await assert.rejects(h.writer.write("absent", { path: "plan.md", content: "不应写入" }, undefined, h.ctx), /原生工具调用/);
 	await h.event("session_tree");
-	await assert.rejects(h.begin().run, /本轮没有/);
+	const call = h.begin();
+	await call.run;
+	await call.persist();
+	await h.event("turn_end");
+	assert.ok(!(await h.disk()).some((row) => row.customType === "delivery-approval"));
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.writer.pending, false);
 });
@@ -243,8 +243,10 @@ test("shutdown 与重新安装不恢复未交接的 writer", async () => {
 	await h.event("turn_end");
 	assert.ok(await h.readLease());
 	await assert.rejects(h.writer.write("closed", { path: "plan.md", content: "不应写入" }, undefined, h.ctx), /已关闭/);
-	const replacement = createParentDocumentWriter(h.pi, h.approvals);
-	await assert.rejects(replacement.write("restored", { path: "plan.md", content: "不应写入" }, undefined, h.ctx), /本轮没有/);
+	const replacement = createParentDocumentWriter(h.pi);
+	const input = { path: "plan.md", content: "不应写入" };
+	h.sm.appendMessage(assistant([{ type: "toolCall", id: "restored", name: DOCUMENT_WRITE_TOOL, arguments: input }]));
+	await assert.rejects(replacement.write("restored", input, undefined, h.ctx), /writer|lease|占用|持有/);
 	assert.ok(await h.readLease());
 });
 

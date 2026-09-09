@@ -40,6 +40,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		audit("start", { sessionId: ctx.sessionManager.getSessionId(), commands: pi.getCommands().map((command) => command.name),
 			tools: pi.getAllTools().map((tool) => tool.name) });
 		if (isChild() && scenario === "missing-tools") pi.setActiveTools([]);
+		if (isChild() && scenario === "development-selection-mismatch") pi.setThinkingLevel("low");
 		if (isChild() && scenario === "boot-failure") process.exit(13);
 		if (isChild() && (scenario === "environment-tool-replaced" || process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-tool-replaced"))) {
 			replaceTool("read");
@@ -137,13 +138,15 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	pi.registerProvider("adaptive-fixture", {
 		name: "禁网测试替身", api: structured ? "openai-responses" : "adaptive-fixture", baseUrl: "http://127.0.0.1", apiKey: "fixture-not-a-credential",
 		models: [{ id: "fake", name: "Fake", reasoning: false, input: structured ? ["text", "image"] : ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1024 }],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1024 },
+			{ id: "fake-reasoner", name: "Fake Reasoner", reasoning: true, input: structured ? ["text", "image"] : ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1024 }],
 		streamSimple(model, context, options) {
 			calls++;
 			const planned = nextTool;
 			nextTool = undefined;
 			const stream = createAssistantMessageEventStream();
-			audit("model", { parentMarkerSeen: JSON.stringify(context.messages).includes("PARENT_ONLY_HISTORY_SENTINEL"),
+			audit("model", { modelId: model.id, reasoning: options?.reasoning, parentMarkerSeen: JSON.stringify(context.messages).includes("PARENT_ONLY_HISTORY_SENTINEL"),
 				tools: context.tools?.map((tool) => tool.name), ...(environment || development || structured ? { systemPrompt: context.systemPrompt,
 					messages: context.messages } : {}) });
 			queueMicrotask(async () => {
@@ -171,6 +174,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const step = messages.filter((message) => message.role === "toolResult").length;
 				const readBeforeWrite = developmentChild && !validationChild && scenario === "development-container-read-before-write";
 				const developmentStep = step - (readBeforeWrite ? 1 : 0);
+				const editRecovery = developmentChild && scenario === "development-edit-recovery";
 				const readSkill = environment && isChild() && read && !read.isError && messages.filter((message) => message.role === "toolResult").length === 1;
 				const user = context.messages.findLast((message) => message.role === "user");
 				const taskText = typeof user?.content === "string" ? user.content : user?.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? "";
@@ -185,21 +189,22 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				}
 				const reviewEvidence = reviewChild ? JSON.parse(taskText.split("\n").find((line) => line.startsWith("审查证据："))!.slice("审查证据：".length)) : undefined;
 				const readonlyEscalation = development && isChild() && !developmentChild && JSON.stringify(user?.content).includes("fixture-read-then-write");
-				const finished = !planned && read && !readSkill && !recoverRead && (structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
+				const finished = !planned && read && !readSkill && !recoverRead && (editRecovery ? step >= 3 : structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
 					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
 					: !developmentChild || developmentStep >= (containerChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
 					&& (!readonlyEscalation || step >= 2 || read.isError);
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write") || readonlyEscalation && step === 1;
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
-				const toolName = planned?.name ?? (structured && isChild() ? developmentChild && !validationChild && step === 0 ? "apply_patch" : developmentChild && scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
+				const toolName = planned?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && isChild() ? developmentChild && !validationChild && step === 0 ? "apply_patch" : developmentChild && scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
 					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && containerChild ? "bash" : "read"
 					: writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
 					: document ? scenario.endsWith("edit") ? "delivery_document_edit" : "delivery_document_write" : approval ? "delivery_approval" : write ? "write" : "read");
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
 				const target = scenario === "development-outside" ? "../outside.js" : scenario === "development-plan" ? "plan.md"
 					: scenario === "development-git" ? ".git/forbidden.js" : scenario === "development-separate-git" ? "metadata/forbidden.js" : "src/value.js";
-				const args = planned?.arguments ?? (structured && isChild() ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
+				const args = planned?.arguments ?? (editRecovery ? { path: target, ...(step === 1 ? {} : { edits: step === 0 ? [{ oldText: " = 1", newText: " = 2" }]
+					: [{ oldText: "first = 1", newText: "first = 2" }, { oldText: "second = 1", newText: "second = 2" }] }) } : structured && isChild() ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
 					: toolName === "write_stdin" ? { session_id: (read as any)?.details?.session_id, chars: "TTY_INPUT_PROOF\n", yield_time_ms: 30_000 }
 					: { cmd: validationChild ? "python inputs/check.py" : reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile}'`
 						: developmentChild ? step === 1 ? scenario.endsWith("structured-pty") ? "read value; printf '%s' \"$value\" > src/typed.txt"
@@ -207,7 +212,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 							: scenario.endsWith("structured-unfinished") ? "sleep 120" : "python inputs/check.py" : "cat src/value.js" : "cat input.txt",
 						yield_time_ms: /structured-(unfinished|pty)$/.test(scenario) ? 250 : 30_000, ...(scenario.endsWith("structured-pty") ? { tty: true } : {}) } : searchStep !== undefined ? searchStep === 0 ? { path: "." } : searchStep === 1 ? { pattern: "*.txt", path: "." }
 					: searchStep === 2 ? { pattern: "fixture-read-ok", path: ".", glob: "*.txt" } : { path: "input.txt" }
-					: recoverRead ? { path: read!.content.filter((part) => part.type === "text").map((part) => part.text).join("\n").match(/原始子 Session：([^\n]+)/)?.[1] ?? "missing-evidence" }
+					: recoverRead ? { path: (read as any).details?.sessionFile ?? "missing-evidence" }
 					: validationChild ? scenario.endsWith("validation-edit") ? { path: target, content: "forbidden validation edit\n" }
 					: { command: scenario.endsWith("validation-wrong") ? "echo unapproved" : step === 1 ? "node inputs/second.cjs" : "node inputs/command.cjs",
 						timeout: scenario.endsWith("validation-timeout") ? 1 : 10 }
@@ -216,7 +221,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					: developmentStep === 2 && containerChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-container-timeout" ? 1 : scenario === "development-container-details" ? 20 : 10 } : { path: target }
 					: toolName === "delivery_document_write" ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
 					: toolName === "delivery_document_edit" ? { path: "plan.md", edits: [{ oldText: "原文", newText: "禁止" }] }
-					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: stage === "design" ? [] : ["plan.md"], validationCommands: [] }
+					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: ["plan.md"], validationCommands: [] }
 					: toolName === "delivery_readonly" ? { task: scenario === "task-command" ? "/fixture-dangerous" : "读取 input.txt，提供独立证据。" }
 					: write ? { path: "forbidden.txt", content: "unexpected" } : { path: reviewChild ? step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile
 						: readSkill ? path.join(process.env.PI_CODING_AGENT_DIR!, "skills", "environment-proof", "SKILL.md")
