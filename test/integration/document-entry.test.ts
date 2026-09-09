@@ -11,6 +11,7 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { createAssistantMessageEventStream, type ToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
+import { approvalUI } from "../support/delivery-ui.ts";
 
 const entry = fileURLToPath(new URL("../../extensions/delivery-gate/index.ts", import.meta.url));
 const documentWrite = "delivery_document_write";
@@ -29,7 +30,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	let api!: ExtensionAPI;
 	const notices: string[] = [];
 	const choices: string[] = [];
-	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[1]; };
+	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[0]; };
 	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true,
 		extensionsOverride: (loaded) => ({ ...loaded, extensions: [...loaded.extensions].reverse() }),
 		additionalExtensionPaths: [entry], extensionFactories: [(pi) => {
@@ -64,6 +65,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		finally { session.dispose(); }
 	});
 	await session.bindExtensions({ mode: "tui", uiContext: {
+		custom: approvalUI((...args) => select(...args)),
 		select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args), notify: (text: string) => { notices.push(text); },
 	} as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
 	const model = modelRuntime.getModel("document-fixture", "fake");
@@ -80,7 +82,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		return result.message;
 	};
 	const approve = (stage = "documents", paths = ["plan.md"]) => call("delivery_approval", { stage, body: `待确认正文 ${stage}`, paths, validationCommands: [] });
-	t.diagnostic(JSON.stringify({ root, sdk: "0.84.4", ui: "simulated" }));
+	t.diagnostic(JSON.stringify({ root, sdk: "0.85.1", ui: "simulated" }));
 	return { root, cwd, sm, session, api, notices, choices, call, approve, readLease: () => leases.read(workspace.key),
 		setSelect: (callback: typeof select) => { select = callback; } };
 }

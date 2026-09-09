@@ -12,6 +12,7 @@ import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai"
 import { installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "../../extensions/delivery-gate/src/parent-writer.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
+import { approvalUI } from "../support/delivery-ui.ts";
 
 function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	return { role: "assistant", content, api: "openai-completions", provider: "fixture", model: "fake", stopReason: "toolUse", timestamp: Date.now(),
@@ -30,7 +31,7 @@ async function host(existing?: string) {
 	const pi: any = { on: (name: string, handler: Function) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
 		registerTool: (tool: any) => { approval = tool; }, registerEntryRenderer() {}, appendEntry: (type: string, data: unknown) => sm.appendCustomEntry(type, data) };
 	const ctx: any = { cwd, mode: "tui", hasUI: true, sessionManager: sm, isIdle: () => true, abort: () => {},
-		ui: { select: async (_title: string, choices: string[]) => choices[1], notify: (text: string) => notices.push(text) } };
+		ui: { custom: approvalUI(async (_title, choices) => choices[0]), notify: (text: string) => notices.push(text) } };
 	const approvals = installApprovals(pi);
 	await approval.execute("approve", { stage: "documents", body: "仅编辑 plan.md", paths: ["plan.md"], validationCommands: [] }, undefined, undefined, ctx);
 	const writer = createParentDocumentWriter(pi, approvals);

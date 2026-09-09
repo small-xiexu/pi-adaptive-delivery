@@ -10,6 +10,7 @@ import { APPROVAL_ENTRY, APPROVAL_TOOL, PROPOSAL_ENTRY, installApprovals } from 
 import { createPlanningDocumentTools } from "../../extensions/delivery-gate/src/planning-documents.ts";
 import { WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { installFakeDocker } from "../support/fake-docker.ts";
+import { approvalUI } from "../support/delivery-ui.ts";
 
 const documents = { stage: "documents", body: "允许持续编辑本任务方案与计划。", paths: ["docs/方案.md", "docs/计划.md"], validationCommands: [] };
 const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", paths: [], validationCommands: [] };
@@ -30,8 +31,9 @@ async function host(persist = true) {
 	const ctx: any = { cwd, mode: "tui", hasUI: true, sessionManager: sm,
 		ui: { select: async (title: string, options: string[]) => {
 			displayed.push({ title, options });
-			return options[1];
+			return options[0];
 		}, notify: (text: string) => { notices.push(text); } } };
+	ctx.ui.custom = approvalUI((...args) => ctx.ui.select(...args));
 	const pi: any = {
 		on: (name: string, handler: Function) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
 		registerTool: (value: any) => { tool = value; },
@@ -123,10 +125,37 @@ test("容器实施确认固定本地镜像 ID 和只读输入，返回对象不�
 	grant.container!.image = `sha256:${"b".repeat(64)}`;
 	assert.deepEqual((await h.readImplementation()).container, expected);
 	const proposal = h.entries(PROPOSAL_ENTRY).at(-1)!;
-	const rendered = h.renderers.get(PROPOSAL_ENTRY)!(proposal).render(10000).join("\n");
+	const rendered = h.renderers.get(PROPOSAL_ENTRY)!(proposal, { expanded: true }).render(10000).join("\n");
 	assert.match(rendered, /额外只读输入/);
 	assert.match(rendered, /容器 \/bin\/sh，不继承宿主 Shell/);
 	assert.ok(fake.audit().every((row) => row.command === "image"));
+});
+
+test("批准摘要保留目录权限，详情含完整正文、固定命令、输入和原方案，冻结记录不被截断", async (t) => {
+	const h = await host();
+	await installFakeDocker(t, h.cwd, "normal");
+	await h.run(design);
+	const body = "计划修改四个文件。\n" + "步骤与停止条件。\n".repeat(100) + "最后一项决策";
+	let inspected = false;
+	h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
+		const panel = await factory(...args);
+		assert.match(panel.body, /工具实际可写范围（文件或目录）：\n• src\n• test/);
+		assert.ok(!panel.body.includes(h.cwd + "/src"));
+		assert.ok(!panel.body.includes("最后一项决策"));
+		assert.ok(panel.detail.includes(body));
+		assert.ok(panel.detail.includes(design.body));
+		assert.ok(panel.detail.includes("node --check src/index.js"));
+		assert.ok(panel.detail.includes(`sha256:${"a".repeat(64)}`));
+		assert.match(panel.detail, /额外只读输入：\n• package.json/);
+		inspected = true;
+		return panel;
+	}, options);
+	await h.run({ ...implementation, body, container: { image: "fixture:local", inputs: ["package.json"] } });
+	assert.equal(inspected, true);
+	assert.equal((await h.readImplementation()).implementationBody, body);
+	const proposal = h.entries(PROPOSAL_ENTRY).at(-1)!;
+	const folded = h.renderers.get(PROPOSAL_ENTRY)!(proposal, { expanded: false }).render(100).join("\n");
+	assert.ok(!folded.includes(body) && !folded.includes("sha256:"));
 });
 
 for (const boundary of ["documents", "design", "outside"]) test(`容器授权 ${boundary} 在访问 Docker 前拒绝`, async (t) => {
@@ -227,7 +256,7 @@ for (const timing of ["before-request", "during-confirmation"]) {
 			await writeFile(h.sm.getSessionFile()!, rows.map((item) => JSON.stringify(item)).join("\n") + "\n");
 		};
 		if (timing === "before-request") await tamper();
-		else h.ctx.ui.select = async (_title: string, choices: string[]) => { await tamper(); return choices[1]; };
+		else h.ctx.ui.select = async (_title: string, choices: string[]) => { await tamper(); return choices[0]; };
 		await assert.rejects(h.run(implementation), /方案批准记录已变化/);
 		await assert.rejects(h.readImplementation(), /本轮没有/);
 		assert.equal(h.entries(APPROVAL_ENTRY).length, 1);
@@ -291,7 +320,7 @@ test("模拟 TUI 的三项授权分别确认并保存原生正文，命令不执
 		assert.match(result.content[0].text, request.stage === "documents" ? /每次写入仍须核验本轮授权、路径和父 writer/ : /不扩大操作范围|不开放宿主 Shell/);
 	}
 	assert.equal(h.displayed.length, 3);
-	assert.ok(h.displayed.every((dialog) => dialog.options[0] === "暂不批准"));
+	assert.ok(h.displayed.every((dialog) => dialog.options[1] === "暂不批准"));
 	const rows = await h.disk();
 	const proposals = rows.filter((entry) => entry.customType === PROPOSAL_ENTRY);
 	const approvals = rows.filter((entry) => entry.customType === APPROVAL_ENTRY);
@@ -302,11 +331,11 @@ test("模拟 TUI 的三项授权分别确认并保存原生正文，命令不执
 	assert.deepEqual(proposals[2].data.validationCommands, implementation.validationCommands);
 	assert.equal(proposals[2].data.designApprovalId, approvals[1].data.id);
 	assert.equal(approvals[2].data.proposalId, proposals[2].data.id);
-	assert.deepEqual(approvals[2].data.source, { mode: "tui", interaction: "select", toolCallId: "fixture-request" });
-	const rendered = h.renderers.get(PROPOSAL_ENTRY)!(proposals[2]).render(80).join("\n");
+	assert.deepEqual(approvals[2].data.source, { mode: "tui", interaction: "custom", toolCallId: "fixture-request" });
+	const rendered = h.renderers.get(PROPOSAL_ENTRY)!(proposals[2], { expanded: true }).render(80).join("\n");
 	assert.match(rendered, /node --check/);
-	assert.match(rendered, /宿主 Shell 关闭，不自动恢复旧权限/);
-	assert.ok(h.notices.some((text) => text.includes(design.body)), "实施确认重新展示已批准方案");
+	assert.match(rendered, /工具实际可写范围/);
+	assert.equal(h.notices.length, 0, "不在主对话重复刷出原方案全文；原文在批准框详情中展示");
 });
 
 for (const event of ["session_start", "session_shutdown", "session_tree"]) {
@@ -330,7 +359,7 @@ test("新的文档请求立即取消旧执行信号，取消确认也不恢复�
 	await h.run(documents);
 	assert.equal(old.signal.aborted, true);
 	await assert.rejects(h.readDocuments(), /本轮没有/);
-	h.ctx.ui.select = async (_title: string, choices: string[]) => choices[1];
+	h.ctx.ui.select = async (_title: string, choices: string[]) => choices[0];
 	await h.run(documents);
 	const next = await h.readDocuments();
 	assert.notEqual(next.signal, old.signal);
@@ -392,7 +421,7 @@ for (const choice of [undefined, "暂不批准", "Yes", "已批准"]) {
 test("确认返回同时被取消时不能记录批准", async () => {
 	const h = await host();
 	const abort = new AbortController();
-	h.ctx.ui.select = async (_title: string, choices: string[]) => { abort.abort(new Error("fixture cancelled")); return choices[1]; };
+	h.ctx.ui.select = async (_title: string, choices: string[]) => { abort.abort(new Error("fixture cancelled")); return choices[0]; };
 	await assert.rejects(h.run(design, abort.signal), /fixture cancelled/);
 	assert.equal(h.entries(APPROVAL_ENTRY).length, 0);
 });
@@ -401,7 +430,7 @@ for (const name of ["session_start", "session_shutdown", "session_tree"]) {
 	test(`${name} 使待确认请求和本轮方案引用失效`, async () => {
 		const h = await host();
 		await h.run();
-		h.ctx.ui.select = async (_title: string, choices: string[]) => { await h.event(name); return choices[1]; };
+		h.ctx.ui.select = async (_title: string, choices: string[]) => { await h.event(name); return choices[0]; };
 		await assert.rejects(h.run(implementation), /请求已失效/);
 		await assert.rejects(h.run(implementation), /尚无可信方案确认/);
 		assert.equal(h.entries(APPROVAL_ENTRY).length, 1);
@@ -435,7 +464,7 @@ for (const failure of ["proposal", "approval"]) {
 		const file = h.sm.getSessionFile()!;
 		t.after(() => chmod(file, 0o600));
 		if (failure === "proposal") await chmod(file, 0o400);
-		else h.ctx.ui.select = async (_title: string, choices: string[]) => { await chmod(file, 0o400); return choices[1]; };
+		else h.ctx.ui.select = async (_title: string, choices: string[]) => { await chmod(file, 0o400); return choices[0]; };
 		await assert.rejects(h.run(), /EACCES|EPERM/);
 		assert.equal((await h.disk()).filter((entry) => entry.customType === APPROVAL_ENTRY).length, 0);
 		if (failure === "approval") assert.equal(h.entries(APPROVAL_ENTRY).length, 1, "写失败后原生内存残留不是成功证据");
@@ -478,7 +507,7 @@ for (const timing of ["after-design", "during-confirmation"]) {
 			await tamper();
 			await assert.rejects(h.run(implementation), /变化|不一致/);
 		} else {
-			h.ctx.ui.select = async (_title: string, choices: string[]) => { await tamper(); return choices[1]; };
+			h.ctx.ui.select = async (_title: string, choices: string[]) => { await tamper(); return choices[0]; };
 			await assert.rejects(h.run(), /变化|不一致/);
 		}
 	});
@@ -491,7 +520,7 @@ test("等待实施确认期间方案批准来源变化时不能新增实施批�
 		const rows = await h.disk();
 		rows.find((entry) => entry.customType === APPROVAL_ENTRY).data.source.mode = "rpc";
 		await writeFile(h.sm.getSessionFile()!, rows.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
-		return choices[1];
+		return choices[0];
 	};
 	await assert.rejects(h.run(implementation), /批准记录已变化/);
 	assert.equal(h.entries(APPROVAL_ENTRY).length, 1);
@@ -507,7 +536,7 @@ test("文档确认期间同时替换内存与磁盘正文，不能沿用原选�
 		const rows = await h.disk();
 		rows.find((row) => row.id === entry.id).data = entry.data;
 		await writeFile(h.sm.getSessionFile()!, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
-		return choices[1];
+		return choices[0];
 	};
 	await assert.rejects(h.run(documents), /变化|不一致/);
 	assert.equal(h.entries(APPROVAL_ENTRY).length, 0);
@@ -529,7 +558,7 @@ test("确认期间换到同 ID 的另一个 Session 文件时，不追加批准"
 		const other = path.join(h.cwd, "copied-session.jsonl");
 		await copyFile(h.sm.getSessionFile()!, other);
 		h.ctx.sessionManager = SessionManager.open(other);
-		return choices[1];
+		return choices[0];
 	};
 	await assert.rejects(h.run(documents));
 	assert.equal(h.entries(APPROVAL_ENTRY).length, 0);
@@ -587,7 +616,7 @@ for (const failure of ["declined", "cancelled", "write-error"]) {
 		} else h.ctx.ui.select = async (_title: string, choices: string[]) => {
 			await assert.rejects(h.readDocuments(), /本轮没有/);
 			if (failure === "cancelled") abort.abort(new Error("fixture cancelled"));
-			return failure === "declined" ? undefined : choices[1];
+			return failure === "declined" ? undefined : choices[0];
 		};
 		if (failure === "declined") assert.equal((await h.run(documents)).details.approved, false);
 		else await assert.rejects(h.run(documents, abort.signal), /fixture cancelled|EACCES|EPERM/);

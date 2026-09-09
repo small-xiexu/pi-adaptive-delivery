@@ -8,6 +8,7 @@ import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-work
 import { Type, type Static } from "typebox";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
 import { resolveContainerImage } from "./container.ts";
+import { DeliveryPanel, displayText } from "./ui.ts";
 
 export const APPROVAL_TOOL = "delivery_approval";
 export const PROPOSAL_ENTRY = "delivery-approval-proposal";
@@ -15,7 +16,7 @@ export const APPROVAL_ENTRY = "delivery-approval";
 
 const parameters = Type.Object({
 	stage: StringEnum(["documents", "design", "implementation"] as const),
-	body: Type.String({ minLength: 1, description: "本阶段待确认的决策正文，不以文件路径或摘要 ID 代替。documents 说明文档编辑用途与边界；design 说明目标、范围、关键设计及验收方向；implementation 说明步骤、依赖、验证、操作范围与停止条件。实施时工具会重新展示原方案，无须重复抄写；不复制全文台账。" }),
+	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用简短分行说明，不复制全文台账。documents 按相对路径逐行说明用途；design 说明目标、范围、关键风险和验收方向；implementation 说明计划修改的文件、步骤、环境、验收和停止条件，并区分计划文件与工具实际可写目录。工具提供原方案查看入口，无须重复抄写；不以路径或摘要 ID 代替决策内容。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "documents 为确切 Markdown 路径；design 为空；implementation 为允许修改的文件或目录。路径按 cwd 解析，不是 glob。" }),
 	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
 	container: Type.Optional(Type.Object({
@@ -42,7 +43,7 @@ interface Approval {
 	proposalId: string;
 	sessionId: string;
 	workspaceKey: string;
-	source: { mode: "tui"; interaction: "select"; toolCallId: string };
+	source: { mode: "tui"; interaction: "custom"; toolCallId: string };
 }
 interface Confirmed {
 	approval: Approval;
@@ -52,18 +53,23 @@ interface Confirmed {
 }
 
 const titles = { documents: "规划文档编辑授权", design: "方案确认", implementation: "实施确认" };
+const actions = { documents: "授权文档编辑", design: "确认方案", implementation: "确认实施" };
 const permissions = {
 	documents: "仅授权列明的 Markdown 文档编辑，不包含源码修改或实施批准。",
 	design: "只确认方案；已有文档授权范围内可编制计划，不包含实施批准。",
 	implementation: "仅授权列明范围内的本地开发、自检、验证、审查与返工。提交、推送、PR、发布、部署、生产及其他外部写入不在本次授权内。",
 };
 
-function presentation(proposal: Proposal): string {
-	return `${titles[proposal.stage]} [${proposal.id}]\n工作目录：${JSON.stringify(proposal.cwd)}\n\n${proposal.body}\n\n`
-		+ `操作边界：${permissions[proposal.stage]}\n路径：${JSON.stringify(proposal.paths)}\n验收命令：${JSON.stringify(proposal.validationCommands)}`
-		+ (proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : "")
-		+ (proposal.container ? `\n外部隔离：本地 Docker；固定镜像 ${proposal.container.image}\n额外只读输入：${JSON.stringify(proposal.container.inputs)}\n可写挂载沿用批准路径；仅挂现有目标，禁止网络/凭据/提权，使用容器 /bin/sh，不继承宿主 Shell。` : "\n本次不授权容器命令。")
-		+ "\n文档授权用于父 Markdown 工具；实施授权用于受控子开发、固定验收和独立审查，仍须核实文档边界、候选和 writer 交接。宿主 Shell 关闭，不自动恢复旧权限。";
+function presentation(proposal: Proposal, expanded = false): string {
+	const relative = (file: string) => path.relative(proposal.cwd, file) || ".";
+	const body = expanded || proposal.body.length <= 600 ? proposal.body : `${proposal.body.slice(0, 600)}\n…完整正文见详情`;
+	return `${titles[proposal.stage]}\n工作目录：${proposal.cwd}\n\n${body}\n\n${permissions[proposal.stage]}`
+		+ (proposal.paths.length ? `\n\n${proposal.stage === "documents" ? "可编辑文档" : "工具实际可写范围（文件或目录）"}：\n${proposal.paths.map((file) => `• ${relative(file)}`).join("\n")}` : "")
+		+ (proposal.container ? `\n\n运行环境：本地 Docker · 禁网 · 1 GiB · 每命令最多 300 秒`
+			+ (expanded ? `\n固定镜像：${proposal.container.image}\n额外只读输入：\n${proposal.container.inputs.map((file) => `• ${relative(file)}`).join("\n") || "无"}\n容器 /bin/sh，不继承宿主 Shell；可写挂载沿用上述范围。` : `\n${proposal.container.inputs.length} 项只读输入，${proposal.validationCommands.length} 条固定验收命令（详情可核对）`)
+			: proposal.stage === "implementation" ? "\n本次不授权容器命令。" : "")
+		+ (expanded && proposal.validationCommands.length ? `\n\n固定验收命令：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n\n")}` : "")
+		+ (expanded ? `\n\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}` : "");
 }
 
 // 只读取 Pi 的原生文件。内存条目即使可见，也不能证明 appendEntry 已经落盘。
@@ -115,7 +121,8 @@ export function installApprovals(pi: ExtensionAPI) {
 	pi.on("session_start", invalidate);
 	pi.on("session_shutdown", invalidate);
 	pi.on("session_tree", invalidate);
-	pi.registerEntryRenderer<Proposal>(PROPOSAL_ENTRY, (entry) => new Text(presentation(entry.data!), 0, 0));
+	pi.registerEntryRenderer<Proposal>(PROPOSAL_ENTRY, (entry, { expanded }) => new Text(displayText(expanded ? presentation(entry.data!, true)
+		: `${titles[entry.data!.stage]} · ${entry.data!.paths.length ? `${entry.data!.paths.length} 项路径 · ` : ""}Ctrl+O 查看完整提案`), 0, 0));
 	pi.registerTool({
 		name: APPROVAL_TOOL, label: "请求交付批准",
 		description: "在父 Pi 的真实 TUI 中请求规划文档编辑授权、方案确认或实施确认。只在用户已准备确认时调用；两次阶段确认分开。模型提供的字段不是批准，RPC/JSON/print 不接受批准。实施可明确申请本地 Docker 镜像与只读输入，不授予宿主 Shell。",
@@ -168,14 +175,20 @@ export function installApprovals(pi: ExtensionAPI) {
 					}
 				};
 				current();
-				// 实施确认重新展示已批准的方案正文；不用活动文档内容替换原批准依据。
-				if (approvedDesign) ctx.ui.notify(presentation(approvedDesign), "info");
 				pi.appendEntry(PROPOSAL_ENTRY, structuredClone(proposal));
 				const [displayed] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]);
 				if (!isDeepStrictEqual(displayed.data, proposal)) throw new Error("展示正文与持久记录不一致");
 				current();
-				const accept = `确认${titles[request.stage]}`;
-				const choice = await ctx.ui.select(`${titles[request.stage]} [${proposal.id}]`, ["暂不批准", accept], { signal: operation });
+				const accept = actions[request.stage];
+				const choice = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) => {
+					const cancel = () => done(undefined);
+					operation.addEventListener("abort", cancel, { once: true });
+					if (operation.aborted) cancel();
+					const panel = new DeliveryPanel(titles[request.stage], presentation(proposal),
+						presentation(proposal, true) + (approvedDesign ? `\n\n已确认的方案原文：\n${presentation(approvedDesign, true)}` : ""),
+						[accept, "暂不批准"], tui, theme, done, 1);
+					return Object.assign(panel, { dispose: () => operation.removeEventListener("abort", cancel) });
+				}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "90%", anchor: "center" } });
 				current();
 				if (choice !== accept) return { content: [{ type: "text", text: "本次未批准，权限未扩大；暂停推进，不自动重复请求批准。" }], details: { approved: false }, terminate: true };
 				// 用户等待期间正文可能被外部改动；确认的是刚才展示的正文，不是后来替换的文件。
@@ -187,7 +200,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				}
 				current();
 				const approval: Approval = { id: randomUUID(), proposalId: proposal.id, sessionId, workspaceKey: workspace.key,
-					source: { mode: "tui", interaction: "select", toolCallId } };
+					source: { mode: "tui", interaction: "custom", toolCallId } };
 				pi.appendEntry(APPROVAL_ENTRY, structuredClone(approval));
 				const [saved] = await persisted<Approval>(ctx, [APPROVAL_ENTRY, approval.id]);
 				if (!isDeepStrictEqual(saved.data, approval)) throw new Error("确认记录与持久记录不一致");

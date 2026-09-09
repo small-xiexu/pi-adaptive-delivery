@@ -52,11 +52,11 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 			}
 			const running = (await rpc.send("get_entries")).data.entries.findLast((row: any) => row.customType === "delivery-delegation")?.data;
 			const statusCursor = rpc.records.length;
-			await rpc.send("prompt", { message: "/delivery-status" });
+			await rpc.send("prompt", { message: "/delivery-status details" });
 			const status = rpc.records.slice(statusCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify");
 			assert.ok(status?.message.includes(running.sessionFile));
 			assert.ok(status?.message.includes(running.id));
-			assert.match(status?.message, /只读.*运行中/);
+			assert.match(status?.message, /运行中.*只读/);
 			await rpc.send("follow_up", { message: "fixture-must-not-resume" });
 			const cleared = await rpc.send("clear_queue");
 			assert.match(JSON.stringify(cleared), /fixture-must-not-resume/);

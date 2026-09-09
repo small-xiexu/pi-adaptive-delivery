@@ -49,6 +49,7 @@ if (process.argv[2] === "--config" && process.argv[4] === "--host") {
 			state.state.Status = running ? "running" : "exited";
 			state.state.Running = running;
 			state.state.Pid = running ? 123 : 0;
+			if (scenario === "oom") { state.state.OOMKilled = true; state.state.ExitCode = 137; }
 			save(state);
 			console.log(state.id);
 		} else if (command === "wait") {
@@ -58,7 +59,7 @@ if (process.argv[2] === "--config" && process.argv[4] === "--host") {
 			console.log("0");
 		} else if (command === "logs") {
 			if (scenario === "logs-error") fail("fixture log client failed");
-			console.log(scenario === "structured-output" ? "A".repeat(100_000) + "OUTPUT_TAIL" : "fixture output");
+			console.log(["structured-output", "oom"].includes(scenario) ? "A".repeat(100_000) + "OUTPUT_TAIL 中文" : "fixture output");
 		} else if (command === "rm") {
 			if (scenario === "remove-error") fail("fixture remove failed");
 			console.log(state.id);

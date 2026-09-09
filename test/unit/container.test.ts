@@ -4,6 +4,7 @@ import { link, mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "no
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { containerMounts, createContainerOperations, resolveContainerImage } from "../../extensions/delivery-gate/src/container.ts";
 import { resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
 import { installFakeDocker } from "../support/fake-docker.ts";
@@ -118,6 +119,37 @@ test("模型提出的镜像名不能成为 Docker 全局选项", async (t) => {
 		await resolveContainerImage(image, h.cwd);
 		assert.deepEqual(fake.audit().at(-1).args.slice(-2), ["--", image]);
 	}
+});
+
+test("原生 Bash 的 OOM 错误保留真实退出、清理和有界输出，不变成成功结果", async (t) => {
+	const h = await host();
+	await installFakeDocker(t, h.root, "oom");
+	const runner = createContainerOperations({ ...h.scope, image: `sha256:${"a".repeat(64)}`, beforeCreate: async () => {} });
+	const bash = createBashTool(h.cwd, { operations: runner.operations, exposeSessionEnvironment: false });
+	await assert.rejects(bash.execute("oom", { command: "true" }), (error: Error) => {
+		assert.match(error.message, /OOMKilled/);
+		assert.match(error.message, /退出码：137；容器清理：已确认；时限：300 秒/);
+		assert.match(error.message, /仅末尾 8000 字符/);
+		assert.match(error.message, /OUTPUT_TAIL 中文/);
+		assert.ok(error.message.length < 9000);
+		return true;
+	});
+	assert.equal(runner.lastExecution?.status, "failed");
+});
+
+test("超时保留部分输出和实际终态，清理后可以执行下一条命令", async (t) => {
+	const h = await host();
+	const fake = await installFakeDocker(t, h.root, "structured-wait");
+	const runner = createContainerOperations({ ...h.scope, image: `sha256:${"a".repeat(64)}`, beforeCreate: async () => {} });
+	await assert.rejects(runner.operations.exec("true", h.cwd, { timeout: 0.05, onData() {} }), (error: Error) => {
+		assert.match(error.message, /timeout:0.05/);
+		assert.match(error.message, /执行状态：timeout；退出码：143；容器清理：已确认/);
+		assert.match(error.message, /fixture output/);
+		return true;
+	});
+	assert.equal(runner.cleanupFailed, false);
+	await writeFile(path.join(fake.bin, "scenario"), "normal");
+	assert.equal((await runner.operations.exec("true", h.cwd, { onData() {} })).exitCode, 0);
 });
 
 for (const scenario of ["normal", "start-error", "logs-error", "output-error"]) test(`Docker ${scenario} 等待全部客户端关闭后才返回，无宿主环境透传`, async (t) => {

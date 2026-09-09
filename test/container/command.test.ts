@@ -9,6 +9,8 @@ import { createBashTool, type CustomEntry } from "@earendil-works/pi-coding-agen
 import { createContainerOperations, resolveContainerImage, type ContainerReference } from "../../extensions/delivery-gate/src/container.ts";
 import { resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createDevelopmentHost } from "../support/development-host.ts";
+import { plainTheme } from "../support/delivery-ui.ts";
+import type { DeliveryPanel } from "../../extensions/delivery-gate/src/ui.ts";
 
 if (process.env.PI_ADAPTIVE_CONTAINER_TESTS !== "1") throw new Error("真实容器测试须显式使用 run-tests.ts --containers；不静默跳过或放宽默认禁网");
 
@@ -82,6 +84,20 @@ test("普通命令失败保留真实退出码和部分产物，清理后可再�
 	assert.equal(await readFile(path.join(h.cwd, "src/partial.txt"), "utf8"), "repaired");
 });
 
+test("真实容器 OOM 的原生错误包含 137、输出和已确认清理", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, `console.log("OOM_PROBE_STARTED");
+console.log("memory.max=" + require("node:fs").readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
+const held=[]; setInterval(() => held.push(Buffer.alloc(16*1024*1024,1)), 10);`);
+	await assert.rejects(h.run(), (error: Error) => {
+		assert.match(error.message, /OOMKilled/);
+		assert.match(error.message, /退出码：137；容器清理：已确认/);
+		assert.match(error.message, /OOM_PROBE_STARTED/);
+		assert.match(error.message, /memory.max=1073741824/);
+		return true;
+	});
+	assert.equal(h.runner.lastExecution?.status, "failed");
+});
+
 for (const kind of ["cancel", "timeout", "background"]) test(`真实容器 ${kind} 收尾后，脱离 stdio 的后代不能继续写入`, { timeout: 40_000 }, async (t) => {
 	const worker = 'setInterval(() => require("node:fs").appendFileSync("src/ticks.txt", "tick\\n"), 30)';
 	const h = await host(t, `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(worker)}], { detached: true, stdio: "ignore" });
@@ -132,6 +148,42 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 	});
 	return { ...h, children };
 }
+
+test("真实 Pi 子命令运行中查看详情，Esc 关闭后继续完成，结束仍可读原始结果", { timeout: 40_000 }, async (t) => {
+	const h = await developmentHost(t, "details", `require("node:fs").writeFileSync("src/ready.txt", "ready");
+console.log("DETAIL_COMMAND_RUNNING"); setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 5000);`);
+	let panel: DeliveryPanel | undefined;
+	h.setCustom((async (factory: any) => {
+		let done!: () => void;
+		const closed = new Promise<void>((resolve) => { done = resolve; });
+		const component = await factory({ terminal: { rows: 32 }, requestRender() {} }, plainTheme, {}, done);
+		panel = component;
+		try { await closed; } finally { component.dispose?.(); panel = undefined; }
+	}) as any);
+	const until = async (condition: () => Promise<boolean> | boolean) => {
+		const deadline = Date.now() + 15_000;
+		while (!await condition()) { assert.ok(Date.now() < deadline, "未取得详情或实际执行证据"); await setTimeout(20); }
+	};
+	let ended = false;
+	const run = h.call("delivery_develop", { task: "创建、编辑文件并执行命令，详情不控制任务。" }).finally(() => { ended = true; });
+	await until(() => readFile(path.join(h.cwd, "src/ready.txt")).then(() => true, (error) => { if (error.code === "ENOENT") return false; throw error; }));
+	const ref = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-development") as CustomEntry<{ id: string }>;
+	assert.ok(ref);
+	const showing = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
+	await until(() => Boolean(panel?.body.includes("DETAIL_COMMAND_RUNNING")));
+	assert.equal(ended, false);
+	panel!.handleInput("\x1b");
+	await showing;
+	assert.equal(ended, false, "关闭详情不能终止在途子命令");
+	const result = await run;
+	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.equal(await h.readLease(), undefined);
+	const finished = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
+	await until(() => Boolean(panel?.body.includes("父工具结果") && panel.body.includes("DETAIL_COMMAND_FINISHED")));
+	assert.ok(panel!.body.includes("调用 bash"));
+	panel!.handleInput("\x1b");
+	await finished;
+});
 
 test("开发初始读取失败后写入与真实自检成功，父沿失败结果取证并继续固定验收", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "read-before-write", `const assert = require("node:assert/strict");

@@ -11,6 +11,7 @@ import { CHILD_ARM, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL, createChildD
 import { createTaskProgress, taskRenderers } from "./src/progress.ts";
 import { createStructuredCommands, structuredPackage, STRUCTURED_TOOLS, STRUCTURED_READ_IMAGE, type ExecInput, type StdinInput } from "./src/structured.ts";
 import { resolveContainerImage } from "./src/container.ts";
+import { installTaskDetails } from "./src/task-details.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	const entryPath = fileURLToPath(import.meta.url);
@@ -145,7 +146,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 				parameters: createEditTool(".").parameters, execute: (id, input, signal) => childDevelopment.execute("edit", id, input, signal) });
 			pi.registerTool({ name: "write", label: "开发文件写入", description: "在已交接的子 writer 范围内创建或完整重写文件，禁止修改父规划文档。",
 				parameters: createWriteTool(".").parameters, execute: (id, input, signal) => childDevelopment.execute("write", id, input, signal) });
-			pi.registerTool({ name: "bash", label: "容器命令", description: "仅在已批准的本地 Docker 镜像和明确挂载范围内执行 /bin/sh 命令。容器内 /workspace 对应 worktree，宿主路径和 Shell 配置不可用。不访问网络、凭据、规划文档或 Docker socket；未批准容器时拒绝，不回退宿主 Bash。timeout 最多 300 秒。",
+			pi.registerTool({ name: "bash", label: "容器命令", description: "仅在已批准的本地 Docker 镜像和明确挂载范围内执行 /bin/sh 命令。容器内 /workspace 对应 worktree，宿主路径和 Shell 配置不可用。不访问网络、凭据、规划文档或 Docker socket；未批准容器时拒绝，不回退宿主 Bash。内存 1 GiB；timeout 默认及上限均为 300 秒，测试耗时未知时省略 timeout，不随意缩短为 60 秒。",
 				parameters: createBashTool(".").parameters, execute: (id, input, signal, update) => childDevelopment.execute("bash", id, input, signal, update) });
 		}
 		pi.on("session_shutdown", async (_event, ctx) => {
@@ -158,6 +159,9 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	const approvals = installApprovals(pi);
 	const writer = createParentDocumentWriter(pi, approvals);
 	const developer = createDevelopmentDelegator(pi, approvals);
+	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
+	const tasks = () => [...active.values()].map((item) => item.progress.snapshot()).concat(developer.progress ? [developer.progress] : []);
+	const openTask = installTaskDetails(pi, tasks);
 	pi.registerTool({ name: GIT_STATUS_TOOL, label: "Git 现状",
 		description: "固定只读查询当前 worktree 的分支、HEAD、暂存/未暂存及未跟踪改动，路径按 JSON 转义。无 HEAD 或 detached 明确返回 null。最多读取 50 KiB，超限报错，不隐藏改动；没有命令或路径参数，不获取源码差异、不产生批准。",
 		parameters: Type.Object({}, { additionalProperties: false }),
@@ -169,7 +173,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerTool({ name: REVIEW_TOOL, label: "独立候选审查",
-		...taskRenderers("审查"),
+		...taskRenderers("审查", openTask),
 		description: "在本轮可信固定验收和当前候选一致时，沿只读子路径独立审查批准目标、当前代码、实际差异及原始验收记录。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
 		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径、实际差异及验收记录，无须重述全部需求，不以实现者总结代替证据" }) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
@@ -181,7 +185,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerTool({ name: VALIDATION_TOOL, label: "固定候选验收",
-		...taskRenderers("验收"),
+		...taskRenderers("验收", openTask),
 		description: "用独立标准 Pi 子会话执行本轮已批准的固定容器验收命令，不能修改或替换命令。实际输入、源码、镜像与前后候选必须一致，全部真实命令通过才报告本次验收通过；不代替独立审查。缺少容器授权或命令时明确未运行。",
 		parameters: Type.Object({}, { additionalProperties: false }),
 		execute: async (id, _input, signal, update, ctx) => {
@@ -193,7 +197,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerTool({ name: DEVELOPMENT_TOOL, label: "开发文件委派",
-		...taskRenderers("开发"),
+		...taskRenderers("开发", openTask),
 		description: "将一次开发任务交给独立标准 Pi。要求本轮父 TUI 的方案、实施及规划文档授权；原生环境使用受控 edit/write，Structured 使用批准容器内的 apply_patch/exec_command/write_stdin。命令须在实施确认中明确批准容器镜像/输入，不能用宿主 Shell 或未知工具覆盖替代。子任务不能修改父规划文档，不递归委派；原生终态落盘后才交回 writer，结果仍需核实。",
 		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据；工具自动附带已批准方案、实施正文、路径及命令，无须再次抄写或复制完整父历史" }) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
@@ -216,10 +220,9 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		parameters: createWriteTool(".").parameters,
 		execute: (id, input, signal, _onUpdate, ctx) => writer.write(id, input, signal, ctx),
 	});
-	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
 	pi.registerTool({
 		name: DELEGATE_TOOL, label: "只读委派",
-		...taskRenderers("只读"),
+		...taskRenderers("只读", openTask),
 		description: "在独立标准 Pi 会话中执行一次只读分析。使用父已启用的原生 read/grep/find/ls，或已核实 Structured 的只读容器命令/图片读取；发送任务前核对工具定义、基础指令、规则和 Skills。子不可写入或继续委派，不复制父完整历史。结果最多 2000 行或 50KB，原始证据保留在子 Session。",
 		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "目标、必要背景、只读边界及预期证据；不要复制父完整历史" }) }),
 		execute: async (id, params, signal, onUpdate, ctx) => {
@@ -252,25 +255,29 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		if (results.some((result) => result.status === "rejected")) ctx.ui.notify("委派已停止；存在取消或失败，请核对原生会话记录。", "warning");
 	});
 	pi.registerCommand("delivery-status", {
-		description: "查看当前交付编排能力与工作区",
-		handler: async (_args, ctx) => {
+		description: "查看交付状态；details 显示诊断信息",
+		handler: async (args, ctx) => {
 			try {
 				const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 				const stateRoot = await getWriterStateRoot(workspace);
 				const lease = await new WriterLeaseManager(stateRoot).read(workspace.key);
-				const tasks = [...active.values()].map((item) => item.progress.snapshot());
-				if (developer.progress) tasks.push(developer.progress);
-				ctx.ui.notify(`${CAPABILITY_NOTICE}\n工作区：${workspace.workspacePath}\n当前已启用原生只读工具：${allowedReadTools(pi).join(", ") || "无"}`
-					+ (structured ? `\nStructured 3.0.29 工具：${pi.getActiveTools().filter(structuredAllowed).join(", ") || "未接管，请核对加载顺序"}；只读镜像 ${STRUCTURED_READ_IMAGE}。` : "\n当前未接管 Structured 工具。")
-					+ (readonlyCommands?.active ? `\n只读容器命令尚未交回：${readonlyCommands.lastExecution?.name ?? "正在准备"}` : "")
-					+ "\n仓库查找需要项目 defaultTools 显式启用 grep/find/ls；Git 分支和改动使用 delivery_git_status。"
-					+ `\n父文档 writer：${writer.pending ? "尚未完成终态交接，暂停新写入" : "本进程无当前文档执行"}\n开发/验收/审查：${developer.pending ? "尚未完成终态交接" : "本进程无当前执行"}`
-					+ (tasks.length ? tasks.map((task) => `\n任务 ${task.id}：${task.name} · ${task.status}\n${task.action}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("") : "\n本进程无当前只读子任务。")
-					+ (lease ? `\n现场 lease：${lease.leaseId}\n记录 owner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}`
-						+ `\n状态目录：${stateRoot}\n记录存在不等于进程仍在运行，也不证明已经停止；未核实原执行与工具终态前禁止替代写入，不自动解锁。`
-						: "\n现场未发现 lease 记录；不等于已取得授权，操作时仍核实批准和 lease。"), "info");
+				const running = tasks();
+				const native = allowedReadTools(pi);
+				const missing = ["grep", "find", "ls"].filter((name) => !native.includes(name));
+				const structuredTools = pi.getActiveTools().filter(structuredAllowed);
+				const structuredMode = Boolean(structured && structuredTools.includes("exec_command"));
+				ctx.ui.notify(`交付状态 · ${structuredMode ? "Structured" : "原生 Pi"}\n工作区：${workspace.workspacePath}`
+					+ `\n只读工具：${(structuredMode ? structuredTools : native).join(", ") || "无"}`
+					+ (running.length ? running.map((task) => `\n${task.status} · ${task.name}\n${task.action}`).join("") : "\n当前没有运行中的子任务。")
+					+ (writer.pending || developer.pending ? "\n文件操作尚在执行或收尾，请等待交回。" : "")
+					+ (readonlyCommands?.active ? "\n只读命令尚未交回，等待最终结果。" : "")
+					+ (lease && !writer.pending && !developer.pending ? "\n需要处理：现场有未交回的写入记录；核实原执行前暂停写入，不自动解锁。" : "")
+					+ (!structuredMode && missing.length ? `\n仓库查找缺少 ${missing.join("/")}；需要时在项目 defaultTools 中启用。` : "")
+					+ "\n/delivery-tasks 查看任务详情；/delivery-status details 查看诊断。"
+					+ (args.trim() === "details" ? `\n\n${CAPABILITY_NOTICE}\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
+						+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("") : ""), "info");
 			} catch (error) {
-				ctx.ui.notify(`${CAPABILITY_NOTICE}\n工作区未核实：${String(error)}`, "error");
+				ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");
 			}
 		},
 	});

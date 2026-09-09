@@ -8,6 +8,7 @@ import type { TestContext } from "node:test";
 import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createPiFixture, testEnvironment } from "./pi-fixture.ts";
+import { approvalUI } from "./delivery-ui.ts";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
@@ -33,7 +34,8 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 	initTheme("dark");
 	const notices: string[] = [];
 	const choices: string[] = [];
-	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[1]; };
+	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[0]; };
+	let custom = approvalUI((...args) => select(...args));
 	let confirm: ExtensionUIContext["confirm"] = async () => true;
 	let input: ExtensionUIContext["input"] = async () => "fixture-answer";
 	t.after(async () => {
@@ -46,6 +48,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 	});
 	await session.bindExtensions({ mode: "tui", abortHandler: () => { session.clearQueue(); void session.abort(); },
 		uiContext: { ...session.extensionRunner.getUIContext(), select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args),
+		custom: (...args: Parameters<ExtensionUIContext["custom"]>) => custom(...args),
 		confirm: (...args: Parameters<ExtensionUIContext["confirm"]>) => confirm(...args), input: (...args: Parameters<ExtensionUIContext["input"]>) => input(...args),
 		notify: (text: string) => { notices.push(text); } } as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
 	const model = modelRuntime.getModel("adaptive-fixture", "fake");
@@ -73,5 +76,6 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: process.pid, ui: "simulated", child: "standard-cli" }));
 	return { ...fixture, session, sm, api, notices, choices, call, approve, prepare, audit, readLease: () => leases.read(workspace.key),
 		setSelect: (value: typeof select) => { select = value; }, setConfirm: (value: typeof confirm) => { confirm = value; },
+		setCustom: (value: typeof custom) => { custom = value; },
 		setInput: (value: typeof input) => { input = value; } };
 }

@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, MouseRegion, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 export interface TaskProgress {
 	id: string;
@@ -92,7 +92,7 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 	};
 }
 
-export function taskRenderers(label: string): Pick<ToolDefinition, "renderCall" | "renderResult"> {
+export function taskRenderers(label: string, open?: (id: string) => void): Pick<ToolDefinition, "renderCall" | "renderResult"> {
 	return {
 		renderCall: () => new Container(),
 		renderResult(result, { expanded, isPartial }, theme, context) {
@@ -103,11 +103,12 @@ export function taskRenderers(label: string): Pick<ToolDefinition, "renderCall" 
 			const status = isPartial ? latest?.status ?? "准备中" : context.isError ? (latest?.status === "已取消" || latest?.status === "收尾未知" ? latest.status : "失败") : latest?.status ?? "执行结束，结果待核实";
 			const heading = `${status} · ${latest?.name ?? short(`${label} · ${(context.args as { task?: string })?.task ?? "固定候选验收"}`, 160)}`;
 			const detail = latest?.action ?? (isPartial ? "核对任务环境" : short(body));
-			return {
+			const component = {
 				invalidate() {},
-				render(width) {
+				render(width: number) {
 					const lines = [truncateToWidth(theme.fg(context.isError ? "error" : "toolTitle", heading), width), truncateToWidth(theme.fg("muted", detail), width)];
 					if (expanded) {
+						if (open) lines.push(...new Text("点击卡片或 /delivery-tasks 查看详情 · Esc 返回", 0, 0).render(width));
 						const elapsed = latest ? `耗时 ${Math.max(0, ((latest.endedAt ?? Date.now()) - latest.startedAt) / 1000).toFixed(1)} 秒` : "";
 						const more = [elapsed, ...(latest?.recent ?? []), latest?.output, latest?.sessionFile ? `原始子 Session：${latest.sessionFile}` : "", !isPartial ? tail(body) : ""].filter(Boolean).join("\n");
 						// Text 处理宽度；终端控制字符不能通过子输出注入界面。
@@ -116,6 +117,10 @@ export function taskRenderers(label: string): Pick<ToolDefinition, "renderCall" 
 					return lines;
 				},
 			};
+			return open ? new MouseRegion(component, (event) => {
+				if (event.type === "click" && event.button === "left") { open(context.toolCallId); return { handled: true }; }
+				return undefined;
+			}) : component;
 		},
 	};
 }

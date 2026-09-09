@@ -5,6 +5,7 @@ import { access, lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises"
 import os from "node:os";
 import { request as httpRequest } from "node:http";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import type { WorkspaceIdentity } from "./workspace.ts";
 
@@ -200,6 +201,14 @@ export function createContainerOperations(scope: ContainerScope) {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let timedOut = false;
 		let stop: (() => void) | undefined;
+		const decoder = new StringDecoder("utf8");
+		let output = "";
+		let truncated = false;
+		const capture = (chunk: Buffer) => {
+			output += decoder.write(chunk);
+			if (output.length > 8000) { output = output.slice(-8000); truncated = true; }
+			onData(chunk);
+		};
 		try {
 			let mounts: { source: string; target: string; readonly: boolean }[];
 			if (scope.readonlyWorkspace) {
@@ -246,7 +255,7 @@ export function createContainerOperations(scope: ContainerScope) {
 			execution.id = await cli.request(["create", "--pull", "never", "--name", execution.name, "--label", `${OWNER_LABEL}=${execution.name}`,
 				"--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", `${uid}:${gid}`,
 				"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=1", "--log-opt", "compress=false",
-				"--init", "--pids-limit", "128", "--memory", "512m", "--memory-swap", "512m", "--cpus", "2", "--no-healthcheck", "--restart", "no",
+				"--init", "--pids-limit", "128", "--memory", "1g", "--memory-swap", "1g", "--cpus", "2", "--no-healthcheck", "--restart", "no",
 				"--tmpfs", "/tmp:rw,nosuid,nodev,size=64m,mode=1777", "--env", "HOME=/tmp", "--workdir",
 				scope.hostPaths ? workdir : path.posix.join("/workspace", path.relative(scope.workspace.workspacePath, workdir).split(path.sep).join("/")),
 				...(input.tty ? ["--interactive", "--tty"] : []),
@@ -272,7 +281,7 @@ export function createContainerOperations(scope: ContainerScope) {
 				input.onStarted?.();
 				const clients = await Promise.allSettled([
 					cli.follow(["wait", execution.id], () => {}, (timeout + 20) * 1000),
-					cli.follow(["logs", "--follow", execution.id], onData, (timeout + 20) * 1000),
+					cli.follow(["logs", "--follow", execution.id], capture, (timeout + 20) * 1000),
 					...(attached ? [attached.closed] : []),
 				].map((client) => client.catch((error) => { stop!(); throw error; })));
 				const failures = clients.filter((client) => client.status === "rejected").map((client) => client.reason);
@@ -298,7 +307,9 @@ export function createContainerOperations(scope: ContainerScope) {
 			return { exitCode: execution.exitCode };
 		} catch (error) {
 			if (attempted && !execution.clean) cleanupFailed = true;
-			throw new Error(`隔离命令未成功 [${execution.name}]：${String(error)}`, { cause: error });
+			throw new Error(`隔离命令未成功 [${execution.name}]：${String(error)}\n`
+				+ `执行状态：${execution.status}；退出码：${execution.exitCode ?? "未取得"}；容器清理：${execution.clean ? "已确认" : "未确认"}；时限：${timeout} 秒\n`
+				+ `命令输出${truncated ? "（仅末尾 8000 字符）" : ""}：\n${output || "（未取得）"}`, { cause: error });
 		} finally {
 			clearTimeout(timer);
 			if (stop) signal?.removeEventListener("abort", stop);
