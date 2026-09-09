@@ -50,16 +50,17 @@ export class DeliveryPanel {
 	}
 	render(width: number) {
 		const body = new Text(displayText(this.expanded ? this.detail : this.body), 0, 0).render(width);
-		const footer = new Text(this.detail ? `Tab ${this.expanded ? "返回摘要" : "完整内容"} · PgUp/PgDn 滚动 · ↑↓ 选择 · Enter 确认 · Esc 返回`
+		const footer = new Text(this.detail ? `Tab ${this.expanded ? "摘要" : "详情"} · PgUp/PgDn 滚动 · ↑↓ 选择 · Enter 确认 · Esc 取消`
 			: "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭", 0, 0).render(width);
 		const options = this.select?.render(width) ?? [];
-		this.pageSize = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - footer.length - options.length - 3);
+		this.pageSize = Math.max(1, Math.min(body.length, this.expanded ? 12 : 8,
+			Math.floor(this.tui.terminal.rows * 0.55) - footer.length - options.length - 3));
 		this.total = body.length;
 		this.offset = Math.min(this.offset, Math.max(0, body.length - this.pageSize));
 		const page = body.slice(this.offset, this.offset + this.pageSize);
 		while (page.length < this.pageSize) page.push("");
-		const position = `${this.offset + 1}–${Math.min(body.length, this.offset + this.pageSize)} / ${body.length} 行`;
-		const lines = [truncateToWidth(this.theme.fg("accent", displayText(this.title)), width), ...page,
+		const position = body.length > this.pageSize ? `${this.offset + 1}–${Math.min(body.length, this.offset + this.pageSize)} / ${body.length} 行 · 可滚动查看` : "";
+		const lines = [truncateToWidth(this.theme.fg("accent", `─ ${displayText(this.title)} `) + this.theme.fg("border", "─".repeat(width)), width, ""), ...page,
 			truncateToWidth(this.theme.fg("muted", position), width)];
 		this.optionsRow = lines.length;
 		return [...lines, ...options, ...footer.map((line) => this.theme.fg("muted", line))];

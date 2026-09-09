@@ -21,6 +21,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	let dialogAsked = false;
 	let nextTool: ToolCall | undefined;
 	let developerSent = false;
+	let streamFailures = 0;
+	let streamError: { message: string; remaining: number; afterTools: number } | undefined;
 	const audit = (phase: string, details: Record<string, unknown> = {}) => appendFileSync(
 		path.join(process.env.PI_CODING_AGENT_DIR!, "fixture-events.jsonl"),
 		`${JSON.stringify({ pid: process.pid, child: isChild(), phase, scenario, ...details })}\n`,
@@ -119,6 +121,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	});
 	pi.registerCommand("fixture-next-tool", { description: "隔离测试：设置下一次 fake provider 工具调用",
 		handler: async (args) => { nextTool = JSON.parse(args); } });
+	pi.registerCommand("fixture-stream-error", { description: "隔离测试：注入模型断流，不调用网络",
+		handler: async (args) => { streamError = JSON.parse(args); } });
 	pi.registerCommand("fixture-hide-pi", {
 		description: "隔离测试：让后续委派找不到 Pi",
 		handler: async () => { process.env.PATH = "/usr/bin:/bin"; },
@@ -209,7 +213,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 						timeout: scenario.endsWith("validation-timeout") ? 1 : 10 }
 					: developmentChild ? developmentStep === 0 ? { path: target, content: "export const value = 1;\n" }
 					: developmentStep === 1 ? { path: target, edits: [{ oldText: "value = 1", newText: containerChild && JSON.stringify(user?.content).includes("fixture-container-repair") ? "value = 3" : "value = 2" }] }
-					: developmentStep === 2 && containerChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-container-timeout" ? 1 : 10 } : { path: target }
+					: developmentStep === 2 && containerChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-container-timeout" ? 1 : scenario === "development-container-details" ? 20 : 10 } : { path: target }
 					: toolName === "delivery_document_write" ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
 					: toolName === "delivery_document_edit" ? { path: "plan.md", edits: [{ oldText: "原文", newText: "禁止" }] }
 					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: stage === "design" ? [] : ["plan.md"], validationCommands: [] }
@@ -243,8 +247,19 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 				};
+				const childStreamError = isChild() && scenario.includes("stream-retry") && step === (containerChild ? 3 : 1)
+					&& (scenario.endsWith("exhausted") || streamFailures === 0);
+				if (!aborted && (childStreamError || streamError && streamError.remaining > 0 && step >= streamError.afterTools)) {
+					streamFailures++;
+					output.stopReason = "error";
+					output.errorMessage = childStreamError ? "stream_read_error" : streamError!.message;
+					if (!childStreamError) streamError!.remaining--;
+					output.content = [{ type: "text", text: "未完成的模型回复" }, { type: "toolCall", id: "incomplete-stream-call", name: "write", arguments: { path: "src/incomplete.txt", content: "不得执行" } }];
+					audit("stream-error", { errorMessage: output.errorMessage });
+				}
 				stream.push({ type: "start", partial: output });
-				if (aborted) stream.push({ type: "error", reason: "aborted", error: output });
+				if (output.stopReason === "error") stream.push({ type: "error", reason: "error", error: output });
+				else if (aborted) stream.push({ type: "error", reason: "aborted", error: output });
 				else stream.push({ type: "done", reason: finished ? "stop" : "toolUse", message: output });
 				stream.end();
 			});

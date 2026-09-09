@@ -22,7 +22,8 @@ test("两个调用及交错工具各自保留目标、真实终态，文本不�
 	a.event({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "隐藏推理" } });
 	assert.deepEqual(a.snapshot(), before);
 	a.event({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "已找到调用点" } });
-	assert.match(a.snapshot().action, /子任务说明：已找到调用点/);
+	assert.equal(a.snapshot().action, "正在整理任务说明");
+	assert.equal(a.snapshot().output, "已找到调用点");
 	a.event({ type: "extension_ui_request", method: "input", title: "选择业务范围" });
 	assert.equal(a.snapshot().status, "等待用户回答");
 	a.event({ type: "agent_settled" });
@@ -39,13 +40,30 @@ test("进度大量输出有界，通知错误不影响状态和真实结束", ()
 	for (let i = 0; i < 100; i++) {
 		p.event({ type: "tool_execution_start", toolCallId: String(i), toolName: "bash", args: { command: `echo ${i}` } });
 		p.event({ type: "tool_execution_update", partialResult: { content: [{ type: "text", text: "A".repeat(100_000) + "TAIL" }] } });
-		assert.match(p.snapshot().output, /^\[前文已截断\]/);
+		assert.match(p.snapshot().output, /^\[预览已省略，详情查看完整内容\]/);
 		assert.ok(p.snapshot().output.endsWith("TAIL"));
 		p.event({ type: "tool_execution_end", toolCallId: String(i), toolName: "bash", isError: false });
 	}
 	assert.equal(p.snapshot().recent.length, 16);
 	p.end("收尾未知");
 	assert.equal(p.snapshot().status, "收尾未知");
+});
+
+test("在途输出按调用关联，累计工具更新不重复追加，结束和取消清除临时正文", () => {
+	const p = createTaskProgress("a", "开发", "并行读取", () => {});
+	for (const id of ["one", "two"]) p.event({ type: "tool_execution_start", toolCallId: id, toolName: "read", args: { path: `${id}.ts` } });
+	const update = (id: string, text: string) => p.event({ type: "tool_execution_update", toolCallId: id, partialResult: { content: [{ type: "text", text }] } });
+	update("one", "A"); update("one", "AB"); update("two", "C");
+	assert.deepEqual(p.snapshot().pending?.map((entry) => [entry.callId, entry.output]), [["one", "AB"], ["two", "C"]]);
+	const copy = p.snapshot(); copy.pending![0]!.output = "污染";
+	assert.equal(p.snapshot().pending![0]!.output, "AB");
+	update("two", "X".repeat(200_000) + "TAIL");
+	assert.ok(p.snapshot().pending![1]!.output.length < 65_000);
+	assert.ok(p.snapshot().pending![1]!.output.endsWith("TAIL"));
+	p.event({ type: "tool_execution_end", toolCallId: "one", toolName: "read", isError: false });
+	assert.deepEqual(p.snapshot().pending?.map((entry) => entry.callId), ["two"]);
+	p.end("已取消");
+	assert.deepEqual(p.snapshot().pending, []);
 });
 
 test("Structured 工具返回 session_id 时仍显示真实命令，最终退出和取消不遗留运行状态", () => {

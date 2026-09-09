@@ -11,20 +11,24 @@ export interface TaskProgress {
 	startedAt: number;
 	endedAt?: number;
 	sessionFile?: string;
+	pending?: { id: string; name: string; callId?: string; args?: unknown; output: string }[];
 }
 export type ProgressUpdate = (message: string, progress: TaskProgress) => void;
 const short = (text: string, limit = 300) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, limit);
-const tail = (text: string) => text.length > 4000 ? `[前文已截断]\n${text.slice(-4000)}` : text;
+const tail = (text: string) => text.length > 4000 ? `[预览已省略，详情查看完整内容]\n${text.slice(-4000)}` : text;
+const streamingTail = (text: string) => text.length > 64_000 ? `[在途输出仅保留最近片段，完成后可查看原始结果]\n${text.slice(-64_000)}` : text;
 const outputText = (result: any) => (result?.content ?? []).filter((part: any) => part.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n");
 
 // 每个调用独立的展示缓存；证据与交接仍只使用原生 Session。
 export function createTaskProgress(id: string, label: string, task: string, update: ProgressUpdate) {
 	const view: TaskProgress = { id, name: short(`${label} · ${task}`, 160), status: "准备中", action: "核对任务环境", recent: [], output: "", startedAt: Date.now() };
 	const open = new Map<string, string>();
+	const pending = new Map<string, NonNullable<TaskProgress["pending"]>[number]>();
 	const commands = new Map<number, string>();
 	const polls = new Map<string, number>();
 	let text = "";
-	const snapshot = () => structuredClone(view);
+	let messageId: string | undefined;
+	const snapshot = (): TaskProgress => structuredClone({ ...view, pending: [...pending.values()] });
 	const emit = () => {
 		// UI 通知失败不改变工具结果、取消或权限裁决。
 		try { update(`${view.name} · ${view.status}\n${view.action}`, snapshot()); } catch { /* 展示可丢失，原始执行记录保留。 */ }
@@ -44,6 +48,7 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 		},
 		end(status: string) {
 			view.status = status; view.endedAt = Date.now();
+			pending.clear();
 			if (view.action.startsWith("正在执行：")) view.action = view.action.replace("正在执行：", "最后操作：");
 			emit();
 		},
@@ -55,11 +60,14 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 				const detail = commands.get(args.session_id) ?? short(`${event.toolName}${target ? ` ${target}` : ""}`);
 				if (event.toolName === "write_stdin") polls.set(event.toolCallId, args.session_id);
 				open.set(event.toolCallId, detail);
+				pending.set(`call:${event.toolCallId}`, { id: `call:${event.toolCallId}`, callId: event.toolCallId, name: event.toolName, args, output: "" });
+				view.output = "";
 				view.status = "执行中";
 				action(`正在执行：${detail}`);
 			} else if (event.type === "tool_execution_end") {
 				const detail = open.get(event.toolCallId) ?? event.toolName;
 				open.delete(event.toolCallId);
+				pending.delete(`call:${event.toolCallId}`);
 				const session = event.result?.details?.session_id;
 				const running = !event.isError && ["exec_command", "write_stdin"].includes(event.toolName) && typeof session === "number";
 				if (running) commands.set(session, detail);
@@ -72,15 +80,22 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 				view.output = tail(outputText(event.result));
 			} else if (event.type === "tool_execution_update") {
 				view.output = tail(outputText(event.partialResult));
+				const entry = pending.get(`call:${event.toolCallId}`);
+				if (entry) entry.output = streamingTail(outputText(event.partialResult));
 			} else if (event.type === "message_start" && event.message?.role === "assistant") {
 				text = "";
+				if (messageId) pending.delete(messageId);
+				messageId = `text:${event.message.timestamp}`;
 			} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-				text = tail(text + event.assistantMessageEvent.delta);
-				view.output = text;
-				if (!open.size && !commands.size) view.action = `子任务说明：${short(text, 280)}`;
+				text = streamingTail(text + event.assistantMessageEvent.delta);
+				view.output = tail(text);
+				if (messageId) pending.set(messageId, { id: messageId, name: "子任务说明", output: text });
+				if (!open.size && !commands.size) view.action = "正在整理任务说明";
 			} else if (event.type === "message_end" && event.message?.role === "assistant") {
+				if (messageId) pending.delete(messageId);
+				messageId = undefined;
 				text = tail(outputText(event.message));
-				if (text) { view.output = text; if (!open.size && !commands.size) view.action = `子任务说明：${short(text, 280)}`; }
+				if (text) { view.output = text; if (!open.size && !commands.size) view.action = "已更新任务说明"; }
 			} else if (event.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(event.method)) {
 				view.status = "等待用户回答";
 				action(event.title ?? event.message ?? "子任务请求交互");
@@ -101,7 +116,7 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			const latest = (progress ?? context.state.progress) as TaskProgress | undefined;
 			const body = outputText(result);
 			const status = isPartial ? latest?.status ?? "准备中" : context.isError ? (latest?.status === "已取消" || latest?.status === "收尾未知" ? latest.status : "失败") : latest?.status ?? "执行结束，结果待核实";
-			const heading = `${status} · ${latest?.name ?? short(`${label} · ${(context.args as { task?: string })?.task ?? "固定候选验收"}`, 160)}`;
+			const heading = `${status === "执行结束，结果待核实" ? "已结束，待核对" : status} · ${label} · ${short((context.args as { task?: string })?.task ?? "固定候选验收", 64)}`;
 			const detail = latest?.action ?? (isPartial ? "核对任务环境" : short(body));
 			const component = {
 				invalidate() {},

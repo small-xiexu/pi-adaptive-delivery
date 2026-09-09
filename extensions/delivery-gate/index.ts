@@ -12,9 +12,11 @@ import { createTaskProgress, taskRenderers } from "./src/progress.ts";
 import { createStructuredCommands, structuredPackage, STRUCTURED_TOOLS, STRUCTURED_READ_IMAGE, type ExecInput, type StdinInput } from "./src/structured.ts";
 import { resolveContainerImage } from "./src/container.ts";
 import { installTaskDetails } from "./src/task-details.ts";
+import { installStreamRetry } from "./src/stream-retry.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	const entryPath = fileURLToPath(import.meta.url);
+	installStreamRetry(pi);
 	// 子进程启动前确定角色；该内部标记只去除协调权限，不提供批准能力。
 	const child = Boolean(process.env[CHILD_ENV]);
 	const childDevelopment = process.env[CHILD_ENV] === "development" ? createChildDevelopment(pi) : undefined;

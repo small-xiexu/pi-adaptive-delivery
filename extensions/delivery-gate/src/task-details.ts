@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DeliveryPanel, displayText } from "./ui.ts";
+import path from "node:path";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { displayText } from "./ui.ts";
 import type { TaskProgress } from "./progress.ts";
 import { DELEGATE_TOOL, DELEGATION_ENTRY } from "./subagents.ts";
 import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
@@ -45,33 +47,232 @@ export function taskDetails(ctx: Pick<ExtensionContext, "sessionManager">, live:
 	return [...tasks.values()];
 }
 
-export async function taskDetailBody(task: TaskDetail): Promise<string> {
-	let body = `${task.label} · ${task.status}\n\n任务说明：\n${task.task}`;
-	if (task.progress) body += `\n\n当前操作：${task.progress.action}`;
-	if (task.result !== undefined) body += `\n\n父工具结果：\n${task.result}`;
-	if (!task.sessionFile) return body + "\n\n尚未取得原始子 Session。";
-	body += `\n\n原始子 Session：${task.sessionFile}\n`;
+interface DetailEntry {
+	id: string;
+	line?: number;
+	name: string;
+	callId?: string;
+	args?: unknown;
+	output?: string;
+	resultLine?: number;
+	failed?: boolean;
+	metadata?: unknown;
+	live?: boolean;
+}
+interface TaskRecord { task: TaskDetail; entries: DetailEntry[]; cwd?: string; notice?: string }
+
+// 仅供当前弹层使用的原记录投影，不写入第二份日志。
+export async function readTaskRecord(task: TaskDetail): Promise<TaskRecord> {
+	const record: TaskRecord = { task, entries: [] };
+	if (!task.sessionFile) record.notice = "尚未取得原始子 Session。";
 	try {
-		const source = await readFile(task.sessionFile, "utf8");
+		const source = task.sessionFile ? await readFile(task.sessionFile, "utf8") : "";
 		const lines = source.split("\n");
 		const partial = lines.pop(); // 活动 Session 的最后一行可能仍在追加，不把半行解释成事件。
+		const calls = new Map<string, DetailEntry>();
 		for (let index = 0; index < lines.length; index++) {
 			const row = JSON.parse(lines[index]!);
+			if (row.type === "session") record.cwd = row.cwd;
 			const message = row.type === "message" ? row.message : undefined;
 			if (message?.role === "assistant") {
 				const content = text(message);
-				if (content) body += `\n[${index + 1}] 子任务说明：\n${content}\n`;
-				for (const part of message.content ?? []) if (part.type === "toolCall") body += `\n[${index + 1}] 调用 ${part.name} · ${part.id}\n${JSON.stringify(part.arguments, null, 2)}\n`;
-				if (message.errorMessage) body += `\n[${index + 1}] 模型错误：${message.errorMessage}\n`;
+				if (content) record.entries.push({ id: `text:${message.timestamp ?? `line:${index}`}`, line: index + 1, name: "子任务说明", output: content });
+				for (const part of message.content ?? []) if (part.type === "toolCall") {
+					const call = { id: `call:${part.id}`, callId: part.id, line: index + 1, name: part.name, args: part.arguments };
+					calls.set(part.id, call);
+					record.entries.push(call);
+				}
+				if (message.errorMessage) record.entries.push({ id: `error:${index}`, line: index + 1, name: "模型错误", output: message.errorMessage, failed: true });
 			} else if (message?.role === "toolResult") {
-				body += `\n[${index + 1}] ${message.isError ? "失败" : "返回"} ${message.toolName} · ${message.toolCallId}\n${text(message)}\n`;
-				if (message.details && Object.keys(message.details).length) body += `${JSON.stringify(message.details, null, 2)}\n`;
+				let call = calls.get(message.toolCallId);
+				if (!call) {
+					call = { id: `call:${message.toolCallId}`, callId: message.toolCallId, line: index + 1, name: message.toolName };
+					record.entries.push(call);
+				}
+				Object.assign(call, { output: text(message), resultLine: index + 1, failed: Boolean(message.isError), metadata: message.details });
 			}
 		}
-		if (partial) body += "\n原始记录末行未完整写入，等待后续更新。";
-	} catch (error) { body += `\n原始记录读取失败：${String(error)}`; }
-	if (task.result === undefined && task.progress?.output) body += `\n\n当前输出（临时预览）：\n${task.progress.output}`;
-	return body;
+		if (partial) record.notice = "原始记录末行未完整写入，等待更新。";
+	} catch (error) { record.notice = `原始记录读取失败：${String(error)}`; }
+	// 原始返回优先；在途输出仅补充尚未落盘的正文，不参与终态判断。
+	for (const pending of task.result === undefined ? task.progress?.pending ?? [] : []) {
+		const original = record.entries.find((entry) => entry.id === pending.id);
+		if (original?.resultLine || original && !pending.callId) continue;
+		if (original) Object.assign(original, { output: pending.output, live: true });
+		else record.entries.push({ ...pending, live: true });
+	}
+	return record;
+}
+
+const clean = (value: string) => displayText(stripTerminalSequences(value)).replace(/\t/g, "    ");
+const short = (value: string) => clean(value).replace(/\s+/g, " ").trim();
+const entryStatus = (entry: DetailEntry) => entry.failed ? "失败" : entry.resultLine ? "已返回" : entry.live ? entry.callId ? "执行中" : "正在输出" : entry.callId ? "待返回" : "说明";
+
+export class TaskDetailsPanel {
+	private record: TaskRecord;
+	private tab = 0;
+	private full = false;
+	private selected?: string;
+	private offsets = [0, 0, 0, 0, 0];
+	private following = [true, false, false, false, false];
+	private frozen = new Map<number, string>();
+	private inspected?: string;
+	private pageSize = 1;
+	private total = 0;
+	private tabs: { start: number; end: number }[] = [];
+	private wrapped?: { body: string; width: number; lines: string[] };
+	constructor(task: TaskDetail, private readonly tui: TUI, private readonly theme: Theme, private readonly done: () => void) {
+		this.record = { task, entries: [], notice: "正在读取原始记录…" };
+	}
+	update(record: TaskRecord) {
+		this.record = record;
+		if (!record.entries.some((entry) => entry.id === this.selected)) this.selected = record.entries.at(-1)?.id;
+		this.tui.requestRender();
+	}
+	showError(message: string) { this.record.notice = message; this.tui.requestRender(); }
+	invalidate() { this.wrapped = undefined; }
+	private get slot() { return this.tab === 2 ? 4 : this.tab * 2 + Number(this.full); }
+	private get offset() { return this.offsets[this.slot]!; }
+	private set offset(value: number) { this.offsets[this.slot] = value; }
+	private get listing() { return this.tab === 1 && !this.full; }
+	private get overview() { return this.tab === 0 && !this.full; }
+	private switchTab(tab: number) { this.tab = (tab + 3) % 3; this.full = false; this.tui.requestRender(); }
+	private expand() {
+		if (this.tab === 1 && this.inspected !== this.selected) {
+			this.inspected = this.selected;
+			this.offsets[3] = 0;
+			this.frozen.delete(3);
+			this.following[3] = Boolean(this.record.entries.find((entry) => entry.id === this.selected)?.live);
+		}
+		this.full = true;
+	}
+	private move(delta: number) {
+		if (this.listing) {
+			const index = Math.max(0, this.record.entries.findIndex((entry) => entry.id === this.selected));
+			this.selected = this.record.entries[Math.max(0, Math.min(this.record.entries.length - 1, index + delta))]?.id;
+			this.offsets[3] = 0;
+		} else {
+			const bottom = Math.max(0, this.total - this.pageSize);
+			this.offset = Math.max(0, Math.min(bottom, this.offset + delta));
+			if (this.overview || this.slot === 3 && (this.following[3] || this.frozen.has(3))) {
+				if (delta < 0 && this.following[this.slot] && this.wrapped) this.frozen.set(this.slot, this.wrapped.body);
+				this.following[this.slot] = delta > 0 && this.offset === bottom;
+				if (this.following[this.slot]) this.frozen.delete(this.slot);
+			}
+		}
+		this.tui.requestRender();
+	}
+	handleInput(data: string) {
+		if (matchesKey(data, "escape")) { this.done(); return; }
+		if (matchesKey(data, "tab") || matchesKey(data, "right")) this.switchTab(this.tab + 1);
+		else if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) this.switchTab(this.tab - 1);
+		else if (matchesKey(data, "return") && this.tab !== 2) this.expand();
+		else if (matchesKey(data, "backspace")) this.full = false;
+		else if (matchesKey(data, "up")) this.move(-1);
+		else if (matchesKey(data, "down")) this.move(1);
+		else if (matchesKey(data, "pageUp")) this.move(-this.pageSize);
+		else if (matchesKey(data, "pageDown")) this.move(this.pageSize);
+		else if (matchesKey(data, "home")) this.move(-Infinity);
+		else if (matchesKey(data, "end")) this.move(Infinity);
+		this.tui.requestRender();
+	}
+	handleMouse(event: TuiMouseEvent) {
+		if (event.type === "wheel") this.move(event.wheelDelta ?? 0);
+		if (event.type === "click" && event.button === "left") {
+			if (event.y === 3) {
+				const tab = this.tabs.findIndex(({ start, end }) => event.x >= start && event.x < end);
+				if (tab >= 0) this.switchTab(tab);
+			} else if (this.listing && event.y >= 5 && event.y < 5 + this.pageSize) {
+				const entry = this.record.entries[this.offset + event.y - 5];
+				if (entry) { this.selected = entry.id; this.expand(); this.tui.requestRender(); }
+			}
+		}
+		return { handled: true };
+	}
+	private summary(entry: DetailEntry) {
+		const args = entry.args as Record<string, unknown> | undefined;
+		let value = entry.callId ? String(args?.path ?? args?.file_path ?? args?.command ?? args?.cmd ?? args?.pattern ?? "") : entry.output ?? "";
+		if (this.record.cwd && path.isAbsolute(value)) value = path.relative(this.record.cwd, value) || ".";
+		return short(value).slice(0, 200);
+	}
+	private content(width: number): string[] {
+		const { task, entries, notice } = this.record;
+		let body: string;
+		if (this.frozen.has(this.slot)) body = this.frozen.get(this.slot)!;
+		else if (this.overview) {
+			body = entries.map((entry) => `${truncateToWidth(`${short(entry.name)} · ${entryStatus(entry)}${entry.callId ? ` · ${this.summary(entry)}` : ""}`, width)}\n`
+				+ (entry.output || (entry.live ? "等待输出…" : entry.callId ? "尚未取得工具返回。" : ""))).join("\n\n") || "等待子任务输出…";
+			if (notice) body += `\n\n${notice}`;
+		}
+		else if (this.tab === 0) body = `完整任务\n\n${task.task}\n\n原始子 Session\n${task.sessionFile ?? "尚未取得"}`;
+		else if (this.tab === 2) body = `任务结果\n\n${task.result ?? "尚未收到父工具结果。当前进展可在「概览」查看。"}`;
+		else {
+			const entry = entries.find((entry) => entry.id === this.selected);
+			if (!entry) return ["还没有工具过程记录。"];
+			body = `${entry.name} · ${entryStatus(entry)}\n\n`;
+			if (entry.args !== undefined) body += `参数\n${JSON.stringify(entry.args, null, 2)}\n\n`;
+			if (!entry.live) {
+				body += `原始记录\n${task.sessionFile ?? "尚未取得"}${entry.line ? `\n第 ${entry.line} 行` : ""}${entry.resultLine ? ` · 返回第 ${entry.resultLine} 行` : ""}\n`;
+				if (entry.callId) body += `调用 ID：${entry.callId}\n`;
+				if (entry.metadata && Object.keys(entry.metadata).length) body += `\n返回元数据\n${JSON.stringify(entry.metadata, null, 2)}\n`;
+				body += "\n";
+			}
+			body += `${entry.callId ? "输出" : "正文"}\n${entry.output || (entry.live ? "等待输出…" : "尚未取得工具返回。")}`;
+		}
+		if (notice && !this.overview && !this.frozen.has(this.slot)) body += `\n\n${notice}`;
+		if (this.wrapped?.body !== body || this.wrapped.width !== width) this.wrapped = { body, width, lines: wrapTextWithAnsi(clean(body), width) };
+		return this.wrapped.lines;
+	}
+	render(width: number) {
+		const th = this.theme;
+		if (width < 32 || this.tui.terminal.rows < 12) return [truncateToWidth(th.fg("muted", "Esc 关闭 · 请放大终端"), width)];
+		const inner = width - 6;
+		const fit = (value: string, size: number) => { const clipped = truncateToWidth(value, size); return clipped + " ".repeat(Math.max(0, size - visibleWidth(clipped))); };
+		const row = (value: string) => th.bg("customMessageBg", th.fg("border", "│") + "  " + fit(value, inner) + "  " + th.fg("border", "│"));
+		const rule = (left: string, right: string) => th.bg("customMessageBg", th.fg("border", left + "─".repeat(width - 2) + right));
+		const footer = width >= 72 ? ["Tab 切换 · ↑↓ / PgUp/PgDn 滚动 · Esc 关闭"] : ["Tab 切换 · ↑↓ 滚动", "Esc 关闭"];
+		const task = this.record.task;
+		const context = this.overview ? [th.fg("muted", `任务：${short(task.task)}`),
+			th.fg("muted", short(task.progress?.action ?? (task.result === undefined ? "等待进度更新" : "已收到结果，可切换到「结果」查看"))),
+			th.fg("accent", this.following[0] ? "实时输出 · 跟随最新" : "实时输出 · 暂停跟随 · End 查看最新")] : [];
+		context.splice(Math.max(0, Math.floor(this.tui.terminal.rows * 0.85) - 10));
+		this.pageSize = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 8 - footer.length - context.length);
+		let cursor = 3;
+		const tabs = (width < 44 ? ["概览", "过程", "结果"] : ["概览", "工具过程", "结果"]).map((label, index) => {
+			const title = this.tab === index ? `[${label}]` : ` ${label} `;
+			this.tabs[index] = { start: cursor, end: cursor + visibleWidth(title) };
+			cursor += visibleWidth(title) + 2;
+			return this.tab === index ? th.fg("accent", th.bold(title)) : th.fg("muted", title);
+		}).join("  ");
+		let page: string[];
+		let position: string;
+		if (this.listing) {
+			const entries = this.record.entries;
+			this.total = entries.length;
+			const index = Math.max(0, entries.findIndex((entry) => entry.id === this.selected));
+			this.offset = Math.max(0, Math.min(this.offset, index, Math.max(0, entries.length - this.pageSize)));
+			if (index >= this.offset + this.pageSize) this.offset = index - this.pageSize + 1;
+			page = entries.slice(this.offset, this.offset + this.pageSize).map((entry) => {
+				const value = fit(`${entry.id === this.selected ? "›" : " "} ${entryStatus(entry)} · ${short(entry.name)}  ${this.summary(entry)}`, inner);
+				return entry.id === this.selected ? th.bg("selectedBg", th.fg("accent", value)) : entry.failed ? th.fg("error", value) : value;
+			});
+			if (!entries.length) page = ["还没有工具过程记录。"];
+			position = `${entries.length ? index + 1 : 0} / ${entries.length} 条 · Enter 查看${this.record.notice ? " · 记录不完整，概览查看原因" : ""}`;
+		} else {
+			const lines = this.content(inner);
+			this.total = lines.length;
+			const bottom = Math.max(0, this.total - this.pageSize);
+			this.offset = this.following[this.slot] ? bottom : Math.min(this.offset, bottom);
+			page = lines.slice(this.offset, this.offset + this.pageSize);
+			position = this.full ? "Backspace 返回" : this.tab === 0 ? "Enter 查看完整任务" : "父工具返回正文";
+			if (this.slot === 3 && (this.following[3] || this.frozen.has(3))) position += this.following[3] ? " · 跟随最新" : " · 暂停跟随 · End 最新";
+			if (this.total > this.pageSize) position += ` · ${this.offset + 1}–${Math.min(this.total, this.offset + this.pageSize)} / ${this.total} 行`;
+		}
+		while (page.length < this.pageSize) page.push("");
+		const status = task.status === "执行结束，结果待核实" ? "已结束，待核对" : task.status;
+		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)} · ${clean(status)}`)), row(""), row(tabs), rule("├", "┤"),
+			...context.map(row), ...page.map(row), rule("├", "┤"), row(th.fg("muted", position)), ...footer.map((line) => row(th.fg("muted", line))), rule("╰", "╯")];
+	}
 }
 
 export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[]) {
@@ -101,23 +302,23 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[])
 			await ctx.ui.custom<void>((tui, theme, _keys, done) => {
 				let closed = false;
 				let loading = false;
-				const panel = new DeliveryPanel("子任务详情", "正在读取原始记录…", "", [], tui, theme, () => done());
+				const panel = new TaskDetailsPanel(tasks.find((task) => task.id === id)!, tui, theme, () => done());
 				close = () => done();
 				const refresh = async () => {
 					if (closed || loading) return;
 					loading = true;
 					try {
 						const task = taskDetails(ctx, live()).find((task) => task.id === id);
-						const body = task ? await taskDetailBody(task) : "任务已离开当前分支。";
-						if (!closed) { panel.body = body; tui.requestRender(); }
+						const record = task ? await readTaskRecord(task) : undefined;
+						if (!closed) { if (record) panel.update(record); else panel.showError("任务已离开当前分支。"); }
 					} catch (error) {
-						if (!closed) { panel.body = `详情更新失败：${String(error)}`; tui.requestRender(); }
+						if (!closed) panel.showError(`详情更新失败：${String(error)}`);
 					} finally { loading = false; }
 				};
 				const timer = setInterval(() => void refresh(), 1000);
 				void refresh();
 				return Object.assign(panel, { dispose() { closed = true; clearInterval(timer); close = undefined; } });
-			}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "90%", anchor: "center" } });
+			}, { overlay: true, overlayOptions: { width: 110, maxHeight: "90%", margin: 1, anchor: "center" } });
 		} finally { close = undefined; }
 	};
 	pi.registerCommand("delivery-tasks", { description: "查看交付子任务详情，Esc 关闭详情", handler: (args, ctx) => open(args.trim() || undefined, ctx) });

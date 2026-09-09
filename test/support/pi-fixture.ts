@@ -204,7 +204,8 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 	}
 	await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({
 		packages: [packageDir, ...(productDir && !writerFixture ? [productDir] : [])], defaultProvider: "adaptive-fixture", defaultModel: "fake",
-		defaultProjectTrust: scenario === "readonly-search" ? "always" : "never", retry: { enabled: false }, compaction: { enabled: false },
+		defaultProjectTrust: scenario === "readonly-search" ? "always" : "never",
+		retry: scenario?.includes("stream-retry") ? { enabled: true, maxRetries: 2, baseDelayMs: scenario.endsWith("exit") ? 1500 : 80 } : { enabled: false }, compaction: { enabled: false },
 	}));
 	if (scenario === "readonly-search") {
 		await mkdir(path.join(cwd, ".pi"));

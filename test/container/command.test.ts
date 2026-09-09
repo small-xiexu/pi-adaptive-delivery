@@ -10,7 +10,7 @@ import { createContainerOperations, resolveContainerImage, type ContainerReferen
 import { resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createDevelopmentHost } from "../support/development-host.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
-import type { DeliveryPanel } from "../../extensions/delivery-gate/src/ui.ts";
+import type { TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 
 if (process.env.PI_ADAPTIVE_CONTAINER_TESTS !== "1") throw new Error("真实容器测试须显式使用 run-tests.ts --containers；不静默跳过或放宽默认禁网");
 
@@ -151,8 +151,12 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 
 test("真实 Pi 子命令运行中查看详情，Esc 关闭后继续完成，结束仍可读原始结果", { timeout: 40_000 }, async (t) => {
 	const h = await developmentHost(t, "details", `require("node:fs").writeFileSync("src/ready.txt", "ready");
-console.log("DETAIL_COMMAND_RUNNING"); setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 5000);`);
-	let panel: DeliveryPanel | undefined;
+const phase = (name) => { for (let i = 0; i < 80; i++) console.log(name + " " + i + " " + "output ".repeat(15)); console.log(name + "_LATEST"); };
+phase("DETAIL_COMMAND_RUNNING");
+setTimeout(() => phase("DETAIL_MIDDLE"), 2500);
+setTimeout(() => phase("DETAIL_LATER"), 5500);
+setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
+	let panel: TaskDetailsPanel | undefined;
 	h.setCustom((async (factory: any) => {
 		let done!: () => void;
 		const closed = new Promise<void>((resolve) => { done = resolve; });
@@ -165,13 +169,33 @@ console.log("DETAIL_COMMAND_RUNNING"); setTimeout(() => console.log("DETAIL_COMM
 		while (!await condition()) { assert.ok(Date.now() < deadline, "未取得详情或实际执行证据"); await setTimeout(20); }
 	};
 	let ended = false;
+	let later = false;
+	const unsubscribe = h.session.subscribe((event) => {
+		if (event.type === "tool_execution_update" && event.toolName === "delivery_develop"
+			&& event.partialResult.details.progress?.output.includes("DETAIL_LATER_LATEST")) later = true;
+	});
+	t.after(unsubscribe);
 	const run = h.call("delivery_develop", { task: "创建、编辑文件并执行命令，详情不控制任务。" }).finally(() => { ended = true; });
 	await until(() => readFile(path.join(h.cwd, "src/ready.txt")).then(() => true, (error) => { if (error.code === "ENOENT") return false; throw error; }));
 	const ref = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-development") as CustomEntry<{ id: string }>;
 	assert.ok(ref);
 	const showing = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
-	await until(() => Boolean(panel?.body.includes("DETAIL_COMMAND_RUNNING")));
+	await until(() => Boolean(panel?.render(100).join("\n").includes("DETAIL_COMMAND_RUNNING_LATEST")));
 	assert.equal(ended, false);
+	await until(() => Boolean(panel?.render(100).join("\n").includes("DETAIL_MIDDLE_LATEST")));
+	panel!.handleInput("\x1b[5~");
+	const paused = panel!.render(100).join("\n");
+	await until(() => later);
+	await setTimeout(1100); // 等待详情至少刷新一次，确认仍保留上翻内容。
+	assert.equal(panel!.render(100).join("\n"), paused);
+	panel!.handleInput("\x1b[F");
+	assert.ok(panel!.render(100).join("\n").includes("DETAIL_LATER_LATEST"));
+	panel!.handleInput("\t");
+	const activeRows = panel!.render(100);
+	const activeBash = activeRows.findIndex((line) => line.includes("执行中 · bash"));
+	assert.ok(activeBash >= 0);
+	panel!.handleMouse({ type: "click", button: "left", x: 4, y: activeBash, screenX: 4, screenY: activeBash, width: 100, height: 30, shift: false, alt: false, ctrl: false });
+	assert.ok(panel!.render(100).join("\n").includes("DETAIL_LATER_LATEST"));
 	panel!.handleInput("\x1b");
 	await showing;
 	assert.equal(ended, false, "关闭详情不能终止在途子命令");
@@ -179,10 +203,37 @@ console.log("DETAIL_COMMAND_RUNNING"); setTimeout(() => console.log("DETAIL_COMM
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.equal(await h.readLease(), undefined);
 	const finished = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
-	await until(() => Boolean(panel?.body.includes("父工具结果") && panel.body.includes("DETAIL_COMMAND_FINISHED")));
-	assert.ok(panel!.body.includes("调用 bash"));
+	await until(() => Boolean(panel?.render(100).join("\n").includes("已结束，待核对")));
+	panel!.handleInput("\t");
+	const processRows = panel!.render(100);
+	const bashRow = processRows.findIndex((line) => line.includes("已返回 · bash"));
+	assert.ok(bashRow >= 0);
+	panel!.handleMouse({ type: "click", button: "left", x: 4, y: bashRow, screenX: 4, screenY: bashRow, width: 100, height: 30, shift: false, alt: false, ctrl: false });
+	panel!.render(100);
+	panel!.handleInput("\x1b[F");
+	assert.ok(panel!.render(100).join("\n").includes("DETAIL_COMMAND_FINISHED"));
+	panel!.handleInput("\t");
+	assert.ok(panel!.render(100).join("\n").includes("开发子任务已结束"));
 	panel!.handleInput("\x1b");
 	await finished;
+});
+
+test("真实容器命令完成后模型断流，恢复不重复命令或委派", { timeout: 40_000 }, async (t) => {
+	const h = await developmentHost(t, "stream-retry-once", `require("node:fs").appendFileSync("src/executions.txt", "once\\n"); console.log("COMMAND_BEFORE_STREAM_ERROR");`);
+	const result = await h.call("delivery_develop", { task: "创建、编辑文件，执行一次命令并读回；模型断流后继续" });
+	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.equal(await readFile(path.join(h.cwd, "src/executions.txt"), "utf8"), "once\n");
+	const children = await h.children();
+	assert.equal(children.length, 1);
+	const rows = children[0]!;
+	assert.equal(rows.filter((row: any) => row.message?.role === "assistant" && row.message.stopReason === "error").length, 1);
+	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
+	assert.deepEqual(tools.map((tool: any) => tool.toolName), ["write", "edit", "bash", "read"]);
+	assert.ok(tools.every((tool: any) => !tool.isError));
+	assert.equal(tools[2].details.container.exitCode, 0);
+	assert.equal(tools[2].details.container.clean, true);
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 4);
 });
 
 test("开发初始读取失败后写入与真实自检成功，父沿失败结果取证并继续固定验收", { timeout: 60_000 }, async (t) => {

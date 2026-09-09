@@ -63,11 +63,12 @@ const permissions = {
 function presentation(proposal: Proposal, expanded = false): string {
 	const relative = (file: string) => path.relative(proposal.cwd, file) || ".";
 	const body = expanded || proposal.body.length <= 600 ? proposal.body : `${proposal.body.slice(0, 600)}\n…完整正文见详情`;
-	return `${titles[proposal.stage]}\n工作目录：${proposal.cwd}\n\n${body}\n\n${permissions[proposal.stage]}`
+	return (expanded ? `${titles[proposal.stage]}\n工作目录：${proposal.cwd}\n\n` : "") + permissions[proposal.stage]
 		+ (proposal.paths.length ? `\n\n${proposal.stage === "documents" ? "可编辑文档" : "工具实际可写范围（文件或目录）"}：\n${proposal.paths.map((file) => `• ${relative(file)}`).join("\n")}` : "")
 		+ (proposal.container ? `\n\n运行环境：本地 Docker · 禁网 · 1 GiB · 每命令最多 300 秒`
 			+ (expanded ? `\n固定镜像：${proposal.container.image}\n额外只读输入：\n${proposal.container.inputs.map((file) => `• ${relative(file)}`).join("\n") || "无"}\n容器 /bin/sh，不继承宿主 Shell；可写挂载沿用上述范围。` : `\n${proposal.container.inputs.length} 项只读输入，${proposal.validationCommands.length} 条固定验收命令（详情可核对）`)
 			: proposal.stage === "implementation" ? "\n本次不授权容器命令。" : "")
+		+ `\n\n${body}`
 		+ (expanded && proposal.validationCommands.length ? `\n\n固定验收命令：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n\n")}` : "")
 		+ (expanded ? `\n\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}` : "");
 }
@@ -188,7 +189,7 @@ export function installApprovals(pi: ExtensionAPI) {
 						presentation(proposal, true) + (approvedDesign ? `\n\n已确认的方案原文：\n${presentation(approvedDesign, true)}` : ""),
 						[accept, "暂不批准"], tui, theme, done, 1);
 					return Object.assign(panel, { dispose: () => operation.removeEventListener("abort", cancel) });
-				}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "90%", anchor: "center" } });
+				});
 				current();
 				if (choice !== accept) return { content: [{ type: "text", text: "本次未批准，权限未扩大；暂停推进，不自动重复请求批准。" }], details: { approved: false }, terminate: true };
 				// 用户等待期间正文可能被外部改动；确认的是刚才展示的正文，不是后来替换的文件。
