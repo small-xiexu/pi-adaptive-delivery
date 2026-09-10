@@ -108,28 +108,33 @@ for (const withPlanning of [false, true]) test(`Structured ${withPlanning ? "维
 	const h = await development(t, "normal", withPlanning), before = await readdir(h.cwd);
 	const progress: any[] = [];
 	t.after(h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName.startsWith("delivery_")) progress.push(event.partialResult.details.progress); }));
-	const model = { provider: "adaptive-fixture", id: "fake-reasoner" };
-	const developed = await h.call("delivery_develop", { task: "局部修改 value 为 2", agent: { model, thinking: "medium", reason: "局部实现" } });
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	h.session.setThinkingLevel("high");
+	const developed = await h.call("delivery_develop", { task: "局部修改 value 为 2", agent: { thinking: "medium", reason: "局部实现" } });
 	assert.equal(developed.isError, false, JSON.stringify(developed));
-	const validated = await h.call("delivery_validate", { agent: { model, thinking: "low", reason: "执行固定命令" } });
+	const validated = await h.call("delivery_validate", { agent: { thinking: "low", reason: "执行固定命令" } });
 	assert.equal(validated.isError, false, JSON.stringify(validated));
 	const proof = (validated.details as any).validation;
 	assert.equal(proof.before.digest, proof.after.digest);
 	assert.deepEqual(proof.results.map((row: any) => [row.status, row.exitCode]), [["passed", 0]]);
 	assert.equal(proof.environment.platform, process.platform);
-	const reviewed = await h.call("delivery_review", { task: "核对原方案、实际差异和验收记录", agent: { model, thinking: "high", reason: "独立审查" } });
+	const reviewed = await h.call("delivery_review", { task: "核对原方案、实际差异和验收记录", agent: { thinking: "high", reason: "独立审查" } });
 	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
 	assert.equal((reviewed.details as any).candidate.digest, proof.after.digest);
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.choices.length, withPlanning ? 3 : 2);
 	assert.deepEqual(await readdir(h.cwd), before);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
-	for (const result of [developed, validated, reviewed]) {
+	for (const [result, thinking] of [[developed, "medium"], [validated, "low"], [reviewed, "high"]] as const) {
 		const own = progress.filter((view) => view?.id === result.toolCallId);
 		assert.ok(own.some((view) => view.action.startsWith("正在执行：")));
 		assert.ok(!own.at(-1).status.includes("运行中"));
-		assert.match(JSON.stringify((await h.audit()).find((row) => row.pid === (result.details as any).pid && row.phase === "model")?.messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
+		const requests = (await h.audit()).filter((row) => row.pid === (result.details as any).pid && row.phase === "model");
+		assert.ok(requests.length > 0 && requests.every((row) => row.modelId === "fake-reasoner" && row.reasoning === thinking));
+		assert.match(JSON.stringify(requests[0].messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
 	}
+	assert.equal(h.session.model!.id, "fake-reasoner");
+	assert.equal(h.session.thinkingLevel, "high");
 	if (withPlanning) assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "已核对原始结果。\n" })).isError, false);
 	assertEnhancements(await h.audit());
 });

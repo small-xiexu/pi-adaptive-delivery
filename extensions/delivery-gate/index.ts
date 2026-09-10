@@ -1,4 +1,5 @@
 import { createBashTool, createEditTool, createReadToolDefinition, createWriteTool, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Type } from "typebox";
@@ -12,7 +13,7 @@ import { createTaskProgress, taskRenderers } from "./src/progress.ts";
 import { structuredPackage, STRUCTURED_TOOLS } from "./src/structured.ts";
 import { installTaskDetails } from "./src/task-details.ts";
 import { installStreamRetry } from "./src/stream-retry.ts";
-import { agentSelection, installModelCatalog, selectChildAgent } from "./src/agent-selection.ts";
+import { agentSelection, selectChildAgent } from "./src/agent-selection.ts";
 import { installActivation } from "./src/activation.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
@@ -87,7 +88,7 @@ function installDelivery(pi: ExtensionAPI) {
 	};
 	const restrictTools = installPolicy(pi, child ? undefined : entryPath, childDevelopment ? entryPath : undefined, structuredAllowed);
 	pi.on("session_start", () => { promptOptions = undefined; });
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", (event, ctx) => {
 		// 原插件会在 input 阶段重设工具，每轮请求前重新应用当前交付角色的可见集合。
 		if (structured) { enableStructuredReads(); restrictTools(); }
 		promptOptions = structuredClone(event.systemPromptOptions);
@@ -95,7 +96,8 @@ function installDelivery(pi: ExtensionAPI) {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话只使用已交接的文件及本机命令工具，遵守批准范围，不修改父规划文档、不批准或继续委派。"
-					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n简单明确、可一次完成并验证的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和验收，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择 agent 配置；delivery_models 查询可用模型，不统计费用。"),
+					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n简单明确、可一次完成并验证的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和验收，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择推理级别，不另选模型。")
+				+ (!child && ctx.model ? `\n子任务固定继承父 Pi 当前模型 ${ctx.model.provider}/${ctx.model.id}；可选推理级别：${getSupportedThinkingLevels(ctx.model).join("、")}。省略 thinking 继承父当前级别；父切换模型后，新任务跟随，已启动的任务保持原模型。` : ""),
 		};
 	});
 	if (child) {
@@ -125,7 +127,6 @@ function installDelivery(pi: ExtensionAPI) {
 	}
 	const approvals = installApprovals(pi);
 	const writer = createParentDocumentWriter(pi);
-	installModelCatalog(pi);
 	const developer = createDevelopmentDelegator(pi, approvals);
 	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
 	const tasks = () => [...active.values()].map((item) => item.progress.snapshot()).concat(developer.progress ? [developer.progress] : []);

@@ -59,7 +59,7 @@ test("权限核对异常时显式拒绝，不把异常交给扩展调度器后�
 	}
 });
 
-for (const name of ["delivery_git_status", "delivery_models", "delivery_readonly", "delivery_approval", "delivery_document_edit", "delivery_document_write", "delivery_develop", "delivery_validate", "delivery_review"]) test(`只有父角色的自有 ${name} 可以调用，同名覆盖立即失权`, () => {
+for (const name of ["delivery_git_status", "delivery_readonly", "delivery_approval", "delivery_document_edit", "delivery_document_write", "delivery_develop", "delivery_validate", "delivery_review"]) test(`只有父角色的自有 ${name} 可以调用，同名覆盖立即失权`, () => {
 	const { pi, tools, handlers } = host("/owned/index.ts");
 	const tool = { name, sourceInfo: { source: "extension", path: "/owned/index.ts" } };
 	tools.push(tool);

@@ -15,7 +15,7 @@ export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActi
 }
 
 export function installPolicy(pi: ExtensionAPI, coordinatorPath?: string, developerPath?: string, structuredAllowed: (name: string) => boolean = () => false): () => void {
-	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [GIT_STATUS_TOOL, "delivery_models", DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL].includes(name)
+	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [GIT_STATUS_TOOL, DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL].includes(name)
 		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === coordinatorPath);
 	const developerAllowed = (name: string) => developerPath !== undefined && ["edit", "write", "bash"].includes(name)
 		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === developerPath);

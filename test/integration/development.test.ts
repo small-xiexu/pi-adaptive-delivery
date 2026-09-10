@@ -57,8 +57,10 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	t.after(unsubscribe);
 	await h.prepare();
 	await h.session.prompt("/fixture-parent-history");
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	h.session.setThinkingLevel("high");
 	const result = await h.call("delivery_develop", { task: "创建 src/value.js，将 value 从 1 改为 2 并读取文件核对。",
-		agent: { model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "medium", reason: "边界明确的局部开发" } });
+		agent: { thinking: "medium", reason: "边界明确的局部开发" } });
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.ok(progress.every((view) => view.id === result.toolCallId && view.name.startsWith("开发")));
 	for (const tool of ["write", "edit", "read"]) {
@@ -76,7 +78,8 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	assert.equal(requests.length, 4);
 	assert.ok(requests.every((row) => row.modelId === "fake-reasoner" && row.reasoning === "medium"));
 	assert.deepEqual(progress.at(-1).agent, { provider: "adaptive-fixture", id: "fake-reasoner", thinking: "medium", reason: "边界明确的局部开发" });
-	assert.equal(h.session.model!.id, "fake");
+	assert.equal(h.session.model!.id, "fake-reasoner");
+	assert.equal(h.session.thinkingLevel, "high");
 	assert.ok(requests.every((row) => !row.parentMarkerSeen));
 	assert.match(JSON.stringify(requests[0].messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
 	assert.ok(requests[0].tools.includes("write") && requests[0].tools.includes("edit"));
@@ -155,30 +158,50 @@ async function reviewHost(t: TestContext, scenario = "normal", configure?: (pi: 
 	return { ...h, inputs, commands };
 }
 
-test("真实父查询可用模型后选择只读子模型，未知模型和不支持级别在启动前拒绝", { timeout: 40_000 }, async (t) => {
+test("真实 Pi 子任务跟随父模型切换，四类工具拒绝单独选模型", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
-	const catalog = await h.call("delivery_models", {});
-	assert.equal(catalog.isError, false, JSON.stringify(catalog));
-	assert.ok((catalog.details as any).models.some((model: any) => model.id === "fake-reasoner" && model.thinking.includes("high")));
-	for (const agent of [{ model: { provider: "unknown", id: "fake" }, reason: "无可用配置" }, { thinking: "high", reason: "非推理模型不能用 high" }]) {
-		assert.equal((await h.call("delivery_readonly", { task: "不能发出任务", agent })).isError, true);
+	assert.ok(!h.api.getAllTools().some((tool) => tool.name === "delivery_models"));
+	assert.equal((await h.call("delivery_models", {})).isError, true);
+	for (const tool of ["delivery_readonly", "delivery_develop", "delivery_validate", "delivery_review"]) {
+		const rejected = await h.call(tool, { ...(tool === "delivery_validate" ? {} : { task: "不能另选可用模型" }),
+			agent: { model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "low", reason: "不能另选模型" } });
+		assert.equal(rejected.isError, true, JSON.stringify(rejected));
+		assert.match(JSON.stringify(rejected), /agent\/model|additional propert/i);
 	}
+	assert.equal((await h.call("delivery_readonly", { task: "不能发出任务", agent: { thinking: "high", reason: "非推理模型不能用 high" } })).isError, true);
 	assert.ok(!(await h.audit()).some((row) => row.child));
-	const result = await h.call("delivery_readonly", { task: "检查 input.txt 并返回结论", agent: { model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "low", reason: "明确的事实查询" } });
+	const first = await h.call("delivery_readonly", { task: "使用父当前模型检查 input.txt" });
+	assert.equal(first.isError, false, JSON.stringify(first));
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	h.session.setThinkingLevel("high");
+	const result = await h.call("delivery_readonly", { task: "检查 input.txt 并返回结论", agent: { thinking: "low", reason: "明确的事实查询" } });
 	assert.equal(result.isError, false, JSON.stringify(result));
 	const requests = (await h.audit()).filter((row) => row.child && row.phase === "model");
-	assert.ok(requests.length > 0 && requests.every((row) => row.modelId === "fake-reasoner" && row.reasoning === "low"));
+	for (const [run, id, thinking] of [[first, "fake", "off"], [result, "fake-reasoner", "low"]] as const) {
+		const details = run.details as any;
+		const own = requests.filter((row) => row.pid === details.pid);
+		assert.ok(own.length > 0 && own.every((row) => row.modelId === id));
+		if (thinking !== "off") assert.ok(own.every((row) => row.reasoning === thinking));
+		assert.equal(details.progress.agent.thinking, thinking);
+		assert.throws(() => process.kill(details.pid, 0), { code: "ESRCH" });
+	}
 	assert.ok(requests.every((row) => !row.tools.includes("delivery_models") && !row.tools.includes("delivery_document_write")));
+	const parentRequests = (await h.audit()).filter((row) => !row.child && row.phase === "model");
+	assert.match(parentRequests.at(-1).systemPrompt, /父 Pi 当前模型 adaptive-fixture\/fake-reasoner；可选推理级别：off、minimal、low、medium、high/);
+	assert.doesNotMatch(parentRequests.at(-1).systemPrompt, /delivery_models/);
 	const record = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-delegation") as any;
 	assert.deepEqual(record.data.agent, { provider: "adaptive-fixture", id: "fake-reasoner", thinking: "low", reason: "明确的事实查询" });
+	assert.equal(h.session.model!.id, "fake-reasoner");
+	assert.equal(h.session.thinkingLevel, "high");
 	assert.equal(h.choices.length, 0);
 });
 
 for (const tool of ["delivery_readonly", "delivery_develop"]) test(`${tool} 拒绝实际子启动级别被配置改写，不发送任务且正常收尾`, { timeout: 40_000 }, async (t) => {
 	const h = await host(t, "selection-mismatch");
 	if (tool === "delivery_develop") await h.prepare();
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
 	const result = await h.call(tool, { task: "不得在被改写的模型配置下执行", agent: {
-		model: { provider: "adaptive-fixture", id: "fake-reasoner" }, thinking: "high", reason: "检验关键边界" } });
+		thinking: "high", reason: "检验关键边界" } });
 	assert.equal(result.isError, true);
 	assert.match(JSON.stringify(result), /模型或只读工具未核实，未发送任务/);
 	const events = (await h.audit()).filter((row) => row.child);
@@ -191,17 +214,44 @@ for (const tool of ["delivery_readonly", "delivery_develop"]) test(`${tool} 拒�
 
 test("真实验收与审查子可分别选择级别，原批准与工具参数绑定保持", { timeout: 40_000 }, async (t) => {
 	const h = await reviewHost(t);
-	const model = { provider: "adaptive-fixture", id: "fake-reasoner" };
-	const validated = await h.call("delivery_validate", { agent: { model, thinking: "low", reason: "执行固定验收命令" } });
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	h.session.setThinkingLevel("high");
+	const validated = await h.call("delivery_validate", { agent: { thinking: "low", reason: "执行固定验收命令" } });
 	assert.equal(validated.isError, false, JSON.stringify(validated));
-	const reviewed = await h.call("delivery_review", { task: "对照候选与证据检查行为", agent: { model, thinking: "high", reason: "代码审查需检查遗漏边界" } });
+	const reviewed = await h.call("delivery_review", { task: "对照候选与证据检查行为", agent: { thinking: "high", reason: "代码审查需检查遗漏边界" } });
 	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
 	assert.equal((validated.details as any).progress.agent.thinking, "low");
 	assert.equal((reviewed.details as any).progress.agent.thinking, "high");
 	const requests = (await h.audit()).filter((row) => row.child && row.phase === "model");
 	assert.ok(requests.some((row) => row.modelId === "fake-reasoner" && row.reasoning === "low"));
 	assert.ok(requests.some((row) => row.modelId === "fake-reasoner" && row.reasoning === "high"));
+	assert.ok(requests.every((row) => row.modelId === "fake-reasoner"));
+	assert.equal(h.session.model!.id, "fake-reasoner");
+	assert.equal(h.session.thinkingLevel, "high");
 	assert.equal(await h.readLease(), undefined);
+});
+
+test("真实子审查运行中切换父模型，子后续请求保持启动模型与级别", { timeout: 40_000 }, async (t) => {
+	const h = await reviewHost(t, "dialog");
+	assert.equal((await h.call("delivery_validate", {})).isError, false);
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	h.session.setThinkingLevel("high");
+	let switched = false;
+	h.setConfirm(async () => {
+		assert.ok((await h.audit()).some((row) => row.child && row.phase === "model" && row.modelId === "fake-reasoner"));
+		await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake")!);
+		switched = true;
+		return true;
+	});
+	const reviewed = await h.call("delivery_review", { task: "审查中切换父模型", agent: { thinking: "low", reason: "检查已确认的局部改动" } });
+	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
+	assert.equal(switched, true);
+	const requests = (await h.audit()).filter((row) => row.pid === (reviewed.details as any).pid && row.phase === "model");
+	assert.ok(requests.length > 1 && requests.every((row) => row.modelId === "fake-reasoner" && row.reasoning === "low"));
+	assert.equal(h.session.model!.id, "fake");
+	assert.equal(h.session.thinkingLevel, "off");
+	assert.equal(await h.readLease(), undefined);
+	assert.throws(() => process.kill((reviewed.details as any).pid, 0), { code: "ESRCH" });
 });
 
 test("候选含符号链接时不启动子 Pi 或锁住 writer，修复范围后可继续验收", { timeout: 40_000 }, async (t) => {

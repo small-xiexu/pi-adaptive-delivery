@@ -77,6 +77,8 @@ flowchart TD
 
 “主 Pi”就是你正在对话的 Pi。它负责和你讨论、分配任务、核对结果，再把开发、验收和审查交给不同的子 Agent，也就是在独立会话里工作的 AI。这些会话都在本机工作，同一工作区按顺序交接修改权限。验收只运行约定的命令，审查只提供读取工具；子 Agent 不能代替你确认方案或允许改动的范围。
 
+**主 Pi 用什么模型，子 Agent 就用什么模型。** AI 只按任务难度调整推理级别，不会自行换成别的模型；你切换主 Pi 的模型后，新任务跟着切换，正在执行的任务保持原样。
+
 ```mermaid
 sequenceDiagram
     actor U as 你
@@ -151,7 +153,7 @@ sequenceDiagram
 | 为什么要确认两次，怎样避免 AI 同时改文件 | [确认与写入控制](docs/技术方案.md)（第 8 节） |
 | 怎么检查代码，发现问题后怎么修 | [验收、审查与返工](docs/技术方案.md)（第 10 节） |
 | 中断后怎样查看记录、继续处理 | [进度与中断恢复](docs/技术方案.md)（第 11 节） |
-| AI 的具体协作规则与模型选择 | [adaptive-delivery Skill](skills/adaptive-delivery/SKILL.md) |
+| AI 的具体协作规则与推理级别 | [adaptive-delivery Skill](skills/adaptive-delivery/SKILL.md) |
 | 目前做到了哪一步，有哪些实际案例和测试记录 | [实施计划](docs/实施计划.md) |
 | 本地运行项目测试 | [开发验证](docs/技术方案.md)（第 14.3 节） |
 
