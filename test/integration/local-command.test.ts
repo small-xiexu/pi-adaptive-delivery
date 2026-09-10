@@ -115,8 +115,8 @@ test("真实本机命令完成后模型断流，恢复不重复命令或委派",
 	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
 	assert.deepEqual(tools.map((tool: any) => tool.toolName), ["write", "edit", "bash", "read"]);
 	assert.ok(tools.every((tool: any) => !tool.isError));
-	assert.equal(tools[2].details.execution.exitCode, 0);
-	assert.equal(tools[2].details.execution.settled, true);
+	assert.match(JSON.stringify(tools[2].content), /COMMAND_BEFORE_STREAM_ERROR/);
+	assert.ok(!rows.some((row: any) => row.customType === "delivery-execution"));
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.choices.length, 3);
 });
@@ -133,8 +133,7 @@ console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	assert.deepEqual(tools.map((tool: any) => [tool.toolName, tool.isError]), [["read", true], ["write", false], ["edit", false], ["bash", false], ["read", false]]);
 	assert.match(JSON.stringify(tools[0].content), /ENOENT/);
 	assert.match(JSON.stringify(tools[3].content), /READ_RECOVERY_SELF_CHECK_OK/);
-	assert.equal(tools[3].details.execution.exitCode, 0);
-	assert.equal(tools[3].details.execution.settled, true);
+	assert.ok(!rows.some((row: any) => row.customType === "delivery-execution"), "普通自检不冒充固定验收证据");
 	assert.equal(rows.find((row: any) => row.customType === "delivery-child-exit").data.development.clean, true);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
@@ -169,14 +168,10 @@ console.log("LOCAL_REAL_COMMAND_OK");`);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	const ref = rows.find((row: any) => row.type === "custom" && row.customType === "delivery-execution");
-	assert.ok(ref);
+	assert.equal(ref, undefined, "普通 Shell 保留原生结果，不生成交付执行证明");
 	const tool = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
 	assert.equal(tool.message.isError, false);
 	assert.match(JSON.stringify(tool.message.content), /LOCAL_REAL_COMMAND_OK/);
-	assert.equal(tool.message.details.execution.settled, true);
-	assert.equal(tool.message.details.execution.exitCode, 0);
-	assert.equal(tool.message.details.execution.name, ref.data.name);
-	assert.ok(rows.indexOf(ref) < rows.indexOf(tool));
 	const events = await h.audit();
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-call" && row.toolName === "bash").length, 1);
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-result" && row.toolName === "bash").length, 1);
@@ -195,7 +190,7 @@ for (const kind of ["failure", "hook-deny", "hook-error"]) test(`正式本机命
 	const result = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
 	assert.equal(result?.message.isError, true);
 	assert.match(JSON.stringify(result.message.content), kind === "hook-deny" ? /CONFIGURED_TOOL_HOOK_DENIED/ : kind === "hook-error" ? /CONFIGURED_TOOL_HOOK_ERROR/ : /code 7/);
-	assert.equal(rows.some((row: any) => row.customType === "delivery-execution"), !kind.startsWith("hook-"));
+	assert.equal(rows.some((row: any) => row.customType === "delivery-execution"), false);
 	if (kind === "failure") {
 		assert.equal((await h.call("delivery_develop", { task: "fixture-local-repair：在原授权范围内修复源码并复验" })).isError, false);
 		assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
@@ -228,8 +223,8 @@ test("父 Bash 已被配置覆盖时不将其偷偷替换成本机实现", { tim
 	assert.notEqual(h.session.getAllTools().find((tool) => tool.name === "bash")?.sourceInfo.source, "builtin");
 	const result = await h.call("delivery_develop", { task: "缺少可重建 Bash 能力" });
 	assert.equal(result.isError, true);
-	assert.match(JSON.stringify(result.content), /不能重建该实现/);
-	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.match(JSON.stringify(result.content), /父子工具定义或来源未对齐/);
+	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
 	assert.equal(await h.readLease(), undefined);
 });
 
@@ -302,7 +297,7 @@ test("独立审查读取原目标、代码、真实差异与原始验收记录�
 	const requests = (await h.audit()).filter((row) => row.pid === details.pid && row.phase === "model");
 	assert.equal(requests.length, 4);
 	assert.ok(requests.every((row) => !row.parentMarkerSeen));
-	assert.deepEqual(requests[0].tools, ["read"]);
+	assert.deepEqual(requests[0].tools, ["bash", "edit", "read", "write"]);
 	assert.match(JSON.stringify(requests[0].messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
 	assert.match(JSON.stringify(requests[2].messages), /diff --git/);
 	assert.match(JSON.stringify(requests[3].messages), /delivery-execution.*delivery-child-exit/s);

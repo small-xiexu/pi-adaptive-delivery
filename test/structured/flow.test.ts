@@ -7,7 +7,6 @@ import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { createPiFixture, FixtureRpc, testEnvironment } from "../support/pi-fixture.ts";
 import { createDevelopmentHost } from "../support/development-host.ts";
-import { createStructuredCommands } from "../../extensions/delivery-gate/src/structured.ts";
 
 if (!process.env.ADAPTIVE_STRUCTURED_PACKAGE) throw new Error("Structured 验收须显式 --adapter <已安装 Package>；不静默跳过");
 const adapter = process.env.ADAPTIVE_STRUCTURED_PACKAGE;
@@ -38,14 +37,13 @@ function assertEnhancements(events: any[]) {
 		assert.equal(request.payload.text.verbosity, "low");
 		assert.ok(request.payload.input.some((message: any) => message.role === "developer" && JSON.stringify(message.content).includes(request.child ? "STRUCTURED_CHILD_CONTEXT_PROOF" : "STRUCTURED_PARENT_CONTEXT_PROOF")));
 		assert.ok(!JSON.stringify(request.payload.input.filter((message: any) => message.role === "developer")).includes(request.child ? "STRUCTURED_PARENT_CONTEXT_PROOF" : "STRUCTURED_CHILD_CONTEXT_PROOF"));
-		assert.ok(request.payload.tools.some((tool: any) => tool.name === "read"));
-		if (!request.child) assert.ok(!request.payload.tools.some((tool: any) => ["exec_command", "write_stdin", "apply_patch"].includes(tool.name)));
+		for (const name of ["exec_command", "write_stdin", "apply_patch"]) assert.ok(request.payload.tools.some((tool: any) => tool.name === name));
 	}
 	assert.ok(events.filter((event) => event.phase === "codex-developer-message").every((event) => event.accepted === true));
 	assert.ok(events.filter((event) => event.child && event.phase === "model").every((event) => event.parentMarkerSeen === false));
 }
 
-test("Structured 普通会话保持原执行，shape 关闭父命令，exit 恢复原工具选择", { timeout: 45_000 }, async (t) => {
+test("Structured 进入交付仍保留父命令和补丁，退出保持原工具选择", { timeout: 45_000 }, async (t) => {
 	const h = await createDevelopmentHost(t, "structured-normal", undefined, (f) => configure(f), false);
 	const originalSource = path.join(adapter, "dist/index.js");
 	assert.equal(h.session.getAllTools().find((tool) => tool.name === "exec_command")!.sourceInfo.path, originalSource);
@@ -56,40 +54,42 @@ test("Structured 普通会话保持原执行，shape 关闭父命令，exit 恢�
 	await h.session.prompt("/delivery-shape");
 	for (const name of ["exec_command", "apply_patch"]) {
 		const args = name === "exec_command" ? { cmd: "touch forbidden.txt" } : { input: "*** Begin Patch\n*** Add File: forbidden.txt\n+blocked\n*** End Patch" };
-		assert.equal((await h.call(name, args)).isError, true);
+		assert.equal((await h.call(name, args)).isError, false);
 	}
 	await h.session.prompt("/delivery-exit");
 	assert.deepEqual(h.session.getActiveToolNames(), original);
 	assert.equal((await h.call("exec_command", { cmd: "printf RESTORED >> original.txt", yield_time_ms: 1000 })).isError, false);
 	assert.equal(await readFile(path.join(h.cwd, "original.txt"), "utf8"), "ORIGINAL_HOSTRESTORED");
-	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	assert.equal(await readFile(path.join(h.cwd, "forbidden.txt"), "utf8"), "blocked\n");
 	assert.equal(h.choices.length, 0);
 });
 
-for (const seven of [false, true]) test(`Structured ${seven ? "七工具" : "默认四工具"} 父子只读、图片与上下文增强`, { timeout: 60_000 }, async (t) => {
+for (const seven of [false, true]) test(`Structured ${seven ? "七工具" : "默认四工具"} 父子沿用插件读取、图片与上下文增强`, { timeout: 60_000 }, async (t) => {
 	const h = await createDevelopmentHost(t, "structured-readonly", undefined, (f) => configure(f, false, seven));
 	auditResources(t, h);
 	const result = await h.call("delivery_readonly", { task: "读取 input.txt" });
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.match(JSON.stringify(result.content), /fixture-read-ok/);
 	const child = await jsonl((result.details as any).sessionFile);
-	assert.ok(child.some((row) => row.message?.toolName === "read" && row.message.isError === false));
-	assert.ok(!child.some((row) => row.message?.toolName === "exec_command"));
+	assert.ok(child.some((row) => row.message?.toolName === "exec_command" && row.message.isError === false));
 	await writeFile(path.join(h.cwd, "pixel.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
 	const image = await h.call("view_image", { path: path.join(h.cwd, "pixel.png") });
 	assert.equal(image.isError, false, JSON.stringify(image));
 	assert.ok(image.content.some((part: any) => part.type === "image"));
-	assert.equal((await h.call("exec_command", { cmd: "touch forbidden.txt" })).isError, true);
+	assert.equal((await h.call("exec_command", { cmd: "touch forbidden.txt" })).isError, false);
 	assertEnhancements(await h.audit());
 	await h.session.prompt("/fixture-replace-tool read");
-	assert.equal((await h.call("read", { path: "input.txt" })).isError, true);
-	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	h.session.setActiveToolsByName([...h.session.getActiveToolNames(), "read"]);
+	const read = await h.call("read", { path: "input.txt" });
+	assert.equal(read.isError, true, "原插件自行停用 read，交付包不补回");
+	assert.match(JSON.stringify(read.content), /Tool read not found/);
+	assert.equal(await readFile(path.join(h.cwd, "forbidden.txt"), "utf8"), "");
 });
 
-test("Structured 不合适的加载顺序也不能通过父命令绕过门禁", { timeout: 40_000 }, async (t) => {
+test("Structured 调换加载顺序仍保留父命令", { timeout: 40_000 }, async (t) => {
 	const h = await createDevelopmentHost(t, "structured-readonly", undefined, (f) => configure(f, true));
-	assert.equal((await h.call("exec_command", { cmd: "touch forbidden.txt" })).isError, true);
-	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	assert.equal((await h.call("exec_command", { cmd: "touch forbidden.txt" })).isError, false);
+	await access(path.join(h.cwd, "forbidden.txt"));
 });
 
 async function development(t: TestContext, scenario = "normal", withPlanning = true) {
@@ -139,7 +139,7 @@ for (const withPlanning of [false, true]) test(`Structured ${withPlanning ? "维
 	assertEnhancements(await h.audit());
 });
 
-for (const failed of [false, true]) test(`Structured ${failed ? "过程失败" : "正常"}审查读取真实快照及原始记录，父能继续取证`, { timeout: 90_000 }, async (t) => {
+for (const failed of [false, true]) test(`Structured ${failed ? "命令非零退出" : "正常"}审查读取真实快照及原始记录，父能继续取证`, { timeout: 90_000 }, async (t) => {
 	const h = await development(t, failed ? "evidence-fail" : "evidence");
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
 	const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: h.cwd });
@@ -149,14 +149,17 @@ for (const failed of [false, true]) test(`Structured ${failed ? "过程失败" :
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
 	const review = await h.call("delivery_review", { task: "读取差异和原始验收" });
 	assert.equal(review.isError, false, JSON.stringify(review));
-	if (failed) assert.equal((review.details as any).progress.status, "已结束，有工具错误待核对");
 	const reference = (await jsonl(h.sm.getSessionFile()!)).findLast((row) => row.customType === "delivery-delegation" && row.data.phase === "ended").data;
+	if (failed) {
+		const results = (await jsonl(reference.sessionFile)).filter((row) => row.message?.role === "toolResult").map((row) => row.message);
+		assert.ok(results.some((row) => row.details?.exit_code === 1 && row.isError === false), "非零退出及错误标记保留原插件语义，不能据此说审查通过");
+	}
 	for (const [name, expected] of [["before", "value = 1"], ["after", "value = 2"]]) {
-		const result = await h.call("read", { path: path.join(reference.reviewDirectory, name!, "src/value.js") });
+		const result = await h.call("exec_command", { cmd: `cat '${path.join(reference.reviewDirectory, name!, "src/value.js")}'`, yield_time_ms: 1000 });
 		assert.equal(result.isError, false);
 		assert.ok(JSON.stringify(result.content).includes(expected!));
 	}
-	const result = await h.call("read", { path: reference.sessionFile });
+	const result = await h.call("exec_command", { cmd: `cat '${reference.sessionFile}'`, yield_time_ms: 1000, max_output_tokens: 30000 });
 	assert.equal(result.isError, false);
 	assert.match(JSON.stringify(result.content), /LONG_REVIEW_BEGIN/);
 	assert.match(JSON.stringify(result.content), /LONG_REVIEW_END/);
@@ -174,13 +177,16 @@ for (const scenario of ["outside", "cancel", "unfinished", "crash"]) test(`Struc
 		await h.session.abort();
 	}
 	const result = await run;
-	assert.equal(result.isError, scenario !== "outside", JSON.stringify(result));
-	if (scenario === "outside") assert.equal((result.details as any).progress.status, "已结束，有工具错误待核对");
-	else assert.match(JSON.stringify(result.content), /原始子 Session/);
+	assert.equal(result.isError, scenario === "cancel" || scenario === "crash", JSON.stringify(result));
+	if (scenario === "outside") {
+		const results = (await jsonl((result.details as any).childSessionFile)).filter((row) => row.message?.role === "toolResult").map((row) => row.message);
+		assert.ok(results.some((row) => row.details?.exit_code !== undefined && row.details.exit_code !== 0), "原插件保留自检失败的真实退出码");
+	} else if (scenario !== "unfinished") assert.match(JSON.stringify(result.content), /原始子 Session/);
 	if (scenario === "crash") assert.ok(await h.readLease());
 	else assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-	if (scenario === "unfinished") assert.match(JSON.stringify(result.content), /未通过原生工具交回/);
-	await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
+	if (scenario === "unfinished") assert.ok(!(result.details as any).validation, "原插件后台会话不被当成固定验收通过");
+	if (scenario === "outside") assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "export const value = 2;\n");
+	else await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
 });
 
 test("Structured 本机 PTY 跨工具调用接收输入，真实退出后结束卡片", { timeout: 60_000 }, async (t) => {
@@ -228,14 +234,14 @@ test("Structured 并发只读子与卡片分别归属", { timeout: 60_000 }, asy
 		assert.equal(result.isError, false, JSON.stringify(result));
 		assert.match(JSON.stringify(result.result.content), new RegExp(`EVIDENCE_${suffix.toUpperCase()}`));
 		const views = rpc.records.filter((row) => row.type === "tool_execution_update" && row.toolCallId === result.toolCallId).map((row) => row.partialResult.details.progress);
-		assert.ok(views.some((view) => view.action.includes(`read input-${suffix}.txt`)));
+		assert.ok(views.some((view) => view.action.includes(`exec_command cat input-${suffix}.txt`)));
 		assert.ok(views.every((view) => view.id === result.toolCallId));
 	}
 	assert.notEqual(results[0].result.details.sessionFile, results[1].result.details.sessionFile);
 	assertEnhancements(await jsonl(path.join(f.agentDir, "fixture-events.jsonl")));
 });
 
-test("Structured 父同回合并发 Shell 均被实际工具门禁阻止", { timeout: 40_000 }, async (t) => {
+test("Structured 父同回合 Shell 由原插件执行，不生成交付验收记录", { timeout: 40_000 }, async (t) => {
 	const f = await createPiFixture(source, "structured-command-parallel");
 	await f.rpc.send("get_state"); await f.rpc.stop(); await configure(f);
 	const rpc = new FixtureRpc(f.cwd, { ...testEnvironment(f.root), ADAPTIVE_FIXTURE_SCENARIO: "structured-command-parallel" });
@@ -245,26 +251,22 @@ test("Structured 父同回合并发 Shell 均被实际工具门禁阻止", { tim
 	await rpc.waitFor((row) => row.type === "agent_settled");
 	const results = rpc.records.filter((row) => row.type === "tool_execution_end" && row.toolName === "exec_command");
 	assert.equal(results.length, 2);
-	assert.ok(results.every((row) => row.isError));
+	assert.ok(results.every((row) => !row.isError));
 	assert.ok(!(await rpc.send("get_entries")).data.entries.some((row: any) => row.customType === "delivery-execution"));
 });
 
-test("Structured 原插件本机补丁支持新增、编辑、移动和删除，路径检查先于所有写入", { timeout: 45_000 }, async (t) => {
-	const f = await createPiFixture(source);
-	await f.rpc.send("get_state"); await f.rpc.stop();
+test("Structured 沿用原插件补丁的新增、编辑、移动和删除", { timeout: 45_000 }, async (t) => {
+	const f = await createDevelopmentHost(t, "structured-normal", undefined, (f) => configure(f));
 	await mkdir(path.join(f.cwd, "src"));
 	await writeFile(path.join(f.cwd, "plan.md"), "protected\n");
-	const runner = createStructuredCommands(adapter, f.cwd, async () => {}, async (targets) => {
-		for (const target of targets) assert.ok(target.startsWith(path.join(f.cwd, "src") + path.sep), "fixture approved paths");
-	});
-	t.after(() => runner.finish());
-	const patch = (text: string) => runner.patch(crypto.randomUUID(), `*** Begin Patch\n${text}*** End Patch\n`);
+	const patch = async (text: string) => {
+		const result = await f.call("apply_patch", { input: `*** Begin Patch\n${text}*** End Patch\n` });
+		assert.equal(result.isError, false, JSON.stringify(result));
+	};
 	await patch("*** Add File: src/a.txt\n+original\n*** Add File: src/delete.txt\n+remove me\n");
 	await patch("*** Update File: src/a.txt\n*** Move to: src/moved.txt\n@@\n-original\n+literal '$(touch plan.md)'\n*** Delete File: src/delete.txt\n");
 	assert.equal(await readFile(path.join(f.cwd, "src/moved.txt"), "utf8"), "literal '$(touch plan.md)'\n");
 	await assert.rejects(access(path.join(f.cwd, "src/a.txt")), { code: "ENOENT" });
 	await assert.rejects(access(path.join(f.cwd, "src/delete.txt")), { code: "ENOENT" });
-	await assert.rejects(patch("*** Add File: src/partial.txt\n+must not apply\n*** Add File: plan.md\n+forbidden\n"), /approved paths/);
-	await assert.rejects(access(path.join(f.cwd, "src/partial.txt")), { code: "ENOENT" });
 	assert.equal(await readFile(path.join(f.cwd, "plan.md"), "utf8"), "protected\n");
 });

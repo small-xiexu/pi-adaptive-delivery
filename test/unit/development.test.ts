@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createWriteTool, SessionManager } from "@earendil-works/pi-coding-agent";
+import { captureCandidate } from "../../extensions/delivery-gate/src/candidate.ts";
 import { createChildDevelopment, verifyRecordedResult } from "../../extensions/delivery-gate/src/development.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WRITER_LEASE_VERSION } from "../../extensions/delivery-gate/src/workspace.ts";
 
@@ -31,78 +32,46 @@ async function host(separateGit = false, pristine = false) {
 	const grant = { lease, owner, parent, paths: [cwd], inputs: [], protectedPaths: [path.join(cwd, "plan.md")] };
 	// 单元夹具模拟另一个父进程完成交接；实际跨进程证据由 SDK/CLI 集成提供。
 	const arm = async () => { await writeFile(leaseFile, JSON.stringify(record)); await writer.arm(grant, ctx); };
-	return { root, cwd, sm, ctx, writer, owner, grant, record, leaseFile, arm };
+	return { root, cwd, sm, ctx, writer, owner, grant, record, leaseFile, arm, workspace };
 }
 
-test("开发子会话未交接、错误 owner、缺失保护范围及重复接收均不写入", async () => {
+test("开发子会话核实交接身份与范围，普通开发不能调用固定验收执行器", async () => {
 	const h = await host();
-	await assert.rejects(h.writer.execute("write", "no-grant", { path: "src.js", content: "禁止" }), /未取得/);
+	await assert.rejects(h.writer.execute("no-grant", { command: "touch src.js" }), /未取得/);
 	await assert.rejects(h.writer.arm(h.grant, h.ctx), /尚未真实交接/);
 	await writeFile(h.leaseFile, JSON.stringify(h.record));
 	await assert.rejects(h.writer.arm({ ...h.grant, owner: { ...h.owner, runId: "other" } }, h.ctx), /身份无效/);
 	await assert.rejects(h.writer.arm({ ...h.grant, protectedPaths: [] }, h.ctx), /身份无效/);
 	await h.writer.arm(h.grant, h.ctx);
+	await assert.rejects(h.writer.execute("development", { command: "touch src.js" }), /未取得固定验收/);
 	await assert.rejects(h.writer.arm(h.grant, h.ctx), /已接收交接/);
 	await assert.rejects(access(path.join(h.cwd, "src.js")), { code: "ENOENT" });
 });
 
-test("子 writer 复用原生创建与精确编辑，完整落盘后生成有限收尾证明", async () => {
+test("开发使用原生文件工具，完整 Session 落盘后生成收尾记录", async () => {
 	const h = await host();
 	await h.arm();
-	await h.writer.execute("write", "write", { path: "src/value.js", content: "export const value = 1;\n" });
-	await h.writer.execute("edit", "edit", { path: "src/value.js", edits: [{ oldText: "value = 1", newText: "value = 2" }] });
+	await createWriteTool(h.cwd).execute("write", { path: "src/value.js", content: "export const value = 1;\n" });
+	await createEditTool(h.cwd).execute("edit", { path: "src/value.js", edits: [{ oldText: "value = 1", newText: "value = 2" }] });
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	const result = await h.writer.finish(h.ctx);
 	assert.equal(result.clean, true);
 	assert.deepEqual(result.owner, h.owner);
 	assert.ok("historyDigest" in result);
 	assert.match(result.historyDigest, /^[a-f0-9]{64}$/);
-	await assert.rejects(h.writer.execute("write", "late", { path: "src.js", content: "禁止" }), /未取得/);
+	await assert.rejects(h.writer.execute("late", { command: "touch src.js" }), /未取得/);
 });
 
 test("子命令仍须核实真实工具调用，只有 writer 不能伪造调用", async () => {
 	const h = await host();
-	await h.arm();
-	await assert.rejects(h.writer.execute("bash", "forged-call", { command: "touch forbidden" }), /工具调用未核实/);
+	await writeFile(h.leaseFile, JSON.stringify(h.record));
+	const commands = ["touch forbidden"];
+	h.grant.paths = [path.join(h.cwd, "forbidden")];
+	const before = await captureCandidate({ workspace: h.workspace, readPaths: [], writePaths: h.grant.paths, protectedPaths: [...h.grant.protectedPaths, h.sm.getSessionFile()!] }, commands);
+	await h.writer.arm({ ...h.grant, validation: { commands, before } }, h.ctx);
+	await assert.rejects(h.writer.execute("forged-call", { command: commands[0]! }), /工具调用未核实/);
 	await assert.rejects(access(path.join(h.cwd, "forbidden")), { code: "ENOENT" });
 });
-
-for (const target of ["../outside.js", "plan.md", ".git/metadata.md"]) {
-	test(`子 I/O 拒绝受保护或越界目标 ${target}`, async () => {
-		const h = await host();
-		await h.arm();
-		await assert.rejects(h.writer.execute("write", "denied", { path: target, content: "禁止" }), /路径/);
-		await assert.rejects(access(path.resolve(h.cwd, target)), { code: "ENOENT" });
-	});
-}
-
-test("子 writer 保护实际 separate-git-dir，不仅保护 .git 名称", async () => {
-	const h = await host(true);
-	await h.arm();
-	await assert.rejects(h.writer.execute("write", "metadata", { path: "metadata/forbidden.js", content: "禁止" }), /受保护路径/);
-	await assert.rejects(access(path.join(h.cwd, "metadata/forbidden.js")), { code: "ENOENT" });
-});
-
-for (const change of ["runId", "processToken", "symlink", "hardlink", "cancel", "session"]) {
-	test(`子文件执行前 ${change} 变化不能沿用 writer`, async () => {
-		const h = await host();
-		await h.arm();
-		await writeFile(path.join(h.cwd, "user.js"), "用户内容");
-		const signal = new AbortController();
-		if (change === "runId" || change === "processToken") {
-			const record = structuredClone(h.record);
-			record.owner[change] = "different";
-			if (change === "runId") record.coordinator.runId = "different";
-			await writeFile(h.leaseFile, JSON.stringify(record));
-		}
-		if (change === "symlink") await symlink("user.js", path.join(h.cwd, "target.js"));
-		if (change === "hardlink") await link(path.join(h.cwd, "user.js"), path.join(h.cwd, "target.js"));
-		if (change === "cancel") signal.abort();
-		if (change === "session") h.ctx.sessionManager = SessionManager.inMemory(h.cwd);
-		await assert.rejects(h.writer.execute("write", "denied", { path: "target.js", content: "禁止" }, signal.signal));
-		assert.equal(await readFile(path.join(h.cwd, "user.js"), "utf8"), "用户内容");
-	});
-}
 
 test("子收尾拒绝仅内存存在的记录，不用 clean 标记掩盖持久化缺失", async () => {
 	const h = await host();
@@ -120,9 +89,8 @@ test("未发任务且未执行工具的子关闭不要求尚未创建的模型 S
 	await assert.rejects(access(h.sm.getSessionFile()!), { code: "ENOENT" });
 });
 
-for (const kind of ["message", "execution"]) test(`子已有 ${kind} 后丢失 Session 不能按未开始收尾`, async () => {
-	const h = await host(false, kind === "execution");
-	if (kind === "execution") { await h.arm(); await h.writer.execute("write", "write", { path: "src/value.js", content: "changed\n" }); }
+test("子已有消息后丢失 Session 不能按未开始收尾", async () => {
+	const h = await host();
 	await rm(h.sm.getSessionFile()!, { force: true });
 	await assert.rejects(h.writer.finish(h.ctx), { code: "ENOENT" });
 });

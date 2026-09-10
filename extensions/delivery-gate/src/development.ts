@@ -2,15 +2,14 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { createBashTool, createEditTool, createWriteTool, truncateHead, type AgentToolResult, type BashToolInput, type EditToolInput, type ExtensionAPI,
-	type ExtensionContext, type RpcSessionState, type SessionEntry, type WriteToolInput } from "@earendil-works/pi-coding-agent";
+import { createBashTool, truncateHead, type AgentToolResult, type BashToolInput, type ExtensionAPI,
+	type ExtensionContext, type RpcSessionState, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { installApprovals } from "./approvals.ts";
-import { createDevelopmentFileTools } from "./planning-documents.ts";
 import { current, nativeEntries, snapshot, type SessionBinding } from "./parent-writer.ts";
 import { CHILD_EXIT, DELEGATION_ENTRY, createChildDialogs, delegateReadOnly, parseReadOnlySession, readyChild, startChild, type ChildRpc, type ChildTask } from "./subagents.ts";
 import { createLocalOperations, type ExecutionReference } from "./local-execution.ts";
 import { createTaskProgress, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
-import { createStructuredCommands, type ExecInput, type StdinInput } from "./structured.ts";
+import { createStructuredCommands, type ExecInput } from "./structured.ts";
 import { captureCandidate, type CandidateSnapshot, type CandidateScope } from "./candidate.ts";
 import { prepareReview } from "./review.ts";
 import { createValidationRun, validationPassed, type ValidationProof } from "./validation.ts";
@@ -38,7 +37,7 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 
 export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 	let prepared: { workspace: WorkspaceIdentity; gitDir: string; leases: WriterLeaseManager; owner: WriterLeaseOwner } | undefined;
-	let tools: ReturnType<typeof createDevelopmentFileTools> | undefined;
+	let armed = false;
 	let local: ReturnType<typeof createLocalOperations> | undefined;
 	let structured: ReturnType<typeof createStructuredCommands> | undefined;
 	let commandScope: CandidateScope | undefined;
@@ -61,7 +60,7 @@ export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 			return { ...owner };
 		},
 		async arm(value: unknown, ctx: ExtensionContext) {
-			if (!prepared || tools || stopped || ctx.mode !== "rpc") throw new Error("子 writer 尚未准备、已接收交接或模式不符");
+			if (!prepared || armed || stopped || ctx.mode !== "rpc") throw new Error("子 writer 尚未准备、已接收交接或模式不符");
 			const grant = snapshot(value) as ChildGrant;
 			const lease = parseWriterLeaseReference(grant?.lease);
 			if (!lease || !isDeepStrictEqual(grant.owner, prepared.owner)
@@ -76,6 +75,7 @@ export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 			if (!Array.isArray(grant.inputs) || grant.inputs.some((item) => typeof item !== "string" || !path.isAbsolute(item))) throw new Error("验收输入范围无效");
 			const protectedPaths = [...grant.protectedPaths, sessionFile, prepared.gitDir];
 			if (grant.validation && (!Array.isArray(grant.validation.commands) || !grant.validation.before)) throw new Error("固定验收缺少命令清单或准备候选");
+			if (!grant.validation) { armed = true; return; }
 			{
 				commandScope = { workspace: prepared.workspace, readPaths: grant.inputs, writePaths: grant.paths, protectedPaths };
 				beforeCommand = async (reference, callId, name) => {
@@ -96,51 +96,41 @@ export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 				};
 				local = createLocalOperations(prepared.workspace.cwdPath, (reference) => beforeCommand!(reference, commandId!, "bash"));
 			}
-			if (grant.validation) validation = await createValidationRun(commandScope, grant.validation.commands, grant.validation.before);
-			tools = createDevelopmentFileTools({ ...prepared, lease, paths: grant.paths, signal: lifetime.signal,
-				authorize: async () => {
-					if (stopped || ctx.sessionManager.getSessionId() !== owner.sessionId || ctx.sessionManager.getSessionFile() !== sessionFile) throw new Error("子 writer 生命周期已变化");
-				} }, protectedPaths);
+			validation = await createValidationRun(commandScope, grant.validation.commands, grant.validation.before);
+			armed = true;
 		},
-		async execute(kind: "edit" | "write" | "bash", id: string, input: EditToolInput | WriteToolInput | BashToolInput, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
-			if (!tools || stopped) throw new Error("本子会话未取得已授权 writer，未执行文件变更");
+		async execute(id: string, input: BashToolInput, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
+			if (!armed || !validation || stopped) throw new Error("本子会话未取得固定验收交接，未执行验收命令");
 			if (active || structured?.active || structured?.cleanupFailed || local?.active) throw new Error("子 writer 尚有执行或收尾未知，未开始新操作");
-			if (validation && kind !== "bash") throw new Error("固定候选验收不提供文件编辑权限，修改后须重新形成候选");
 			executed = true;
 			active++;
 			try {
-				if (kind === "bash") {
-					commandId = id;
-					const operation = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
-					const invoke = () => createBashTool(prepared!.workspace.cwdPath, { operations: local!.operations, exposeSessionEnvironment: false })
-						.execute(id, input as BashToolInput, operation, update);
-					const result = validation ? await validation.execute(id, input as BashToolInput, invoke, () => local!.lastExecution) : await invoke();
-					return { ...result, details: { ...result.details, execution: local!.lastExecution } };
-				}
-				return kind === "edit" ? await tools.edit(id, input as EditToolInput, signal) : await tools.write(id, input as WriteToolInput, signal);
+				commandId = id;
+				const operation = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+				const invoke = () => createBashTool(prepared!.workspace.cwdPath, { operations: local!.operations, exposeSessionEnvironment: false })
+					.execute(id, input, operation, update);
+				const result = await validation.execute(id, input, invoke, () => local!.lastExecution);
+				return { ...result, details: { ...result.details, execution: local!.lastExecution } };
 			} finally { commandId = undefined; active--; }
 		},
-		async executeStructured(name: string, id: string, input: any, packageRoot: string, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
-			if (!tools || stopped || !commandScope || !beforeCommand) throw new Error("Structured 子开发需要本轮已交接的 writer");
+		async executeStructured(id: string, input: ExecInput, packageRoot: string, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
+			if (!armed || !validation || stopped || !commandScope || !beforeCommand) throw new Error("Structured 固定验收需要本轮交接");
 			if (active || local?.active || structured?.cleanupFailed) throw new Error("子 writer 尚有原生调用或收尾未知");
-			if (validation && (name !== "exec_command" || input.tty || input.login || input.shell
-				|| input.workdir && path.resolve(prepared!.workspace.cwdPath, input.workdir) !== prepared!.workspace.cwdPath)) throw new Error("固定验收仅使用原工作目录与默认 Shell，不接收补丁、交互或其他 Shell");
-			structured ??= createStructuredCommands(packageRoot, prepared!.workspace.cwdPath, beforeCommand, tools.checkPaths);
+			if (input.tty || input.login || input.shell
+				|| input.workdir && path.resolve(prepared!.workspace.cwdPath, input.workdir) !== prepared!.workspace.cwdPath) throw new Error("固定验收仅使用原工作目录与默认 Shell，不接收交互或其他 Shell");
+			structured ??= createStructuredCommands(packageRoot, prepared!.workspace.cwdPath, beforeCommand);
 			const operation = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
 			executed = true;
 			active++;
 			try {
-				if (name === "apply_patch") return await structured.patch(id, input.input, operation);
-				if (name === "write_stdin") return await structured.stdin(input as StdinInput, operation, update);
-				if (name !== "exec_command") throw new Error("未知 Structured 写工具");
-				const invoke = () => structured!.exec(id, input as ExecInput, operation, update, Boolean(validation));
-				return validation ? await validation.execute(id, { command: input.cmd }, invoke, () => structured!.lastExecution) : await invoke();
+				const invoke = () => structured!.exec(id, input, operation, update);
+				return await validation.execute(id, { command: input.cmd }, invoke, () => structured!.lastExecution);
 			} finally { active--; }
 		},
 		async finish(ctx: ExtensionContext) {
 			stopped = true;
 			lifetime.abort(new Error("子会话正在关闭"));
-			if (!prepared || active || tools?.cleanupFailed || local?.active) throw new Error("子 writer 的执行或句柄清理尚未核实");
+			if (!prepared || active || local?.active) throw new Error("子 writer 的执行或句柄清理尚未核实");
 			const structuredClose = await structured?.finish();
 			const file = ctx.sessionManager.getSessionFile();
 			if (!file) throw new Error("子 Session 文件缺失");
@@ -274,8 +264,11 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					validationCommands = [...grant.validationCommands];
 				}
 				const running = executionSignal = AbortSignal.any([operation, grant.signal]);
-				for (const toolName of name === REVIEW_TOOL || input.environment.structured ? [] : ["edit", "write", "bash"]) {
-					if (pi.getAllTools().find((tool) => tool.name === toolName)?.sourceInfo.source !== "builtin") throw new Error(`任务所需 ${toolName} 已被覆盖，当前受控开发路径不能重建该实现，未委派`);
+				if (name === VALIDATION_TOOL) {
+					if (input.environment.structured && input.environment.structured.version !== "3.0.29") throw new Error("固定验收目前仅支持 pi-codex-conversion 3.0.29；普通工具仍沿用原插件");
+					const commandTool = input.environment.structured ? "exec_command" : "bash";
+					if (!input.environment.tools.some((tool) => tool.name === commandTool)) throw new Error(`父 Pi 未启用 ${commandTool}，不能运行固定验收`);
+					if (!input.environment.structured && pi.getAllTools().find((tool) => tool.name === "bash")?.sourceInfo.source !== "builtin") throw new Error("固定验收需要原生 bash 或已支持的 Structured 执行器；普通工具仍沿用 Pi，未启动验收");
 				}
 				const records = await nativeEntries(state, ctx);
 				const call = records.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
@@ -342,15 +335,6 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					};
 					const { state: child, data } = await readyChild(rpc, input, childSignal, (value) => { state.child = value; });
 					progress.agent({ provider: child.model!.provider, id: child.model!.id, thinking: child.thinkingLevel, reason: input.selectionReason });
-					const expectedTools = input.environment.structured ? ["exec_command", "write_stdin", "apply_patch"].map((name) => {
-						const tool = pi.getAllTools().find((tool) => tool.name === name);
-						if (tool?.sourceInfo.path !== input.environment.structured!.entry) throw new Error(`Structured ${name} 的原实现已变化`);
-						return [name, tool.parameters] as const;
-					}) : [["edit", createEditTool(".").parameters], ["write", createWriteTool(".").parameters], ["bash", createBashTool(".").parameters]] as const;
-					for (const [name, parameters] of expectedTools) {
-						const tool = data.developmentTools?.find((item: any) => item.name === name);
-						if (tool?.sourceInfo?.path !== input.entryPath || !isDeepStrictEqual(tool.parameters, snapshot(parameters))) throw new Error(`子 ${name} 实现来源或参数未核实`);
-					}
 					if (data.owner?.pid !== rpc.process.pid || data.owner?.sessionId !== child.sessionId || data.owner?.runId !== input.id) throw new Error("子 writer 身份未核实");
 					const childOwner = snapshot(data.owner) as WriterLeaseOwner;
 					await state.leases.handoff(state.lease, parent, childOwner, async () => {
@@ -368,8 +352,8 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					progress.phase("运行中", "子任务已接收 writer", child.sessionFile);
 					await Promise.all([rpc.waitSettled(childSignal), rpc.request({ type: "prompt", message:
 						(validationCommands ? `固定候选验收。严格按下列固定验收命令顺序逐条调用 ${input.environment.structured ? "exec_command" : "bash"}，不替换命令、不编辑文件，失败后停止。验收调用等待真实退出，不使用 tty/write_stdin。不得用文字或手工模拟结果代替执行。\n`
-							: "开发子任务。只使用已交接的工具，不修改父规划文档，不继续委派。\n")
-						+ `本机开发，工作目录 ${input.cwd}，使用本机已有工具链与当前用户权限。遵守已批准范围，不擅自安装依赖、访问外部系统或留下后台服务；Shell 不提供路径或网络隔离。额外验收输入 ${JSON.stringify(grant.inputs)}。\n`
+							: "开发子任务。沿用父 Pi 原有工具和权限，遵守本任务批准范围，不修改父规划文档，不继续委派。\n")
+						+ `本机开发，工作目录 ${input.cwd}，使用本机已有工具链与当前用户权限。正常联网检索和查阅资料可直接使用原工具；安装依赖、外部写入或后台服务仍须遵守用户授权。额外验收输入 ${JSON.stringify(grant.inputs)}。\n`
 						+ `\n已批准开发路径：${JSON.stringify(grant.paths)}\n固定验收命令：${JSON.stringify(grant.validationCommands)}\n`
 						+ `\n已批准方案：\n${grant.designBody}\n\n已批准实施计划：\n${grant.implementationBody}\n\n本次任务：\n${input.task}` }, childSignal)]);
 					if (validationCommands && rpc.toolError) throw new Error("固定验收存在工具失败，请核对原生记录");

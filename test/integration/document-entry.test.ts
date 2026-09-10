@@ -119,11 +119,11 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.ok(h.prompts.every((prompt) => !prompt.includes("交付已启用：")));
 	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-activation"));
 	await h.session.prompt("/delivery-shape");
-	assert.ok(!h.session.getActiveToolNames().includes("write"));
+	assert.ok(h.session.getActiveToolNames().includes("write"));
 	h.api.setActiveTools([...h.session.getActiveToolNames(), "write", "plugin_tool"]);
-	assert.equal((await h.call("write", { path: "blocked.txt", content: "禁止" })).isError, true);
-	assert.equal((await h.call("plugin_tool", {})).isError, true);
-	assert.match(h.prompts.at(-1)!, /交付已启用：.*Shell 使用当前用户权限/);
+	assert.equal((await h.call("write", { path: "blocked.txt", content: "原工具" })).isError, false);
+	assert.equal((await h.call("plugin_tool", {})).isError, false);
+	assert.match(h.prompts.at(-1)!, /交付已启用：保留 Pi 原有工具与权限检查/);
 	assert.ok(h.prompts.at(-1)!.includes(fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))));
 	await h.session.prompt("/delivery-exit");
 	assert.deepEqual(h.session.getActiveToolNames(), original);
@@ -132,21 +132,21 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.match(JSON.stringify((await h.call("plugin_tool", {})).content), /PLUGIN_ORIGINAL/);
 	assert.ok(!h.prompts.at(-1)!.includes("交付已启用："));
 	assert.equal(await readFile(path.join(h.cwd, "normal.txt"), "utf8"), "正常写入");
-	await assert.rejects(access(path.join(h.cwd, "blocked.txt")), { code: "ENOENT" });
+	assert.equal(await readFile(path.join(h.cwd, "blocked.txt"), "utf8"), "原工具");
 	assert.equal(h.choices.length, 0);
 });
 
-test("显式进入后的 reload 和重开保持门禁，退出后的重开保持普通使用", async (t) => {
+test("显式进入后的 reload 和重开保留交付入口及普通工具，旧批准不恢复", async (t) => {
 	const h = await host(t);
 	await h.call(documentWrite, { path: "plan.md", content: "原始规划" });
 	await h.approve();
 	await h.session.reload();
 	assert.equal((await h.approve("implementation", ["src"])).isError, true);
-	assert.ok(!h.session.getActiveToolNames().includes("write"));
+	assert.ok(h.session.getActiveToolNames().includes("write"));
 	await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 	const reopened = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
 	assert.ok(reopened.session.getActiveToolNames().includes(documentWrite));
-	assert.ok(!reopened.session.getActiveToolNames().includes("write"));
+	assert.ok(reopened.session.getActiveToolNames().includes("write"));
 	await reopened.session.prompt("/delivery-exit");
 	const normal = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
 	assert.ok(normal.session.getActiveToolNames().includes("write"));
@@ -162,7 +162,7 @@ for (const failure of ["record", "lock"]) test(`真实 SDK 退出遇到未知 wr
 	if (failure === "record") await writeFile(file, "broken");
 	else await mkdir(file);
 	await h.session.prompt("/delivery-exit");
-	assert.ok(!h.session.getActiveToolNames().includes("write"));
+	assert.ok(h.session.getActiveToolNames().includes("write"));
 	assert.ok(h.notices.some((text) => text.startsWith("暂不能退出交付")));
 	await access(file);
 	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-activation" && (row.data as any).enabled === false));
@@ -178,7 +178,7 @@ async function userBash(h: Awaited<ReturnType<typeof host>>, command: string, ex
 	return h.session.executeBash(command, onChunk, { excludeFromContext, operations: event?.operations });
 }
 
-test("父 TUI 手动 Shell 执行真实 pwd、保留退出码和 !! 上下文语义，模型不能继承权限", async (t) => {
+test("父 TUI 手动 Shell 保留退出码和 !! 上下文语义，普通模型 Shell 同样可用但不产生交付批准", async (t) => {
 	const h = await host(t);
 	const chunks: string[] = [];
 	const pwd = await userBash(h, "pwd", false, (chunk) => chunks.push(chunk));
@@ -195,8 +195,8 @@ test("父 TUI 手动 Shell 执行真实 pwd、保留退出码和 !! 上下文语
 	assert.equal(failed.exitCode, 7);
 	assert.equal(failed.output, "MANUAL_FAILURE");
 	const denied = await h.call("bash", { command: "printf MODEL_OVERWRITE > manual.txt" });
-	assert.equal(denied.isError, true);
-	assert.equal(await readFile(path.join(h.cwd, "manual.txt"), "utf8"), "user_content");
+	assert.equal(denied.isError, false);
+	assert.equal(await readFile(path.join(h.cwd, "manual.txt"), "utf8"), "MODEL_OVERWRITE");
 	const context = JSON.stringify(h.contexts);
 	assert.match(context, /VISIBLE_MANUAL/);
 	assert.doesNotMatch(context, /HIDDEN_MANUAL/);
@@ -363,7 +363,7 @@ test("正式入口默认创建及持续编辑，文档写入无审批，进度�
 	assert.equal(h.choices.length, 2, "只有方案与实施确认");
 });
 
-test("默认文档编辑拒绝源码、越界与 Git，原生写入和 Shell 不开放", async (t) => {
+test("交付文档工具拒绝源码、越界与 Git，普通文件和 Shell 沿用 Pi", async (t) => {
 	const h = await host(t);
 	assert.equal((await h.call(documentWrite, { path: "other.md", content: "默认允许" })).isError, false);
 	assert.equal(await h.readLease(), undefined);
@@ -373,10 +373,10 @@ test("默认文档编辑拒绝源码、越界与 Git，原生写入和 Shell 不
 		await assert.rejects(access(path.resolve(h.cwd, target)), { code: "ENOENT" });
 	}
 	h.api.setActiveTools([...h.session.getActiveToolNames(), "write", "edit", "bash"]);
-	assert.equal((await h.call("write", { path: "plan.md", content: "禁止" })).isError, true);
-	assert.equal((await h.call("bash", { command: "touch forbidden.txt" })).isError, true);
-	await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
-	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	assert.equal((await h.call("write", { path: "plan.md", content: "原工具" })).isError, false);
+	assert.equal((await h.call("bash", { command: "touch forbidden.txt" })).isError, false);
+	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "原工具");
+	await access(path.join(h.cwd, "forbidden.txt"));
 	assert.equal(h.choices.length, 0);
 });
 
@@ -389,7 +389,7 @@ for (const name of [documentWrite, documentEdit]) for (const phase of ["startup"
 	assert.notEqual(h.session.getAllTools().find((tool) => tool.name === name)?.sourceInfo.path, entry);
 	const result = await h.call(name, {});
 	assert.equal(result.isError, true);
-	assert.match(JSON.stringify(result.content), /不在当前已验证/);
+	assert.match(JSON.stringify(result.content), /实现来源已变化/);
 	assert.equal(await h.readLease(), undefined);
 	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
 });

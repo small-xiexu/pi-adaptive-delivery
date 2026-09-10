@@ -189,22 +189,28 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				}
 				const reviewEvidence = reviewChild ? JSON.parse(taskText.split("\n").find((line) => line.startsWith("审查证据："))!.slice("审查证据：".length)) : undefined;
 				const readonlyEscalation = development && isChild() && !developmentChild && JSON.stringify(user?.content).includes("fixture-read-then-write");
-				const finished = !planned && read && !readSkill && !recoverRead && (editRecovery ? step >= 3 : structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
+				const inheritedCalls = isChild() && taskText.includes("fixture-inherited-tools") ? [
+					{ name: "web_search", arguments: { query: "library version" } },
+					{ name: "fetch_content", arguments: { url: "https://example.invalid/docs" } },
+					{ name: "plugin_echo", arguments: {} },
+					{ name: "web_search", arguments: { query: "blocked" } },
+				] : undefined;
+				const finished = !planned && read && !readSkill && !recoverRead && (inheritedCalls ? step >= inheritedCalls.length : editRecovery ? step >= 3 : structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
 					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
 					: !developmentChild || developmentStep >= (localChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
 					&& (!readonlyEscalation || step >= 2 || read.isError);
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write") || readonlyEscalation && step === 1;
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
-				const toolName = planned?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && developmentChild ? !validationChild && step === 0 ? "apply_patch" : scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
+				const toolName = planned?.name ?? inheritedCalls?.[step]?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && isChild() ? developmentChild && !validationChild && step === 0 ? "apply_patch" : scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
 					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && localChild ? "bash" : "read"
 					: writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
 					: document ? scenario.endsWith("edit") ? "delivery_document_edit" : "delivery_document_write" : approval ? "delivery_approval" : write ? "write" : "read");
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
 				const target = scenario === "development-outside" ? "../outside.js" : scenario === "development-plan" ? "plan.md"
 					: scenario === "development-git" ? ".git/forbidden.js" : scenario === "development-separate-git" ? "metadata/forbidden.js" : "src/value.js";
-				const args = planned?.arguments ?? (editRecovery ? { path: target, ...(step === 1 ? {} : { edits: step === 0 ? [{ oldText: " = 1", newText: " = 2" }]
-					: [{ oldText: "first = 1", newText: "first = 2" }, { oldText: "second = 1", newText: "second = 2" }] }) } : structured && developmentChild ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
+				const args = planned?.arguments ?? inheritedCalls?.[step]?.arguments ?? (editRecovery ? { path: target, ...(step === 1 ? {} : { edits: step === 0 ? [{ oldText: " = 1", newText: " = 2" }]
+					: [{ oldText: "first = 1", newText: "first = 2" }, { oldText: "second = 1", newText: "second = 2" }] }) } : structured && isChild() ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
 					: toolName === "write_stdin" ? { session_id: (read as any)?.details?.session_id, chars: "TTY_INPUT_PROOF\n", yield_time_ms: 30_000 }
 					: { cmd: validationChild ? "node inputs/command.cjs" : reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile}'`
 						: developmentChild ? step === 1 ? scenario.endsWith("structured-pty") ? "read value; printf '%s' \"$value\" > src/typed.txt"
@@ -229,10 +235,11 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const aborted = options?.signal?.aborted === true;
 				if (isChild() && scenario.endsWith("readonly-parallel")) {
 					const target = taskText.includes("input-b.txt") ? "input-b.txt" : "input-a.txt";
-					Object.assign(args, { path: target });
+					Object.assign(args, structured ? { cmd: `cat ${target}` } : { path: target });
 				}
 				if (reviewChild && scenario.includes("structured-evidence")) {
-					Object.assign(args, { path: step === 0 ? reviewEvidence.diffFile : step === 2 && scenario.endsWith("-fail") ? "missing-review-input" : reviewEvidence.validationSessionFile });
+					const file = step === 0 ? reviewEvidence.diffFile : step === 2 && scenario.endsWith("-fail") ? "missing-review-input" : reviewEvidence.validationSessionFile;
+					Object.assign(args, { cmd: `cat '${file}'` });
 				}
 				const longReview = `LONG_REVIEW_BEGIN\n${"原始审查正文中文🔎\u2028".repeat(180)}\nLONG_REVIEW_END`;
 				const output: AssistantMessage = {
@@ -241,7 +248,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 						: reviewChild ? `FAKE_REVIEW_MECHANISM：${JSON.stringify(messages.find((message) => message.role === "toolResult")?.content).includes("value = 1") ? "P1 src/value.js:1 需要父会话裁决并修复 value" : "未发现本夹具范围内问题"}`
 						: `隔离✅\u2028保留\u2029JSONL ${JSON.stringify(read!.content)}` }]
 					: !isChild() && delegate && scenario.endsWith("readonly-parallel") ? ["a", "b"].map((target) => ({ type: "toolCall", id: `parallel-${target}`, name: "delivery_readonly", arguments: { task: `读取 input-${target}.txt 并说明事实` } }))
-					: !isChild() && scenario === "structured-command-parallel" ? ["a", "b"].map((target) => ({ type: "toolCall", id: `command-${target}`, name: "exec_command", arguments: { cmd: "sleep 120", yield_time_ms: 250 } }))
+					: !isChild() && scenario === "structured-command-parallel" ? ["a", "b"].map((target) => ({ type: "toolCall", id: `command-${target}`, name: "exec_command", arguments: { cmd: `printf ORIGINAL_${target}`, yield_time_ms: 1000 } }))
 					: [...(reviewChild && scenario.endsWith("structured-evidence-fail") && step === 2 ? [{ type: "text" as const, text: longReview }] : []),
 						{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: args }],
 					stopReason: aborted ? "aborted" : finished ? "stop" : "toolUse", timestamp: Date.now(),

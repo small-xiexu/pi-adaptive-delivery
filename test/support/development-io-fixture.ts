@@ -33,33 +33,23 @@ export default async function developmentIoFixture(pi: ExtensionAPI) {
 		rows.find((row) => row.message?.role === "toolResult").message.content = [{ type: "text", text: "篡改已落盘结果" }];
 		await writeFile(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
 	});
-	if (!["development-wait", "development-partial", "development-close"].includes(scenario ?? "")) return;
+	if (!["development-wait", "development-partial"].includes(scenario ?? "")) return;
 	if (await access(path.join(agentDir, "development-fault-used")).then(() => true, () => false)) return;
-	const open = fs.open;
-	fs.open = async (...args: Parameters<typeof open>) => {
-		const handle = await open(...args);
-		if (String(args[0]) !== path.join(process.cwd(), "src/value.js")) return handle;
-		const write = handle.writeFile.bind(handle);
-		handle.writeFile = async (...content: Parameters<typeof write>) => {
-			if (scenario === "development-wait") {
-				audit("development-io-pending");
-				const deadline = Date.now() + 15_000;
-				while (!await access(path.join(agentDir, "development-unblock")).then(() => true, () => false)) {
-					if (Date.now() >= deadline) throw new Error("fixture I/O unblock timeout");
-					await setTimeout(20);
-				}
+	const nativeWrite = fs.writeFile;
+	fs.writeFile = async (...args: Parameters<typeof nativeWrite>) => {
+		if (String(args[0]) !== path.join(process.cwd(), "src/value.js")) return nativeWrite(...args);
+		if (scenario === "development-wait") {
+			audit("development-io-pending");
+			const deadline = Date.now() + 15_000;
+			while (!await access(path.join(agentDir, "development-unblock")).then(() => true, () => false)) {
+				if (Date.now() >= deadline) throw new Error("fixture I/O unblock timeout");
+				await setTimeout(20);
 			}
-			if (scenario === "development-partial") { await write("部分写入"); throw new Error("fixture partial write"); }
-			await write(...content);
-		};
-		const close = handle.close.bind(handle);
-		handle.close = async () => {
-			await close();
-			audit("development-handle-closed");
-			if (scenario === "development-close") throw new Error("fixture handle close failure");
-		};
-		return handle;
+		}
+		if (scenario === "development-partial") { await nativeWrite(args[0], "部分写入"); throw new Error("fixture partial write"); }
+		await nativeWrite(...args);
+		audit("development-handle-closed");
 	};
 	syncBuiltinESMExports();
-	pi.on("session_shutdown", () => { fs.open = open; syncBuiltinESMExports(); });
+	pi.on("session_shutdown", () => { fs.writeFile = nativeWrite; syncBuiltinESMExports(); });
 }

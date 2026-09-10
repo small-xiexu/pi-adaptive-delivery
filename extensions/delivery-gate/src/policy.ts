@@ -5,40 +5,22 @@ import { DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./parent-writer.ts";
 import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
 import { GIT_STATUS_TOOL } from "./workspace.ts";
 
-export const CAPABILITY_NOTICE = "交付已启用：父会话负责讨论、Markdown 和委派；开发须方案及实施确认与 writer 交接，原生或已核实 Structured 命令在本机执行。文件工具检查路径，Shell 使用当前用户权限，不提供文件、网络或后台进程隔离。讨论与独立审查仅提供读取工具。用户在父 TUI 手动 !/!! 沿用 Pi 原生行为，不授予 AI 权限或替代固定验收。旧批准和验收不自动恢复，完成结论须有当前候选证据。";
-const NATIVE_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
+export const CAPABILITY_NOTICE = "交付已启用：保留 Pi 原有工具与权限检查，联网查资料、文件、Shell 和插件能力不按角色删减。方案与实施仍分别确认，交付委派、写入交接和固定候选验收只管理本 Package 的交付调用。普通工具不由交付 writer 接管，也不能用其输出代替固定验收。父负责讨论与协调，子按任务要求开发或只读审查；两者都应遵守用户授权，不能因工具可用就擅自写入、递归委派或执行外部操作。旧批准和验收不自动恢复，完成结论须有当前候选证据。";
 
-export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">): string[] {
-	const tools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-	return pi.getActiveTools().filter((name) => NATIVE_READ_TOOLS.has(name)
-		&& tools.get(name)?.sourceInfo.source === "builtin");
+// 子任务继承父实际启用的工具；交付协调工具属于父会话，不是项目原有能力。
+export function inheritedTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">, entryPath: string) {
+	const active = new Set(pi.getActiveTools());
+	return pi.getAllTools().filter((tool) => active.has(tool.name) && tool.sourceInfo.path !== entryPath);
 }
 
-export function installPolicy(pi: ExtensionAPI, coordinatorPath?: string, developerPath?: string, structuredAllowed: (name: string) => boolean = () => false): () => void {
-	const coordinatorAllowed = (name: string) => coordinatorPath !== undefined && [GIT_STATUS_TOOL, DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL].includes(name)
-		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === coordinatorPath);
-	const developerAllowed = (name: string) => developerPath !== undefined && ["edit", "write", "bash"].includes(name)
-		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === developerPath);
-	const restrictTools = () => {
-		const tools = allowedReadTools(pi);
-		tools.push(...pi.getActiveTools().filter((name) => coordinatorAllowed(name) || developerAllowed(name) || structuredAllowed(name)));
-		pi.setActiveTools(tools);
-	};
-	pi.on("session_start", restrictTools);
-	// active-tools 只减少模型看到的工具，不作为权限保证；实际调用时重新核实实现来源。
+export function installPolicy(pi: ExtensionAPI, entryPath: string): void {
+	const ownTools = [GIT_STATUS_TOOL, DELEGATE_TOOL, APPROVAL_TOOL, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL];
+	// 仅核实本 Package 的交付入口；普通工具继续由 Pi 和原有插件判断。
 	pi.on("tool_call", (event) => {
+		if (!ownTools.includes(event.toolName)) return;
 		try {
-			if (coordinatorAllowed(event.toolName) || developerAllowed(event.toolName) || structuredAllowed(event.toolName)) return undefined;
-			if (allowedReadTools(pi).includes(event.toolName)) return undefined;
-		} catch (error) {
-			return { block: true, reason: `无法核实工具权限，未执行：${String(error)}` };
-		}
-		return { block: true, reason: `${CAPABILITY_NOTICE} 工具 ${event.toolName} 不在当前已验证的原生只读或父协调能力内，未执行。` };
+			if (pi.getAllTools().some((tool) => tool.name === event.toolName && tool.sourceInfo.path === entryPath)) return;
+		} catch (error) { return { block: true, reason: `无法核实交付工具来源，未执行：${String(error)}` }; }
+		return { block: true, reason: `交付工具 ${event.toolName} 的实现来源已变化，未执行。` };
 	});
-	// 用户在父 TUI 的 !/!! 交回 Pi；RPC 与子角色不能借此取得宿主执行能力。
-	pi.on("user_bash", (_event, ctx) => {
-		if (coordinatorPath !== undefined && ctx.mode === "tui") return;
-		return { result: { output: "此入口不接受宿主 Shell 命令；用户手动 !/!! 仅在父 TUI 保留原生执行，AI 命令须使用受控工具。Shell 未执行。", exitCode: 1, cancelled: false, truncated: false } };
-	});
-	return restrictTools;
 }

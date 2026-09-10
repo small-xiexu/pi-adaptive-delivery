@@ -9,7 +9,7 @@ import { createPiFixture, FixtureRpc, testEnvironment } from "../support/pi-fixt
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
-test("正式 Package 默认不约束 RPC Shell，shape 后受控，exit 后恢复", { timeout: 30_000 }, async (t) => {
+test("正式 Package 进入和退出均保留 RPC Shell，交付批准独立处理", { timeout: 30_000 }, async (t) => {
 	const f = await createPiFixture(source, undefined, false);
 	t.after(() => f.rpc.stop());
 	const commands = (await f.rpc.send("get_commands")).data.commands;
@@ -22,11 +22,11 @@ test("正式 Package 默认不约束 RPC Shell，shape 后受控，exit 后恢�
 	assert.equal((await f.rpc.send("bash", { command: "printf before > normal.txt" })).data.exitCode, 0);
 	await f.rpc.send("prompt", { message: "/delivery-status" });
 	await f.rpc.send("prompt", { message: "/delivery-shape" });
-	assert.equal((await f.rpc.send("bash", { command: "printf blocked > blocked.txt" })).data.exitCode, 1);
+	assert.equal((await f.rpc.send("bash", { command: "printf original > blocked.txt" })).data.exitCode, 0);
 	await f.rpc.send("prompt", { message: "/delivery-exit" });
 	assert.equal((await f.rpc.send("bash", { command: "printf after >> normal.txt" })).data.exitCode, 0);
 	assert.equal(await readFile(path.join(f.cwd, "normal.txt"), "utf8"), "beforeafter");
-	await assert.rejects(access(path.join(f.cwd, "blocked.txt")), { code: "ENOENT" });
+	assert.equal(await readFile(path.join(f.cwd, "blocked.txt"), "utf8"), "original");
 	await f.rpc.send("prompt", { message: "/delivery-shape" });
 	await f.rpc.send("new_session");
 	assert.equal((await f.rpc.send("bash", { command: "printf NEW_SESSION" })).data.exitCode, 0);
@@ -83,32 +83,33 @@ test("无 node_modules 的正式 Package 加载自身资源并完成真实只读
 });
 
 for (const scenario of ["write", "replacement", "delegator-replacement", "approval-replacement", "bash"]) {
-	test(`正式只读边界拒绝 ${scenario}，临时目标未写入`, { timeout: 30_000 }, async (t) => {
+	test(`正式 Package 只保护交付工具来源，普通 ${scenario} 沿用原实现`, { timeout: 30_000 }, async (t) => {
 		const fixture = await createPiFixture(source, scenario === "approval-replacement" ? "approval-design" : undefined);
 		t.after(() => fixture.rpc.stop());
 		const { rpc } = fixture;
 		await rpc.send("get_state");
 		if (scenario === "bash") {
 			const result = await rpc.send("bash", { command: "printf unexpected > forbidden.txt" });
-			assert.equal(result.data.exitCode, 1);
+			assert.equal(result.data.exitCode, 0);
 		} else {
 			const replacedTool = scenario === "delegator-replacement" ? "delivery_readonly" : scenario === "approval-replacement" ? "delivery_approval" : "read";
 			await rpc.send("prompt", { message: scenario === "write" ? "/fixture-activate-write" : `/fixture-replace-tool ${replacedTool}` });
 			await rpc.send("prompt", { message: scenario === "write" ? "fixture-attempt-write" : scenario === "delegator-replacement" ? "fixture-delegate" : "读取 input.txt" });
 			await rpc.waitFor((record) => record.type === "agent_settled");
-			assert.ok(rpc.records.some((record) => record.type === "tool_execution_end" && record.isError));
+			assert.ok(rpc.records.some((record) => record.type === "tool_execution_end" && record.isError === ["delegator-replacement", "approval-replacement"].includes(scenario)));
 			if (scenario === "delegator-replacement" || scenario === "approval-replacement") {
 				const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === replacedTool);
 				assert.ok(result);
-				assert.match(JSON.stringify(result.result), /不在当前已验证/);
+				assert.match(JSON.stringify(result.result), /实现来源已变化/);
 			}
 		}
-		await assert.rejects(access(path.join(fixture.cwd, "forbidden.txt")), { code: "ENOENT" });
+		if (["delegator-replacement", "approval-replacement"].includes(scenario)) await assert.rejects(access(path.join(fixture.cwd, "forbidden.txt")), { code: "ENOENT" });
+		else assert.equal(await readFile(path.join(fixture.cwd, "forbidden.txt"), "utf8"), "unexpected");
 		t.diagnostic(JSON.stringify({ root: fixture.root, pid: rpc.process.pid, scenario }));
 	});
 }
 
-test("标准 CLI 开发入口拒绝无批准 RPC；开发角色标记本身不提供 writer", { timeout: 30_000 }, async (t) => {
+test("标准 CLI 交付开发入口拒绝无批准 RPC；开发角色标记不接管普通工具", { timeout: 30_000 }, async (t) => {
 	const fixture = await createPiFixture(source, "development-normal");
 	t.after(() => fixture.rpc.stop());
 	await fixture.rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id: "unapproved-development", name: "delivery_develop", arguments: { task: "未授权开发" } })}` });
@@ -121,9 +122,8 @@ test("标准 CLI 开发入口拒绝无批准 RPC；开发角色标记本身不�
 	await child.send("prompt", { message: "未交接的子进程尝试写入" });
 	await child.waitFor((row) => row.type === "agent_settled");
 	const result = child.records.find((row) => row.type === "tool_execution_end" && row.toolName === "write");
-	assert.equal(result?.isError, true);
-	assert.match(JSON.stringify(result.result), /未取得已授权 writer/);
-	await assert.rejects(access(path.join(fixture.cwd, "src/value.js")), { code: "ENOENT" });
+	assert.equal(result?.isError, false);
+	assert.equal(await readFile(path.join(fixture.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	await assert.rejects(access(path.join(fixture.cwd, ".git/pi-adaptive-delivery")), { code: "ENOENT" });
 	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: fixture.rpc.process.pid, childPid: child.process.pid }));
 });
@@ -147,7 +147,7 @@ for (const kind of ["write", "edit"]) for (const boundary of ["rpc", "replacemen
 		} else {
 			const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === name);
 			assert.ok(result?.isError);
-			assert.match(JSON.stringify(result.result), boundary === "replacement" ? /不在当前已验证/ : /只供父 Pi TUI/);
+			assert.match(JSON.stringify(result.result), boundary === "replacement" ? /实现来源已变化/ : /只供父 Pi TUI/);
 		}
 		const native = await readFile(state.sessionFile, "utf8");
 		assert.ok(!native.includes('"customType":"delivery-approval"'));

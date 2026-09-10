@@ -65,7 +65,7 @@ function presentation(proposal: Proposal, expanded = false): string {
 		if (!expanded && proposal.inputs.length) content += `\n\n另有 ${proposal.inputs.length} 项文件纳入验收核对，Ctrl+O 查看清单。`;
 	}
 	if (expanded) content += (proposal.stage === "design" ? `\n\n维护的规划文档：\n${proposal.paths.length ? files(proposal.paths) : "方案保存在会话中，无须规划文档。"}`
-		: `\n\n额外验收输入：\n${files(proposal.inputs)}\n\n运行环境：本机，使用当前用户的 Shell、工具链与权限。文件工具按批准范围检查；Shell 的文件、网络和后台进程不受这些路径隔离。`)
+		: `\n\n额外验收输入：\n${files(proposal.inputs)}\n\n运行环境：本机，父子沿用 Pi 已启用的工具与权限检查。修改范围是任务约定及候选验收范围，普通文件、Shell、联网和插件工具不由交付包额外拦截。`)
 		+ `\n\n${permissions[proposal.stage]}\n\n工作目录：${proposal.cwd}\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}`;
 	return content;
 }
@@ -144,7 +144,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		: `${titles[entry.data!.stage]}提案已保存`), 0, 0));
 	pi.registerTool({
 		name: APPROVAL_TOOL, label: "请求交付批准",
-		description: "在父 Pi TUI 分别请求方案和实施确认，RPC/JSON/print 不接受批准。简单任务直接说明正文，design.paths 可为空；需要持续维护的方案/台账沿用已有文档。实施须列明修改范围、步骤、本机环境与固定验收命令；确认后开发子会话可运行本机 Shell，文件工具的路径检查不构成 Shell 隔离。",
+		description: "在父 Pi TUI 分别请求方案和实施确认，RPC/JSON/print 不接受批准。简单任务直接说明正文，design.paths 可为空；需要持续维护的方案/台账沿用已有文档。实施须列明约定修改范围、步骤、本机环境与固定验收命令。确认管理本 Package 的交付入口，普通工具沿用 Pi 权限，不提供文件或网络隔离。",
 		parameters,
 		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("批准只接受父 Pi 的真实 TUI 交互；当前模式不接受批准");

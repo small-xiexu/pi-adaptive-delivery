@@ -40,7 +40,7 @@ export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, t
 export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?: ReadOnlyEnvironment): void {
 	if (JSON.stringify(expected.structured) !== JSON.stringify(actual?.structured)) throw new Error("Structured 插件模式或来源未对齐，未发送任务");
 	if (JSON.stringify(expected.tools) !== JSON.stringify(actual?.tools)) {
-		throw new Error(`只读工具定义或来源未对齐：需要 ${expected.tools.map((tool) => tool.name).join(",")}；实际 ${JSON.stringify(actual?.tools)}。未发送任务`);
+		throw new Error(`父子工具定义或来源未对齐：需要 ${expected.tools.map((tool) => tool.name).join(",")}；实际 ${JSON.stringify(actual?.tools)}。未发送任务`);
 	}
 	if (expected.instructions !== actual?.instructions) throw new Error("基础指令未对齐；请按配置提供子任务所需指令。未发送任务");
 	if (expected.rules !== actual?.rules) throw new Error("项目或全局规则未对齐；请核对配置与已加载内容。未发送任务");
@@ -297,10 +297,7 @@ export interface ChildTask {
 
 export async function startChild(input: ChildTask, kind: "readonly" | "development"): Promise<ChildRpc> {
 	const tools = input.environment.tools.map((tool) => tool.name);
-	if (!tools.length) throw new Error("没有已启用的原生只读工具，未启动子 Pi");
-	// Structured 只读子也需加载原工具定义以核实来源；实际调用仍由角色门禁拒绝命令与补丁。
-	if (input.environment.structured) tools.push("exec_command", "write_stdin", "apply_patch");
-	else if (kind === "development") tools.push("edit", "write", "bash");
+	if (!tools.length) throw new Error("父 Pi 没有已启用的项目工具，未启动子 Pi");
 	const { workspacePath } = await resolveWorkspaceIdentity(input.cwd);
 	const outside = (file: string) => {
 		const relative = path.relative(workspacePath, file);
@@ -346,7 +343,7 @@ export async function readyChild(rpc: ChildRpc, input: ChildTask, signal: AbortS
 		|| data?.projectTrusted !== input.projectTrusted
 		|| state.model?.provider !== input.model.provider || state.model?.id !== input.model.id
 		|| state.thinkingLevel !== input.thinking) {
-		throw new Error("子 Pi 的独立会话、受控入口、模型或只读工具未核实，未发送任务");
+		throw new Error("子 Pi 的独立会话、交付入口、模型或继承工具未核实，未发送任务");
 	}
 	return { state, data };
 }

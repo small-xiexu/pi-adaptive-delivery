@@ -12,8 +12,8 @@ test("项目显式启用查找工具后，真实父子保留 read/grep/find/ls �
 	const { rpc } = fixture;
 	t.after(() => rpc.stop());
 	await rpc.send("prompt", { message: "/delivery-status" });
-	const status = rpc.records.find((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes("只读工具"));
-	assert.match(status?.message, /read.*grep.*find.*ls/);
+	const status = rpc.records.find((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes("沿用 Pi 的工具"));
+	for (const name of ["read", "grep", "find", "ls"]) assert.ok(status?.message.includes(name));
 	assert.ok(!status?.message.includes("defaultTools"), "已经启用查找工具时不再提示配置");
 	await rpc.send("prompt", { message: "fixture-delegate" });
 	await rpc.waitFor((row) => row.type === "agent_settled");
@@ -26,7 +26,7 @@ test("项目显式启用查找工具后，真实父子保留 read/grep/find/ls �
 	assert.ok(tools.every((row) => /input.txt|fixture-read-ok/.test(JSON.stringify(row.content))));
 	const model = (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line)).filter((row) => row.phase === "model");
 	for (const row of model) for (const name of ["read", "grep", "find", "ls"]) assert.ok(row.tools.includes(name));
-	assert.ok(model.every((row) => !row.tools.includes("bash") && !row.tools.includes("write")));
+	assert.ok(model.every((row) => row.tools.includes("bash") && row.tools.includes("write")));
 	assert.throws(() => process.kill(result!.result.details.pid, 0), { code: "ESRCH" });
 	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: rpc.process.pid, childPid: result!.result.details.pid }));
 });
@@ -81,7 +81,7 @@ for (const scenario of ["normal", "rules-missing", "instructions-missing", "skil
 			assert.equal(model.length, 0, "环境不符时不调用子模型");
 			assert.ok(!entries.some((entry: any) => entry.customType === "delivery-delegation" && entry.data.phase === "started"));
 			const reason = scenario === "rules-missing" ? /规则未对齐/ : scenario === "instructions-missing" ? /基础指令未对齐/
-				: scenario === "tool-replaced" ? /只读工具定义或来源未对齐/ : /Skills.*未对齐/;
+				: scenario === "tool-replaced" ? /父子工具定义或来源未对齐/ : /Skills.*未对齐/;
 			assert.match(ended.error, reason);
 			assert.match(ended.error, /未发送任务/);
 			if (scenario === "tool-replaced") {
@@ -110,7 +110,7 @@ for (const scenario of ["normal", "rules-missing", "instructions-missing", "skil
 				assert.match(messages, /CHILD_CONTEXT_HOOK/);
 				assert.ok(!messages.includes("PARENT_CONTEXT_HOOK"));
 				assert.equal(request.parentMarkerSeen, false);
-				assert.deepEqual(request.tools, ["read"]);
+				assert.deepEqual(request.tools, ["bash", "edit", "read", "write"]);
 			}
 			const calls = child.filter((event) => event.phase === "environment-tool-call");
 			assert.equal(calls.length, scenario === "normal" ? 2 : 1);

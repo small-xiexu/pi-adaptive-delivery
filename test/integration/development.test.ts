@@ -203,7 +203,7 @@ for (const tool of ["delivery_readonly", "delivery_develop"]) test(`${tool} 拒�
 	const result = await h.call(tool, { task: "不得在被改写的模型配置下执行", agent: {
 		thinking: "high", reason: "检验关键边界" } });
 	assert.equal(result.isError, true);
-	assert.match(JSON.stringify(result), /模型或只读工具未核实，未发送任务/);
+	assert.match(JSON.stringify(result), /模型或继承工具未核实，未发送任务/);
 	const events = (await h.audit()).filter((row) => row.child);
 	assert.equal(events.filter((row) => row.phase === "start").length, 1);
 	assert.ok(!events.some((row) => row.phase === "model" || row.phase === "environment-tool-call"));
@@ -389,12 +389,13 @@ for (const kind of ["tool-replaced", "hook-deny", "hook-error", "write"]) test(`
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
 	const result = await h.call("delivery_review", { task: kind === "write" ? "fixture-read-then-write" : "检查实际能力失败" });
 	assert.equal(result.isError, kind === "tool-replaced", JSON.stringify(result));
-	if (kind !== "tool-replaced") assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
+	if (kind === "hook-deny" || kind === "hook-error") assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(children.length, 2);
 	assert.throws(() => process.kill(children[1].pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	if (kind === "write") assert.equal(await readFile(path.join(h.cwd, "forbidden.txt"), "utf8"), "unexpected", "只读是任务要求；普通工具违规写入仍须由父审查");
+	else await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "审查失败，未完成交付。\n" })).isError, false);
 });
 
@@ -666,7 +667,6 @@ for (const kind of ["readonly", "development", "readonly-write"]) test(`正式 $
 	const before = h.sm.getEntries().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length;
 	const result = await h.call(kind === "development" ? "delivery_develop" : "delivery_readonly", { task: kind === "readonly-write" ? "fixture-read-then-write" : "执行一次任务并提供证据" });
 	assert.equal(result.isError, false, JSON.stringify(result));
-	if (kind === "readonly-write") assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 	assert.equal(titles.length, 3);
 	const events = await h.audit();
 	const child = events.find((row) => row.child && row.phase === "start");
@@ -685,7 +685,8 @@ for (const kind of ["readonly", "development", "readonly-write"]) test(`正式 $
 	assert.ok(!childLog.includes('"customType":"delivery-approval"'));
 	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	if (kind === "readonly-write") assert.equal(await readFile(path.join(h.cwd, "forbidden.txt"), "utf8"), "unexpected");
+	else await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
 	if (kind === "development") {
 		assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 		assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "父核实交互与文件证据后记录进度。\n" })).isError, false);
@@ -777,8 +778,8 @@ test("开发部分写入不回滚，正常收尾后原授权内可重新委派�
 	assert.equal(h.choices.length, 2);
 });
 
-for (const failure of ["close", "crash", "child-tamper", "child-persistence", "parent-tamper", "parent-persistence"]) {
-	test(`开发 ${failure} 不交回未知 writer，父子新写入保持关闭`, { timeout: 40_000 }, async (t) => {
+for (const failure of ["crash", "child-tamper", "child-persistence", "parent-tamper", "parent-persistence"]) {
+	test(`开发 ${failure} 不交回未知 writer，交付入口不开始新写入`, { timeout: 40_000 }, async (t) => {
 		let parentFile: string | undefined;
 		const h = await host(t, failure, (pi) => {
 			pi.on("tool_result", async (event, ctx) => {
@@ -835,15 +836,15 @@ for (const scenario of ["hook-deny", "hook-error"]) {
 }
 
 for (const scenario of ["outside", "plan", "git", "separate-git"]) {
-	test(`正式开发子工具拒绝 ${scenario}，普通失败收尾后可回到父文档`, { timeout: 40_000 }, async (t) => {
+	test(`普通开发工具不增加 ${scenario} 路径拦截，交付文档仍核实自身范围`, { timeout: 40_000 }, async (t) => {
 		const h = await host(t, scenario);
 		await h.prepare();
 		if (scenario === "separate-git") await h.approve("implementation", ["src", "metadata"]);
 		const result = await h.call("delivery_develop", { task: "尝试夹具中的越权路径" });
 		assert.equal(result.isError, false);
-		assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-		for (const target of ["../outside.js", "plan.md", scenario === "separate-git" ? "metadata/forbidden.js" : ".git/forbidden.js"]) await assert.rejects(access(path.resolve(h.cwd, target)), { code: "ENOENT" });
+		const target = scenario === "outside" ? "../outside.js" : scenario === "plan" ? "plan.md" : scenario === "separate-git" ? "metadata/forbidden.js" : ".git/forbidden.js";
+		assert.equal(await readFile(path.resolve(h.cwd, target), "utf8"), "export const value = 2;\n");
 		if (scenario === "separate-git") {
 			assert.equal((await h.call("delivery_document_write", { path: "metadata/forbidden.md", content: "父也不能误写 Git 元数据" })).isError, true);
 			await assert.rejects(access(path.join(h.cwd, "metadata/forbidden.md")), { code: "ENOENT" });
@@ -917,17 +918,17 @@ test("真实子 Pi 的本机命令失败保留错误与执行引用，不把模�
 	assert.ok(reference?.type === "custom");
 	const text = await readFile((reference.data as { childSessionFile: string }).childSessionFile, "utf8");
 	assert.match(text, /Cannot find module/);
-	assert.ok(text.includes('"customType":"delivery-execution"'));
+	assert.ok(!text.includes('"customType":"delivery-execution"'), "普通命令失败留在原生工具结果中");
 });
 
-for (const name of ["edit", "write"]) test(`父配置的必需 ${name} 被覆盖时拒绝开发，不偷偷替换成原生实现`, { timeout: 40_000 }, async (t) => {
+for (const name of ["edit", "write"]) test(`父 ${name} 仅在内存被覆盖而子未加载同一实现时，不发送任务`, { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	await h.prepare();
 	await h.session.prompt(`/fixture-replace-tool ${name}`);
 	assert.notEqual(h.session.getAllTools().find((tool) => tool.name === name)?.sourceInfo.source, "builtin");
 	const result = await h.call("delivery_develop", { task: "需要实际配置工具的文件任务" });
 	assert.equal(result.isError, true);
-	assert.match(JSON.stringify(result.content), /不能重建该实现/);
-	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.match(JSON.stringify(result.content), /父子工具定义或来源未对齐/);
+	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
 	assert.equal(await h.readLease(), undefined);
 });
