@@ -14,7 +14,11 @@ test("正式 Package 默认不约束 RPC Shell，shape 后受控，exit 后恢�
 	t.after(() => f.rpc.stop());
 	const commands = (await f.rpc.send("get_commands")).data.commands;
 	assert.ok(commands.some((command: any) => command.name === "delivery-shape" && command.source === "extension"));
-	assert.ok(!commands.some((command: any) => command.name === "delivery-resume"));
+	for (const name of ["delivery-tasks", "delivery-resume"]) {
+		assert.ok(commands.some((command: any) => command.name === name && command.source === "extension"));
+		await f.rpc.send("prompt", { message: `/${name}` });
+	}
+	assert.ok(!f.rpc.records.some((row) => row.type === "agent_start"), "未启用时被动命令不启动模型");
 	assert.equal((await f.rpc.send("bash", { command: "printf before > normal.txt" })).data.exitCode, 0);
 	await f.rpc.send("prompt", { message: "/delivery-status" });
 	await f.rpc.send("prompt", { message: "/delivery-shape" });

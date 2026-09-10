@@ -108,6 +108,11 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.ok(!h.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
 	await h.session.prompt("普通明确需求，不使用交付流程");
 	await h.session.prompt("/delivery-status");
+	const beforeViewing = h.contexts.length;
+	await h.session.prompt("/delivery-tasks");
+	await h.session.prompt("/delivery-resume");
+	assert.equal(h.contexts.length, beforeViewing, "被动入口不调用模型或启用约束");
+	assert.deepEqual(h.session.getActiveToolNames(), original);
 	assert.equal((await h.call("write", { path: "normal.txt", content: "正常写入" })).isError, false);
 	assert.equal((await h.call("bash", { command: "printf NORMAL_SHELL" })).isError, false);
 	assert.match(JSON.stringify((await h.call("plugin_tool", {})).content), /PLUGIN_ORIGINAL/);

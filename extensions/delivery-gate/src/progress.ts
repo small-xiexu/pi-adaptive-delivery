@@ -125,9 +125,11 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			const component = {
 				invalidate() {},
 				render(width: number) {
-					const lines = [truncateToWidth(theme.fg(context.isError ? "error" : status === TOOL_ERROR_STATUS ? "warning" : "toolTitle", heading), width), truncateToWidth(theme.fg("muted", detail), width)];
+					const hint = open ? " /delivery-tasks" : "";
+					const title = truncateToWidth(theme.fg(context.isError ? "error" : status === TOOL_ERROR_STATUS ? "warning" : "toolTitle", heading), Math.max(1, width - hint.length));
+					const lines = [truncateToWidth(title + theme.fg("muted", hint), width), truncateToWidth(theme.fg("muted", detail), width)];
 					if (expanded) {
-						if (open) lines.push(...new Text("点击卡片或 /delivery-tasks 查看详情 · Esc 返回", 0, 0).render(width));
+						if (open) lines.push(...new Text("/delivery-tasks 查看详情 · 全屏模式可点击卡片 · Esc 关闭详情", 0, 0).render(width));
 						const elapsed = latest ? `耗时 ${Math.max(0, ((latest.endedAt ?? Date.now()) - latest.startedAt) / 1000).toFixed(1)} 秒` : "";
 						const more = [latest?.agent ? `模型：${latest.agent.provider}/${latest.agent.id} · ${latest.agent.thinking}\n选择理由：${latest.agent.reason}` : "", elapsed, ...(latest?.recent ?? []), latest?.output, latest?.sessionFile ? `原始子 Session：${latest.sessionFile}` : "", !isPartial ? tail(body) : ""].filter(Boolean).join("\n");
 						// Text 处理宽度；终端控制字符不能通过子输出注入界面。

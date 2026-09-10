@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 import { installActivation } from "../../extensions/delivery-gate/src/activation.ts";
 
 function host(entries: any[] = []) {
@@ -15,8 +16,10 @@ function host(entries: any[] = []) {
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }), sendUserMessage: (...args: any[]) => messages.push(args), sendMessage: (...args: any[]) => messages.push(args) };
 	const ctx: any = { sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
 		ui: { notify: (text: string) => notices.push(text) }, reload: async () => { reloads++; } };
-	installActivation(pi, () => { starts++; return { initialize: async () => { tools = ["read"]; }, assertCanExit: async () => { if (blocked) throw new Error("未知 writer"); } }; });
+	installActivation(pi, (current) => { assert.equal(current, ctx); starts++; return { initialize: async () => { tools = ["read"]; }, assertCanExit: async () => { if (blocked) throw new Error("未知 writer"); } }; });
+	const autocomplete = new CombinedAutocompleteProvider([...commands].map(([name, command]) => ({ name, description: command.description })), "/tmp");
 	return { pi, ctx, entries, notices, messages, handlers, command: (name: string, args = "") => commands.get(name).handler(args, ctx),
+		completions: async () => (await autocomplete.getSuggestions(["/delivery-"], 0, 10, { signal: new AbortController().signal }))?.items.map((item) => item.value),
 		starts: () => starts, reloads: () => reloads, setBusy: (value: boolean) => { idle = !value; }, setQueued: (value: boolean) => { queued = value; }, setBlocked: () => { blocked = true; } };
 }
 
@@ -24,11 +27,22 @@ test("普通启动和状态查询不安装运行逻辑、不改工具、不发�
 	const h = host();
 	await h.handlers.get("session_start")!({}, h.ctx);
 	await h.command("delivery-status");
+	await h.command("delivery-tasks");
+	await h.command("delivery-resume");
 	await h.command("delivery-exit");
 	assert.equal(h.starts(), 0);
 	assert.deepEqual(h.pi.getActiveTools(), ["read", "bash", "plugin"]);
 	assert.deepEqual(h.entries, []);
 	assert.deepEqual(h.messages, []);
+});
+
+test("启动时建立的补全已包含任务与恢复入口，首次 shape 后仍可发现，无须重建", async () => {
+	const h = host();
+	const before = await h.completions();
+	assert.ok(before?.includes("delivery-tasks"));
+	assert.ok(before?.includes("delivery-resume"));
+	await h.command("delivery-shape");
+	assert.deepEqual(await h.completions(), before);
 });
 
 test("仅 shape 安装一次运行逻辑，需求按字面发送、不展开命令或批准", async () => {

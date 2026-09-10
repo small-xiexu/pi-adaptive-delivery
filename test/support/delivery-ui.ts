@@ -17,12 +17,13 @@ export function approvalUI(select: ExtensionUIContext["select"], feedback?: () =
 			panel.render(100);
 			const text = review ? feedback?.() : undefined;
 			if (text !== undefined) {
+				panel.handleInput("\x1b[A");
+				panel.handleInput("\r");
 				panel.handleInput(`\x1b[200~${text}\x1b[201~`);
 				panel.handleInput("\r");
 				return await result;
 			}
 			const choice = await select(panel.title, panel.choices);
-			if (review) panel.handleInput("\t");
 			if (choice === panel.choices[0]) for (let i = 1; i < panel.choices.length; i++) panel.handleInput("\x1b[A");
 			panel.handleInput(choice === panel.choices[0] || choice === panel.choices.at(-1) ? "\r" : "\x1b");
 			return await result;

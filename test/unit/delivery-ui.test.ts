@@ -8,16 +8,19 @@ import { CURSOR_MARKER, TuiAltScreen, TuiMainScreen, visibleWidth, type Terminal
 import { Type } from "typebox";
 import { DeliveryPanel, DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
 import { createTaskProgress, taskRenderers, TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
-import { taskDetails, readTaskRecord, TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
+import { installTaskDetails, taskDetails, readTaskRecord, TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 
 const tui = { terminal: { rows: 32 }, requestRender() {} } as TUI;
 const mouse = (type: TuiMouseEvent["type"], y: number): TuiMouseEvent => ({ type, button: "left", x: 1, y, screenX: 1, screenY: y, width: 80, height: 30, shift: false, alt: false, ctrl: false });
 
-test("方案审阅默认编辑，空提交和查看详情不批准，多行及大粘贴完整发送", () => {
+test("方案先阅读，按需输入意见；空提交和查看详情不批准，多行及大粘贴完整发送", () => {
 	const results: unknown[] = [];
 	const panel = new DesignReviewPanel("方案：docs/设计.md", "完整条件\n".repeat(80) + "END", tui, plainTheme, (value) => results.push(value));
 	panel.focused = true;
+	assert.ok(!panel.render(80).join("\n").includes(CURSOR_MARKER));
+	panel.handleInput("\x1b[A");
+	panel.handleInput("\r");
 	assert.ok(panel.render(80).join("\n").includes(CURSOR_MARKER));
 	panel.handleInput("\r");
 	panel.handleInput("\x0f");
@@ -37,29 +40,34 @@ test("方案审阅默认编辑，空提交和查看详情不批准，多行及�
 	assert.deepEqual(results, [{ feedback: `先保留原接口\n${paste}` }]);
 });
 
-test("方案审阅操作焦点默认稍后再看，只有显式选择才批准，鼠标也可发送意见", () => {
+test("方案默认稍后再看，鼠标可打开意见，Esc 返回保留草稿且不批准", () => {
 	const results: unknown[] = [];
 	const panel = new DesignReviewPanel("方案", "详情", tui, plainTheme, (value) => results.push(value));
 	panel.focused = true;
-	panel.handleInput("\t");
 	assert.ok(!panel.render(80).join("\n").includes(CURSOR_MARKER));
 	panel.handleInput("\r");
 	assert.deepEqual(results, [undefined]);
-	panel.handleInput("\x1b[A");
-	panel.handleInput("\r"); // 空意见回到输入，不能批准
-	assert.ok(panel.render(80).join("\n").includes(CURSOR_MARKER));
-	assert.equal(results.length, 1);
-	panel.handleInput("补充验收");
 	let lines = panel.render(80);
-	let y = lines.findIndex((line) => line.includes("发送修改意见"));
+	const y = lines.findIndex((line) => line.includes("提出修改意见"));
 	panel.handleMouse(mouse("press", y));
 	panel.handleMouse(mouse("release", y));
 	assert.equal(results.length, 1);
+	assert.ok(!panel.render(80).join("\n").includes(CURSOR_MARKER));
 	panel.handleMouse(mouse("click", y));
-	assert.deepEqual(results[1], { feedback: "补充验收" });
+	assert.ok(panel.render(80).join("\n").includes(CURSOR_MARKER));
+	panel.handleInput("\r"); // 空意见不能批准
+	assert.equal(results.length, 1);
+	panel.handleInput("补充验收");
+	panel.handleInput("\x1b");
 	lines = panel.render(80);
-	y = lines.findIndex((line) => line.includes("确认方案"));
-	panel.handleMouse(mouse("click", y));
+	assert.ok(!lines.join("\n").includes(CURSOR_MARKER));
+	assert.equal(results.length, 1);
+	panel.handleMouse(mouse("click", lines.findIndex((line) => line.includes("提出修改意见"))));
+	panel.handleInput("\r");
+	assert.deepEqual(results[1], { feedback: "补充验收" });
+	panel.handleInput("\x1b");
+	lines = panel.render(80);
+	panel.handleMouse(mouse("click", lines.findIndex((line) => line.includes("确认方案"))));
 	assert.equal(results[2], "确认方案");
 	panel.handleInput("\x1b");
 	assert.equal(results[3], undefined);
@@ -84,9 +92,12 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的
 	try {
 		renderer.renderNow();
 		assert.equal(renderer.hasOverlay(), false);
+		feed("\x1b[A");
 		feed("\r");
 		assert.equal(results.length, 0);
 		feed("意见");
+		feed("\x1b");
+		assert.equal(results.length, 0, "输入中的 Esc 先返回方案，不结束审阅");
 		feed("\x1b");
 		assert.deepEqual(results, [undefined]);
 		assert.equal(mainKeys, 0);
@@ -102,9 +113,9 @@ for (const accept of ["确认实施"]) test(`${accept} 在上但默认回车不�
 		const lines = panel.render(width);
 		assert.ok(lines.findIndex((line) => line.includes(accept)) < lines.findIndex((line) => line.includes("暂不批准")));
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
-		assert.ok(lines.length <= 17, "底部审批不能占满终端");
+		assert.ok(lines.length <= 22, "底部审批不能占满终端");
 	}
-	panel.handleInput("\t");
+	panel.handleInput("\x0f");
 	panel.handleInput("\x1b[F");
 	assert.match(panel.render(80).join("\n"), /最后一个条件/);
 	panel.handleInput("\r");
@@ -126,6 +137,29 @@ test("鼠标确认使用 Pi 的点击事件，按下和滚轮不批准", () => {
 	assert.equal(results.length, 0);
 	panel.handleMouse(mouse("click", y));
 	assert.deepEqual(results, ["确认"]);
+});
+
+test("确认面板适应窄终端；显示不下时仍可退出，不能选择不可见的批准操作", () => {
+	const screen = { terminal: { rows: 32 }, requestRender() {} };
+	for (const stage of ["design", "implementation"]) {
+		const results: unknown[] = [];
+		const notice = "确认后在本机开发、验收和返工；Shell 使用你的权限，不受文件路径隔离。\n提交、推送、PR、发布、部署、生产及其他外部写入需另行授权。";
+		const panel = stage === "design" ? new DesignReviewPanel("改法\n".repeat(100), "详情", screen as TUI, plainTheme, (value) => results.push(value), notice)
+			: new DeliveryPanel("实施确认", "步骤\n".repeat(100), "详情", ["确认实施", "暂不批准"], screen as TUI, plainTheme, (value) => results.push(value), 1, notice);
+		for (const rows of [10, 20, 32, 60]) for (const width of [20, 40, 80, 110]) {
+			screen.terminal.rows = rows;
+			const lines = panel.render(width);
+			assert.ok(lines.length < rows);
+			assert.ok(lines.every((line) => visibleWidth(line) <= width));
+		}
+		screen.terminal.rows = 10;
+		assert.match(panel.render(20).join("\n"), /请放大终端/);
+		panel.handleInput("\x1b[A"); panel.handleInput("\x1b[A"); panel.handleInput("\r");
+		panel.handleMouse(mouse("click", 1));
+		assert.deepEqual(results, []);
+		panel.handleInput("\x1b");
+		assert.deepEqual(results, [undefined]);
+	}
 });
 
 for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的真实焦点分派：Esc 只关闭详情，下次 Esc 才交回主组件`, () => {
@@ -160,9 +194,28 @@ test("真实工具卡片点击按 toolCallId 打开对应详情，折叠仍保�
 	card.updateResult({ content: [{ type: "text", text: "结束" }], details: {}, isError: false });
 	const rows = card.render(80);
 	assert.equal(rows.filter((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trim()).length, 2);
+	assert.match(rows.join("\n"), /\/delivery-tasks/);
 	// Pi 的 ToolExecutionComponent 本身沿 Container 的公开鼠标分派到 MouseRegion。
 	for (let y = 0; y < rows.length && !opened.length; y++) card.handleMouse(mouse("click", y));
 	assert.deepEqual(opened, ["task-a"]);
+});
+
+test("首次按需安装即能从卡片打开详情，分支切换更新上下文，关闭后不沿用旧上下文", async () => {
+	const handlers = new Map<string, Function>();
+	const pi: any = { on: (name: string, handler: Function) => handlers.set(name, handler), registerCommand() {} };
+	const opened: string[] = [];
+	const context = (name: string): any => ({ mode: "tui", hasUI: true, sessionManager: { getBranch: () => [
+		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "a", name: "delivery_readonly", arguments: { task: name } }] } },
+	] }, ui: { custom: async () => { opened.push(name); }, notify() {} } });
+	const open = installTaskDetails(pi, () => [], context("首次会话"));
+	open("a"); await Promise.resolve();
+	assert.deepEqual(opened, ["首次会话"]);
+	handlers.get("session_tree")!({}, context("新分支"));
+	open("a"); await Promise.resolve();
+	assert.deepEqual(opened, ["首次会话", "新分支"]);
+	handlers.get("session_shutdown")!();
+	open("a"); await Promise.resolve();
+	assert.equal(opened.length, 2);
 });
 
 test("详情复用原生分支与长 Session，保留完整调用/结果、末行提示且排除 thinking", async () => {

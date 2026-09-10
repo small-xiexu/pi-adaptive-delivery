@@ -207,8 +207,8 @@ export class TaskDetailsPanel {
 	}
 }
 
-export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[]) {
-	let current: ExtensionContext | undefined;
+export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[], initialContext?: ExtensionContext) {
+	let current = initialContext;
 	let close: (() => void) | undefined;
 	const reset = (_event: unknown, ctx: ExtensionContext) => { close?.(); current = ctx; };
 	pi.on("session_start", reset);

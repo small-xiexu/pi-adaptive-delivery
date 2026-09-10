@@ -6,13 +6,13 @@ type Activation = { enabled: boolean; tools?: string[] };
 type Runtime = { initialize(): Promise<void>; assertCanExit(ctx: ExtensionContext): Promise<void> };
 
 // 只保存用户选择的入口和原工具集合，不保存或恢复批准。
-export function installActivation(pi: ExtensionAPI, start: () => Runtime): void {
+export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContext) => Runtime): void {
 	let runtime: Runtime | undefined;
 	let originalTools: string[] = [];
 	let restoreTools: string[] | undefined;
 	let changing = false;
-	const enter = async () => {
-		runtime ??= start();
+	const enter = async (ctx: ExtensionContext) => {
+		runtime ??= start(ctx);
 		await runtime.initialize();
 	};
 	pi.on("session_start", async (_event, ctx) => {
@@ -21,7 +21,7 @@ export function installActivation(pi: ExtensionAPI, start: () => Runtime): void 
 		const state = entry.data as Activation;
 		if (state.enabled) {
 			originalTools = state.tools ?? [];
-			await enter();
+			await enter(ctx);
 		} else if (state.tools) {
 			restoreTools = state.tools;
 		}
@@ -37,6 +37,14 @@ export function installActivation(pi: ExtensionAPI, start: () => Runtime): void 
 		description: "查看交付是否启用及当前状态",
 		handler: async (_args, ctx) => { ctx.ui.notify("交付未启用，当前沿用 Pi 原有工具。使用 /delivery-shape 进入交付流程。", "info"); },
 	});
+	// Pi 在启动时建立命令补全；先声明入口，进入交付后由实际处理器接管。
+	for (const [name, description] of [
+		["delivery-tasks", "查看交付子任务的实时输出，Esc 关闭详情"],
+		["delivery-resume", "继续尚未确认的方案审阅"],
+	] as const) pi.registerCommand(name, {
+		description,
+		handler: async (_args, ctx) => { ctx.ui.notify("请先用 /delivery-shape 进入交付流程。当前仍沿用 Pi 原有工具。", "info"); },
+	});
 	pi.registerCommand("delivery-shape", {
 		description: "启用当前会话的受控交付，可附带需求",
 		handler: async (args, ctx) => {
@@ -49,7 +57,7 @@ export function installActivation(pi: ExtensionAPI, start: () => Runtime): void 
 				if (!runtime) {
 					originalTools = pi.getActiveTools();
 					pi.appendEntry(ENTRY, { enabled: true, tools: originalTools });
-					await enter();
+					await enter(ctx);
 				}
 				ctx.ui.notify("交付已启用；方案与实施仍需分别确认。任务收尾后用 /delivery-exit 恢复普通使用。", "info");
 				if (args.trim()) pi.sendUserMessage(`先读取并遵循 ${fileURLToPath(new URL("../../../skills/adaptive-delivery/SKILL.md", import.meta.url))}，核实项目事实并对齐需求；明确需求可以零追问，简单任务无须规划文档。当前需求：\n${args}`, { expandPromptTemplates: false });

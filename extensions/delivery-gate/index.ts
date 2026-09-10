@@ -18,10 +18,10 @@ import { installActivation } from "./src/activation.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	if (process.env[CHILD_ENV]) { installDelivery(pi); return; }
-	installActivation(pi, () => installDelivery(pi)!);
+	installActivation(pi, (ctx) => installDelivery(pi, ctx)!);
 }
 
-function installDelivery(pi: ExtensionAPI) {
+function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	const entryPath = fileURLToPath(import.meta.url);
 	installStreamRetry(pi);
 	// 子进程启动前确定角色；该内部标记只去除协调权限，不提供批准能力。
@@ -130,7 +130,7 @@ function installDelivery(pi: ExtensionAPI) {
 	const developer = createDevelopmentDelegator(pi, approvals);
 	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
 	const tasks = () => [...active.values()].map((item) => item.progress.snapshot()).concat(developer.progress ? [developer.progress] : []);
-	const openTask = installTaskDetails(pi, tasks);
+	const openTask = installTaskDetails(pi, tasks, initialContext);
 	pi.registerTool({ name: GIT_STATUS_TOOL, label: "Git 现状",
 		description: "固定只读查询当前 worktree 的分支、HEAD、暂存/未暂存及未跟踪改动，路径按 JSON 转义。无 HEAD 或 detached 明确返回 null。最多读取 50 KiB，超限报错，不隐藏改动；没有命令或路径参数，不获取源码差异、不产生批准。",
 		parameters: Type.Object({}, { additionalProperties: false }),

@@ -258,11 +258,18 @@ test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，�
 	const body = "计划修改四个文件。\n" + "步骤与停止条件。\n".repeat(100) + "最后一项决策";
 	h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
 		const panel = await factory(...args);
-		assert.match(panel.body, /工具实际可写范围（文件或目录）：\n• src\n• test/);
-		assert.ok(!panel.body.includes("最后一项决策")); assert.ok(panel.detail.includes(body)); assert.ok(panel.detail.includes(design.body));
+		assert.ok(panel.body.startsWith(body), "正文先展示且不截掉长提案的后半部分");
+		assert.match(panel.body, /允许修改（文件或目录）：\n• src\n• test/);
+		assert.ok(panel.detail.includes(body)); assert.ok(panel.detail.includes(design.body));
 		assert.match(panel.detail, /额外验收输入：\n• package.json/);
-		assert.match(panel.body, /本机.*当前用户/);
-		assert.match(panel.body, /Shell.*不受这些路径隔离/); return panel;
+		assert.match(panel.body, /验收时依次运行：\n1. node --check src\/index.js/);
+		for (const key of ["", "\x1b[6~", "\x0f", "\x1b[F"]) {
+			if (key) panel.handleInput(key);
+			const screen = panel.render(100).join("\n");
+			assert.match(screen, /本机.*Shell 使用你的权限，不受文件路径隔离/);
+			assert.match(screen, /提交、推送、PR、发布、部署、生产及其他外部写入需另行授权/);
+		}
+		return panel;
 	}, options);
 	await h.run({ ...implementation, body, inputs: ["package.json"] });
 	const grant = await h.readImplementation();
@@ -270,6 +277,31 @@ test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，�
 	assert.deepEqual(grant.inputs, [path.join(h.cwd, "package.json")]);
 	grant.inputs.push("/other");
 	assert.equal((await h.readImplementation()).inputs.length, 1);
+});
+
+test("小修复首屏先显示改法与实际命令，文档和记录引用收进详情，两阶段按键一致", async () => {
+	const h = await host();
+	const bodies = { design: "非法日期显示“时间格式异常”；空值和正常日期沿用原行为。", implementation: "修改日期格式函数，补充非法日期测试。" };
+	for (const stage of ["design", "implementation"] as const) {
+		h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
+			const panel = await factory(...args);
+			const screen = panel.render(100).join("\n");
+			assert.ok(screen.split("\n")[1]!.startsWith(bodies[stage]), "首行正文不能被权限条款或文档路径占用");
+			assert.match(screen, /↑↓ 选择 · Enter 确定/);
+			assert.match(screen, /Ctrl\+O 查看详情/);
+			assert.doesNotMatch(screen, /父会话|提案记录|项路径|你希望怎么改/);
+			if (stage === "design") {
+				assert.doesNotMatch(screen, /docs\/方案.md/);
+				assert.match(panel.detail, /docs\/方案.md/);
+			} else {
+				assert.match(screen, /• src/);
+				assert.match(screen, /node --check src\/index.js/);
+			}
+			return panel;
+		}, options);
+		await h.run({ ...(stage === "design" ? design : implementation), body: bodies[stage] });
+	}
+	assert.equal(h.entries(APPROVAL_ENTRY).length, 2);
 });
 
 for (const stage of ["design", "implementation"]) for (const type of [PROPOSAL_ENTRY, APPROVAL_ENTRY]) test(`同时篡改内存与磁盘 ${stage}/${type} 不能扩大权限`, async () => {

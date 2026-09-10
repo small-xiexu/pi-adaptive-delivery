@@ -3,13 +3,17 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
-import type { CustomEntry } from "@earendil-works/pi-coding-agent";
+import { ToolExecutionComponent, type CustomEntry } from "@earendil-works/pi-coding-agent";
+import { CombinedAutocompleteProvider, type TUI } from "@earendil-works/pi-tui";
 import { createDevelopmentHost } from "../support/development-host.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 import type { TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 
 async function developmentHost(t: TestContext, scenario: string, script: string, commands: string[] = [], withPlanning = true) {
-	const h = await createDevelopmentHost(t, `local-${scenario}`);
+	const h = await createDevelopmentHost(t, `local-${scenario}`, undefined, undefined, false);
+	// 与 Pi 启动时相同：命令数组只构造一次，shape 后不刷新补全。
+	const autocomplete = new CombinedAutocompleteProvider(h.api.getCommands().map(({ name, description }) => ({ name, description })), h.cwd);
+	await h.session.prompt("/delivery-shape");
 	await mkdir(path.join(h.cwd, "inputs"));
 	await writeFile(path.join(h.cwd, "inputs/command.cjs"), script);
 	if (withPlanning) await h.prepare();
@@ -25,16 +29,22 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 	t.after(async () => {
 		for (const event of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(event.pid, 0), { code: "ESRCH" });
 	});
-	return { ...h, children };
+	return { ...h, children, autocomplete };
 }
 
-test("真实 Pi 子命令运行中查看详情，Esc 关闭后继续完成，结束仍可读原始结果", { timeout: 40_000 }, async (t) => {
+test("首次进入后补全可选子任务，运行中命令和卡片可看详情，Esc 不停止任务，结束后 ID 可查", { timeout: 40_000 }, async (t) => {
 	const h = await developmentHost(t, "details", `require("node:fs").writeFileSync("src/ready.txt", "ready");
 const phase = (name) => { for (let i = 0; i < 80; i++) console.log(name + " " + i + " " + "output ".repeat(15)); console.log(name + "_LATEST"); };
 phase("DETAIL_COMMAND_RUNNING");
 setTimeout(() => phase("DETAIL_MIDDLE"), 2500);
 setTimeout(() => phase("DETAIL_LATER"), 5500);
 setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
+	const suggestions = await h.autocomplete.getSuggestions(["/delivery-"], 0, 10, { signal: new AbortController().signal });
+	const taskCommand = suggestions?.items.find((item) => item.value === "delivery-tasks");
+	assert.ok(taskCommand, "运行逻辑启用后必须能从启动时的补全找到任务入口");
+	assert.ok(suggestions?.items.some((item) => item.value === "delivery-resume"));
+	const commandLine = h.autocomplete.applyCompletion(["/delivery-"], 0, 10, taskCommand, suggestions!.prefix).lines.join("\n").trim();
+	assert.equal(commandLine, "/delivery-tasks");
 	let panel: TaskDetailsPanel | undefined;
 	h.setCustom((async (factory: any) => {
 		let done!: () => void;
@@ -58,7 +68,7 @@ setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
 	await until(() => readFile(path.join(h.cwd, "src/ready.txt")).then(() => true, (error) => { if (error.code === "ENOENT") return false; throw error; }));
 	const ref = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-development") as CustomEntry<{ id: string }>;
 	assert.ok(ref);
-	const showing = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
+	const showing = h.session.prompt(commandLine);
 	await until(() => Boolean(panel?.render(100).join("\n").includes("DETAIL_COMMAND_RUNNING_LATEST")));
 	assert.equal(ended, false);
 	await until(() => Boolean(panel?.render(100).join("\n").includes("DETAIL_MIDDLE_LATEST")));
@@ -73,6 +83,15 @@ setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
 	panel!.handleInput("\x1b");
 	await showing;
 	assert.equal(ended, false, "关闭详情不能终止在途子命令");
+	const tool = h.session.extensionRunner.getToolDefinition("delivery_develop");
+	assert.ok(tool);
+	const card = new ToolExecutionComponent(tool.name, ref.data!.id, { task: "本机命令" }, {}, tool, { terminal: { rows: 32 }, requestRender() {} } as TUI, h.cwd);
+	card.updateResult({ content: [], details: {}, isError: false }, true);
+	const rows = card.render(100);
+	for (let y = 0; y < rows.length; y++) card.handleMouse({ type: "click", button: "left", x: 1, y, screenX: 1, screenY: y, width: 100, height: rows.length, shift: false, alt: false, ctrl: false });
+	await until(() => Boolean(panel?.render(100).join("\n").includes("DETAIL_LATER_LATEST")));
+	assert.equal(ended, false, "首次按需安装的卡片应在子命令仍运行时打开");
+	panel!.handleInput("\x1b");
 	const result = await run;
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.equal(await h.readLease(), undefined);

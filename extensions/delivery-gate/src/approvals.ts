@@ -15,7 +15,7 @@ export const APPROVAL_ENTRY = "delivery-approval";
 
 const parameters = Type.Object({
 	stage: StringEnum(["design", "implementation"] as const),
-	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用简短分行说明，不复制全文台账。design 说明目标、范围、关键设计、风险和验收方向；有规划文档时先给相对路径和修改摘要，简单任务可直接在正文说明，无须新建文档。implementation 说明计划修改的文件、步骤、环境、验收和停止条件，并区分计划文件与工具实际可写目录。工具提供原方案查看入口，无须重复抄写；不以路径或摘要 ID 代替决策内容。" }),
+	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用大白话分行说明，不复制全文台账。design 先说明本次要改成什么、范围、关键设计、风险和验收方向；有规划文档时在正文后补充修改摘要，路径由界面详情列出。简单任务直接说明，无须新建文档。implementation 先说明具体步骤、依赖、环境与停止条件；可写范围和固定验收命令由界面按参数列出，无须重复抄写，但须区分计划文件与实际可写目录。工具提供原方案查看入口，不重述相同方案，不以路径或摘要 ID 代替决策内容。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "design 列明本任务由父维护的确切规划 Markdown 路径，随确认保护；简单任务没有规划文档时传 []，不得为填参数创建占位文档或遗漏已有需维护的方案/台账。implementation 必须列明允许子修改的文件或目录，不能传空数组。路径按 cwd 解析，不是 glob。" }),
 	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
 	inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "implementation 中纳入候选指纹的额外源码、配置或测试输入，按 cwd 解析，必须在 worktree 内且不含凭据。不包含整个工作区、规划文档、Git 或执行记录；这是验收范围，不是 Shell 隔离。" })),
@@ -51,20 +51,23 @@ interface Confirmed {
 const titles = { design: "方案确认", implementation: "实施确认" };
 const actions = { design: "确认方案", implementation: "确认实施" };
 const permissions = {
-	design: "确认后准备实施步骤与验收说明；本次不批准源码开发或命令执行。",
-	implementation: "仅授权列明范围内的本地开发、自检、验证、审查与返工。提交、推送、PR、发布、部署、生产及其他外部写入不在本次授权内。",
+	design: "确认后准备实施步骤，暂不修改代码或运行命令。",
+	implementation: "确认后在本机开发、验收和返工；Shell 使用你的权限，不受文件路径隔离。\n提交、推送、PR、发布、部署、生产及其他外部写入需另行授权。",
 };
 
 function presentation(proposal: Proposal, expanded = false): string {
 	const relative = (file: string) => path.relative(proposal.cwd, file) || ".";
-	const body = expanded || proposal.body.length <= 600 ? proposal.body : `${proposal.body.slice(0, 600)}\n…完整正文见详情`;
-	return (expanded ? `${titles[proposal.stage]}\n工作目录：${proposal.cwd}\n\n` : "") + permissions[proposal.stage]
-		+ (proposal.paths.length ? `\n\n${proposal.stage === "design" ? "规划文档（由父会话维护）" : "工具实际可写范围（文件或目录）"}：\n${proposal.paths.map((file) => `• ${relative(file)}`).join("\n")}` : proposal.stage === "design" ? "\n\n方案保存在会话中，无规划文档。" : "")
-		+ (proposal.stage === "implementation" ? "\n\n运行环境：本机，使用当前用户的 Shell、工具链与权限。文件工具按上述范围检查；Shell 的文件、网络和后台进程不受这些路径隔离。"
-			+ (expanded ? `\n额外验收输入：\n${proposal.inputs.map((file) => `• ${relative(file)}`).join("\n") || "无"}` : `\n${proposal.inputs.length} 项额外验收输入，${proposal.validationCommands.length} 条固定验收命令（详情可核对）`) : "")
-		+ `\n\n${body}`
-		+ (expanded && proposal.validationCommands.length ? `\n\n固定验收命令：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n\n")}` : "")
-		+ (expanded ? `\n\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}` : "");
+	const files = (paths: string[]) => paths.map((file) => `• ${relative(file)}`).join("\n") || "无";
+	let content = proposal.body;
+	if (proposal.stage === "implementation") {
+		content += `\n\n允许修改（文件或目录）：\n${files(proposal.paths)}`
+			+ `\n\n验收时依次运行：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n") || "未提供固定命令，不能完成交付验收。"}`;
+		if (!expanded && proposal.inputs.length) content += `\n\n另有 ${proposal.inputs.length} 项文件纳入验收核对，Ctrl+O 查看清单。`;
+	}
+	if (expanded) content += (proposal.stage === "design" ? `\n\n维护的规划文档：\n${proposal.paths.length ? files(proposal.paths) : "方案保存在会话中，无须规划文档。"}`
+		: `\n\n额外验收输入：\n${files(proposal.inputs)}\n\n运行环境：本机，使用当前用户的 Shell、工具链与权限。文件工具按批准范围检查；Shell 的文件、网络和后台进程不受这些路径隔离。`)
+		+ `\n\n${permissions[proposal.stage]}\n\n工作目录：${proposal.cwd}\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}`;
+	return content;
 }
 
 // 只读取 Pi 的原生文件。内存条目即使可见，也不能证明 appendEntry 已经落盘。
@@ -138,7 +141,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		},
 	});
 	pi.registerEntryRenderer<Proposal>(PROPOSAL_ENTRY, (entry, { expanded }) => new Text(displayText(expanded ? presentation(entry.data!, true)
-		: `${titles[entry.data!.stage]} · ${entry.data!.paths.length ? `${entry.data!.paths.length} 项路径 · ` : ""}Ctrl+O 查看完整提案`), 0, 0));
+		: `${titles[entry.data!.stage]}提案已保存`), 0, 0));
 	pi.registerTool({
 		name: APPROVAL_TOOL, label: "请求交付批准",
 		description: "在父 Pi TUI 分别请求方案和实施确认，RPC/JSON/print 不接受批准。简单任务直接说明正文，design.paths 可为空；需要持续维护的方案/台账沿用已有文档。实施须列明修改范围、步骤、本机环境与固定验收命令；确认后开发子会话可运行本机 Shell，文件工具的路径检查不构成 Shell 隔离。",
@@ -199,10 +202,10 @@ export function installApprovals(pi: ExtensionAPI) {
 					const cancel = () => done(undefined);
 					operation.addEventListener("abort", cancel, { once: true });
 					if (operation.aborted) cancel();
-					const panel = request.stage === "design" ? new DesignReviewPanel(presentation(proposal), presentation(proposal, true), tui, theme, done)
+					const panel = request.stage === "design" ? new DesignReviewPanel(presentation(proposal), presentation(proposal, true), tui, theme, done, permissions.design)
 						: new DeliveryPanel(titles[request.stage], presentation(proposal),
 						presentation(proposal, true) + (approvedDesign ? `\n\n已确认的方案原文：\n${presentation(approvedDesign, true)}` : ""),
-						[accept, "暂不批准"], tui, theme, done, 1);
+						[accept, "暂不批准"], tui, theme, done, 1, permissions.implementation);
 					return Object.assign(panel, { dispose: () => operation.removeEventListener("abort", cancel) });
 				});
 				current();
