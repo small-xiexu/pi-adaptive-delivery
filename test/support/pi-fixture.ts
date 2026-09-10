@@ -164,7 +164,7 @@ export class FixtureRpc {
 	}
 }
 
-export async function createPiFixture(packageSource?: string, scenario?: string): Promise<{
+export async function createPiFixture(packageSource?: string, scenario?: string, activate = true): Promise<{
 	root: string;
 	cwd: string;
 	agentDir: string;
@@ -221,5 +221,10 @@ export async function createPiFixture(packageSource?: string, scenario?: string)
 		await writeFile(path.join(agentDir, "skills", "environment-proof", "SKILL.md"),
 			"---\nname: environment-proof\ndescription: ENVIRONMENT_SKILL_DESCRIPTION\n---\n\nENVIRONMENT_SKILL_BODY\n");
 	}
-	return { root, cwd, agentDir, packageDir, productDir, rpc: new FixtureRpc(cwd, env) };
+	const rpc = new FixtureRpc(cwd, env);
+	if (productDir && !writerFixture && activate) {
+		try { await rpc.send("prompt", { message: "/delivery-shape" }); }
+		catch (error) { await rpc.stop(); throw error; }
+	}
+	return { root, cwd, agentDir, packageDir, productDir, rpc };
 }

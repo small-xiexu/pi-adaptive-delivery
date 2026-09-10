@@ -282,6 +282,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		}
 	}
 	return {
+		get pending() { return pending !== undefined; },
 		// 只核实批准依据，不授予 writer；执行方不能把返回快照缓存为持续有效的权限。
 		async readImplementationApproval(ctx: ExtensionContext, signal?: AbortSignal) {
 			const { expected, expectedDesign, workspace } = await readCurrent(ctx, signal);

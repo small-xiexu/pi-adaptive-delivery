@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, withFileMutationQueue, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContextActions, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Context, type ToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
@@ -18,7 +18,7 @@ const documentWrite = "delivery_document_write";
 const documentEdit = "delivery_document_edit";
 
 // 真实 Pi 加载器与 AgentSession；只有交互选择是测试替身，不是用户 TUI 验收。
-async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conflict?: string, resume?: { cwd: string; sessionFile: string }) {
+async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conflict?: string, resume?: { cwd: string; sessionFile: string }, activate = true) {
 	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "document-entry-")));
 	const cwd = resume?.cwd ?? path.join(root, "repo");
 	const agentDir = path.join(root, "agent");
@@ -29,6 +29,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	let calls: ToolCall[] = [];
 	let followups: ToolCall[][] = [];
 	const contexts: Context["messages"][] = [];
+	const prompts: string[] = [];
 	let feedback: (() => string | undefined) | undefined;
 	let api!: ExtensionAPI;
 	const notices: string[] = [];
@@ -43,6 +44,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 				streamSimple(model, context) {
 					const stream = createAssistantMessageEventStream();
 					contexts.push(structuredClone(context.messages));
+					prompts.push(context.systemPrompt ?? "");
 					const content = calls.length ? calls : followups.shift() ?? [];
 					calls = [];
 					queueMicrotask(() => {
@@ -59,7 +61,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 			configure?.(pi);
 		}] });
 	await loader.reload();
-	assert.deepEqual(loader.getExtensions().errors, conflict ? [{ path: "<inline:1>", error: `Tool "${conflict}" conflicts with ${entry}` }] : []);
+	assert.deepEqual(loader.getExtensions().errors, []);
 	const sm = resume ? SessionManager.open(resume.sessionFile) : SessionManager.create(cwd, path.join(root, "sessions"));
 	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json") });
 	const { session } = await createAgentSession({ cwd, agentDir, settingsManager, modelRuntime, resourceLoader: loader, sessionManager: sm });
@@ -68,13 +70,14 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); }
 		finally { session.dispose(); }
 	});
-	await session.bindExtensions({ mode: "tui", uiContext: {
+	await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session.reload() } as ExtensionCommandContextActions, uiContext: {
 		custom: approvalUI((...args) => select(...args), () => feedback?.()),
 		select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args), notify: (text: string) => { notices.push(text); },
 	} as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
 	const model = modelRuntime.getModel("document-fixture", "fake");
 	assert.ok(model);
 	await session.setModel(model);
+	if (activate) await session.prompt("/delivery-shape");
 	const workspace = await resolveWorkspaceIdentity(cwd);
 	const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 	const call = async (name: string, args: Record<string, unknown>) => {
@@ -87,7 +90,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	};
 	const approve = (stage = "design", paths = ["plan.md"]) => call("delivery_approval", { stage, body: `待确认正文 ${stage}`, paths, validationCommands: [] });
 	t.diagnostic(JSON.stringify({ root, sdk: "0.85.1", ui: "simulated" }));
-	return { root, cwd, sm, session, api, notices, choices, call, approve, contexts, readLease: () => leases.read(workspace.key),
+	return { root, cwd, sm, session, api, notices, choices, call, approve, contexts, prompts, readLease: () => leases.read(workspace.key),
 		setFollowups: (steps: ToolCall[][]) => { followups = steps; },
 		setFeedback: (callback: typeof feedback) => { feedback = callback; },
 		setSelect: (callback: typeof select) => { select = callback; } };
@@ -96,6 +99,142 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 const reviewCall = (body: string, paths = ["plan.md"]): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: { stage: "design", body, paths, validationCommands: [] } });
 const editCall = (oldText: string, newText: string): ToolCall => ({ type: "toolCall", id: randomUUID(), name: documentEdit, arguments: { path: "plan.md", edits: [{ oldText, newText }] } });
 const readCall = (): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "read", arguments: { path: "plan.md" } });
+
+test("未启用交付时普通写入、Shell 和第三方工具沿用原行为，退出后恢复", async (t) => {
+	const h = await host(t, (pi) => pi.registerTool({ name: "plugin_tool", label: "原插件", description: "原插件工具", parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text", text: "PLUGIN_ORIGINAL" }], details: {} }) }), undefined, undefined, false);
+	const original = h.session.getActiveToolNames();
+	assert.ok(original.includes("bash") && original.includes("write") && original.includes("plugin_tool"));
+	assert.ok(!h.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
+	await h.session.prompt("普通明确需求，不使用交付流程");
+	await h.session.prompt("/delivery-status");
+	assert.equal((await h.call("write", { path: "normal.txt", content: "正常写入" })).isError, false);
+	assert.equal((await h.call("bash", { command: "printf NORMAL_SHELL" })).isError, false);
+	assert.match(JSON.stringify((await h.call("plugin_tool", {})).content), /PLUGIN_ORIGINAL/);
+	assert.ok(h.prompts.every((prompt) => !prompt.includes("AI 宿主 Shell 关闭")));
+	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-activation"));
+	await h.session.prompt("/delivery-shape");
+	assert.ok(!h.session.getActiveToolNames().includes("write"));
+	h.api.setActiveTools([...h.session.getActiveToolNames(), "write", "plugin_tool"]);
+	assert.equal((await h.call("write", { path: "blocked.txt", content: "禁止" })).isError, true);
+	assert.equal((await h.call("plugin_tool", {})).isError, true);
+	assert.match(h.prompts.at(-1)!, /AI 宿主 Shell 关闭/);
+	assert.ok(h.prompts.at(-1)!.includes(fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))));
+	await h.session.prompt("/delivery-exit");
+	assert.deepEqual(h.session.getActiveToolNames(), original);
+	assert.ok(!h.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
+	assert.equal((await h.call("write", { path: "after.txt", content: "恢复" })).isError, false);
+	assert.match(JSON.stringify((await h.call("plugin_tool", {})).content), /PLUGIN_ORIGINAL/);
+	assert.ok(!h.prompts.at(-1)!.includes("AI 宿主 Shell 关闭"));
+	assert.equal(await readFile(path.join(h.cwd, "normal.txt"), "utf8"), "正常写入");
+	await assert.rejects(access(path.join(h.cwd, "blocked.txt")), { code: "ENOENT" });
+	assert.equal(h.choices.length, 0);
+});
+
+test("显式进入后的 reload 和重开保持门禁，退出后的重开保持普通使用", async (t) => {
+	const h = await host(t);
+	await h.call(documentWrite, { path: "plan.md", content: "原始规划" });
+	await h.approve();
+	await h.session.reload();
+	assert.equal((await h.approve("implementation", ["src"])).isError, true);
+	assert.ok(!h.session.getActiveToolNames().includes("write"));
+	await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+	const reopened = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
+	assert.ok(reopened.session.getActiveToolNames().includes(documentWrite));
+	assert.ok(!reopened.session.getActiveToolNames().includes("write"));
+	await reopened.session.prompt("/delivery-exit");
+	const normal = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
+	assert.ok(normal.session.getActiveToolNames().includes("write"));
+	assert.ok(!normal.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
+});
+
+for (const failure of ["record", "lock"]) test(`真实 SDK 退出遇到未知 writer ${failure} 保持门禁与现场`, async (t) => {
+	const h = await host(t);
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const directory = path.join(await getWriterStateRoot(workspace), "leases");
+	await mkdir(directory, { recursive: true });
+	const file = path.join(directory, `${workspace.key}.${failure === "record" ? "json" : "operation-lock"}`);
+	if (failure === "record") await writeFile(file, "broken");
+	else await mkdir(file);
+	await h.session.prompt("/delivery-exit");
+	assert.ok(!h.session.getActiveToolNames().includes("write"));
+	assert.ok(h.notices.some((text) => text.startsWith("暂不能退出交付")));
+	await access(file);
+	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-activation" && (row.data as any).enabled === false));
+});
+
+// 与 Pi 原生手动命令入口同序：分派 user_bash，再由 Session 执行或记录扩展结果。
+async function userBash(h: Awaited<ReturnType<typeof host>>, command: string, excludeFromContext = false, onChunk?: (chunk: string) => void) {
+	const event = await h.session.extensionRunner.emitUserBash({ type: "user_bash", command, excludeFromContext, cwd: h.cwd });
+	if (event?.result) {
+		h.session.recordBashResult(command, event.result, { excludeFromContext });
+		return event.result;
+	}
+	return h.session.executeBash(command, onChunk, { excludeFromContext, operations: event?.operations });
+}
+
+test("父 TUI 手动 Shell 执行真实 pwd、保留退出码和 !! 上下文语义，模型不能继承权限", async (t) => {
+	const h = await host(t);
+	const chunks: string[] = [];
+	const pwd = await userBash(h, "pwd", false, (chunk) => chunks.push(chunk));
+	assert.equal(pwd.exitCode, 0, pwd.output);
+	assert.equal(await realpath(pwd.output.trim()), h.cwd);
+	assert.equal(chunks.join(""), pwd.output);
+	const written = await userBash(h, "printf VISIBLE_MANUAL; printf USER_CONTENT | tr A-Z a-z > manual.txt");
+	assert.equal(written.exitCode, 0, written.output);
+	assert.equal(await readFile(path.join(h.cwd, "manual.txt"), "utf8"), "user_content");
+	const hidden = await userBash(h, "printf HIDDEN_MANUAL", true);
+	assert.equal(hidden.exitCode, 0, hidden.output);
+	assert.equal(hidden.output, "HIDDEN_MANUAL");
+	const failed = await userBash(h, "printf MANUAL_FAILURE; exit 7");
+	assert.equal(failed.exitCode, 7);
+	assert.equal(failed.output, "MANUAL_FAILURE");
+	const denied = await h.call("bash", { command: "printf MODEL_OVERWRITE > manual.txt" });
+	assert.equal(denied.isError, true);
+	assert.equal(await readFile(path.join(h.cwd, "manual.txt"), "utf8"), "user_content");
+	const context = JSON.stringify(h.contexts);
+	assert.match(context, /VISIBLE_MANUAL/);
+	assert.doesNotMatch(context, /HIDDEN_MANUAL/);
+	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	const commands = rows.filter((row) => row.message?.role === "bashExecution").map((row) => row.message);
+	assert.deepEqual(commands.map((row) => row.exitCode), [0, 0, 0, 7]);
+	assert.equal(commands.find((row) => row.output === "HIDDEN_MANUAL")?.excludeFromContext, true);
+	assert.ok(!rows.some((row) => ["delivery-approval", "delivery-validation"].includes(row.customType)));
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 0);
+});
+
+test("父 TUI 手动 Shell 保留原生取消与 reload 后执行", { timeout: 20_000 }, async (t) => {
+	const h = await host(t);
+	let pid: number | undefined;
+	const result = await userBash(h, 'printf "MANUAL_RUNNING:%s\\n" "$$"; sleep 30', false, (chunk) => {
+		const match = chunk.match(/MANUAL_RUNNING:(\d+)/);
+		if (match) { pid = Number(match[1]); h.session.abortBash(); }
+	});
+	assert.equal(result.cancelled, true, result.output);
+	assert.ok(pid, "必须取得真实 Shell PID 后才取消");
+	assert.throws(() => process.kill(pid!, 0), { code: "ESRCH" });
+	assert.equal(h.session.isBashRunning, false);
+	await h.session.reload();
+	const pwd = await userBash(h, "pwd");
+	assert.equal(pwd.exitCode, 0, pwd.output);
+	assert.equal(await realpath(pwd.output.trim()), h.cwd);
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 0);
+});
+
+test("父 TUI 手动 Shell 继续交给已有扩展处理，不覆盖其执行结果", async (t) => {
+	let received = false;
+	const h = await host(t, (pi) => pi.on("user_bash", (event) => {
+		if (event.command !== "fixture-existing-shell") return;
+		received = true;
+		return { result: { output: "EXISTING_SHELL_BACKEND", exitCode: 9, cancelled: false, truncated: false } };
+	}));
+	const result = await userBash(h, "fixture-existing-shell", true);
+	assert.equal(received, true);
+	assert.deepEqual(result, { output: "EXISTING_SHELL_BACKEND", exitCode: 9, cancelled: false, truncated: false });
+	assert.equal(h.session.messages.at(-1)?.role, "bashExecution");
+});
 
 test("真实 SDK 在同一模型回合接收两轮意见、修订同一方案并批准最新提案", async (t) => {
 	const h = await host(t);
@@ -122,7 +261,7 @@ test("真实 SDK 在同一模型回合接收两轮意见、修订同一方案并
 	assert.deepEqual(feedbackResults.map((row) => row.message.details.feedback), ["改为 V2，保留用户段落", "再调整为 V3"]);
 	for (const text of ["改为 V2，保留用户段落", "再调整为 V3"]) assert.ok(h.contexts.some((messages) => messages.some((message) => message.role === "toolResult" && (message.details as any)?.feedback === text)));
 	assert.ok(!rows.some((row) => row.message?.toolName === "delivery_develop" || row.data?.stage === "implementation"));
-	assert.equal(h.notices.length, 0);
+	assert.deepEqual(h.notices.filter((text) => !text.startsWith("交付已启用")), []);
 });
 
 test("无规划文档的真实 SDK 方案反馈、暂停和重载恢复仅使用会话正文", async (t) => {

@@ -59,6 +59,22 @@ async function gitRepo(prefix: string): Promise<string> {
 	return repo;
 }
 
+test("退出所需 writer 空闲证据拒绝损坏记录及残留操作锁，不解锁", async () => {
+	const repo = await gitRepo("adaptive-idle-");
+	const workspace = await resolveWorkspaceIdentity(repo);
+	const root = await getWriterStateRoot(workspace);
+	const manager = new WriterLeaseManager(root);
+	await manager.assertIdle(workspace.key);
+	await mkdir(path.join(root, "leases"), { recursive: true });
+	const lock = path.join(root, "leases", `${workspace.key}.operation-lock`);
+	await mkdir(lock);
+	await assert.rejects(manager.assertIdle(workspace.key), /操作锁/);
+	await access(lock);
+	await writeFile(path.join(root, "leases", `${workspace.key}.json`), "broken");
+	await assert.rejects(manager.assertIdle(workspace.key));
+	await access(lock);
+});
+
 test("canonicalizes symlink aliases to the same workspace key", async () => {
 	const repo = await gitRepo("adaptive-lease-repo-");
 	const aliases = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-alias-"));

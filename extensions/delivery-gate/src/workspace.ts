@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, open, readFile, realpath, rename, rm, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual, promisify } from "node:util";
 
@@ -294,6 +294,13 @@ export class WriterLeaseManager {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
 		}
+	}
+
+	async assertIdle(workspaceKey: string): Promise<void> {
+		if (await this.read(workspaceKey)) throw new Error("现场有未交回的 writer；核实原执行前保持受控，不自动解锁。");
+		try { await lstat(this.operationLockPath(workspaceKey)); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+		throw new Error("writer 操作锁仍在，收尾尚未核实；不自动解锁。");
 	}
 
 	async acquire(

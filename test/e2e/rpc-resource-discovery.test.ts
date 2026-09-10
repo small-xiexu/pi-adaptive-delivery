@@ -9,6 +9,26 @@ import { createPiFixture, FixtureRpc, testEnvironment } from "../support/pi-fixt
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
+test("正式 Package 默认不约束 RPC Shell，shape 后受控，exit 后恢复", { timeout: 30_000 }, async (t) => {
+	const f = await createPiFixture(source, undefined, false);
+	t.after(() => f.rpc.stop());
+	const commands = (await f.rpc.send("get_commands")).data.commands;
+	assert.ok(commands.some((command: any) => command.name === "delivery-shape" && command.source === "extension"));
+	assert.ok(!commands.some((command: any) => command.name === "delivery-resume"));
+	assert.equal((await f.rpc.send("bash", { command: "printf before > normal.txt" })).data.exitCode, 0);
+	await f.rpc.send("prompt", { message: "/delivery-status" });
+	await f.rpc.send("prompt", { message: "/delivery-shape" });
+	assert.equal((await f.rpc.send("bash", { command: "printf blocked > blocked.txt" })).data.exitCode, 1);
+	await f.rpc.send("prompt", { message: "/delivery-exit" });
+	assert.equal((await f.rpc.send("bash", { command: "printf after >> normal.txt" })).data.exitCode, 0);
+	assert.equal(await readFile(path.join(f.cwd, "normal.txt"), "utf8"), "beforeafter");
+	await assert.rejects(access(path.join(f.cwd, "blocked.txt")), { code: "ENOENT" });
+	await f.rpc.send("prompt", { message: "/delivery-shape" });
+	await f.rpc.send("new_session");
+	assert.equal((await f.rpc.send("bash", { command: "printf NEW_SESSION" })).data.exitCode, 0);
+	t.diagnostic(JSON.stringify({ root: f.root, pid: f.rpc.process.pid }));
+});
+
 test("离线 npm tarball 在无 node_modules 的隔离目录加载完整自有资源并执行真实 Pi", { timeout: 40_000 }, async (t) => {
 	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "adaptive-pack-")));
 	const stage = path.join(root, "stage");

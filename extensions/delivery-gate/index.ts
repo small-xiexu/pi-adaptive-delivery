@@ -14,8 +14,14 @@ import { resolveContainerImage } from "./src/container.ts";
 import { installTaskDetails } from "./src/task-details.ts";
 import { installStreamRetry } from "./src/stream-retry.ts";
 import { agentSelection, installModelCatalog, selectChildAgent } from "./src/agent-selection.ts";
+import { installActivation } from "./src/activation.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
+	if (process.env[CHILD_ENV]) { installDelivery(pi); return; }
+	installActivation(pi, () => installDelivery(pi)!);
+}
+
+function installDelivery(pi: ExtensionAPI) {
 	const entryPath = fileURLToPath(import.meta.url);
 	installStreamRetry(pi);
 	// 子进程启动前确定角色；该内部标记只去除协调权限，不提供批准能力。
@@ -46,7 +52,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	};
 	const structuredAllowed = (name: string) => Boolean(structured && STRUCTURED_TOOLS.includes(name)
 		&& pi.getAllTools().some((tool) => tool.name === name && tool.sourceInfo.path === entryPath));
-	pi.on("session_start", async (_event, ctx) => {
+	const initializeStructured = async () => {
 		await readonlyCommands?.finish();
 		readonlyCommands = undefined;
 		structuredClose = undefined;
@@ -92,7 +98,8 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 				return readonlyCommands.exec(id, args as ExecInput, signal, update);
 			},
 		});
-	});
+	};
+	if (child) pi.on("session_start", initializeStructured);
 	pi.on("session_shutdown", async () => {
 		if (!structured || childDevelopment) return;
 		if (readonlyCommands) {
@@ -123,12 +130,13 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		return { ...snapshotReadOnlyEnvironment(options, pi.getAllTools().filter((tool) => names.includes(tool.name))),
 			...(structuredMode ? { structured: { entry: path.join(structured!.root, "dist", "index.js"), version: "3.0.29" } } : {}) };
 	};
-	installPolicy(pi, child ? undefined : entryPath, childDevelopment ? entryPath : undefined, structuredAllowed);
+	const restrictTools = installPolicy(pi, child ? undefined : entryPath, childDevelopment ? entryPath : undefined, structuredAllowed);
 	pi.on("session_start", () => { promptOptions = undefined; });
 	pi.on("before_agent_start", (event) => {
 		promptOptions = structuredClone(event.systemPromptOptions);
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。`
+				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话只使用已交接的文件/容器工具，不修改父规划文档、不执行宿主 Shell、不批准或继续委派。"
 					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n简单明确、可一次完成并验证的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和验收，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择 agent 配置；delivery_models 查询可用模型，不统计费用。"),
 		};
@@ -286,4 +294,14 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 			}
 		},
 	});
+	return {
+		initialize: async () => { await initializeStructured(); restrictTools(); },
+		assertCanExit: async (ctx: ExtensionContext) => {
+			if (approvals.pending || writer.pending || developer.pending || active.size || readonlyStarting || readonlyCommands?.active) throw new Error("交互或执行尚未收尾，请等待原始结果与写入权限交回。");
+			if (readonlyCommands?.cleanupFailed || (structuredClose && !structuredClose.clean)) throw new Error("只读容器收尾尚未核实，请先核对原始执行记录。");
+			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
+			const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
+			await leases.assertIdle(workspace.key);
+		},
+	};
 }

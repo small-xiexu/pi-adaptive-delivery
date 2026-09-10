@@ -23,7 +23,26 @@ test("实际调用边界拒绝重新激活的写工具与未知工具", () => {
 	const { handlers } = host();
 	for (const toolName of ["write", "bash", "unknown"]) assert.equal(handlers.get("tool_call")!({ toolName }).block, true);
 	assert.equal(handlers.get("tool_call")!({ toolName: "read" }), undefined);
-	assert.equal(handlers.get("user_bash")!().result.exitCode, 1);
+	assert.equal(handlers.get("user_bash")!({}, { mode: "rpc" }).result.exitCode, 1);
+});
+
+for (const excludeFromContext of [false, true]) test(`父 TUI 手动 Shell 不拦截，excludeFromContext=${excludeFromContext}，模型工具仍受限`, () => {
+	const { handlers } = host("/owned/index.ts");
+	const event = { type: "user_bash", command: "printf manual | tr a-z A-Z > user.txt", excludeFromContext, cwd: "/fixture" };
+	assert.equal(handlers.get("user_bash")!(event, { mode: "tui" }), undefined);
+	assert.equal(handlers.get("tool_call")!({ toolName: "bash" }).block, true);
+});
+
+for (const mode of ["rpc", "json", "print", undefined]) test(`父 ${mode} 不能通过 user_bash 执行宿主命令`, () => {
+	const { handlers } = host("/owned/index.ts");
+	assert.equal(handlers.get("user_bash")!({ command: "pwd", excludeFromContext: false }, { mode }).result.exitCode, 1);
+});
+
+test("子角色即使绑定 TUI 也不开放 user_bash", () => {
+	for (const developerPath of [undefined, "/owned/index.ts"]) {
+		const { handlers } = host(undefined, developerPath);
+		assert.equal(handlers.get("user_bash")!({ command: "pwd", excludeFromContext: false }, { mode: "tui" }).result.exitCode, 1);
+	}
 });
 
 test("同名工具实现被覆盖后不能继承原生只读权限", () => {
@@ -66,7 +85,7 @@ for (const name of ["edit", "write", "bash"]) test(`开发子角色仅允许自�
 	assert.deepEqual(pi.getActiveTools(), ["read", name]);
 	assert.equal(handlers.get("tool_call")!({ toolName: name }), undefined);
 	if (name !== "bash") assert.equal(handlers.get("tool_call")!({ toolName: "bash" }).block, true);
-	assert.equal(handlers.get("user_bash")!().result.exitCode, 1);
+	assert.equal(handlers.get("user_bash")!({}, { mode: "rpc" }).result.exitCode, 1);
 	own.sourceInfo.path = "/foreign/index.ts";
 	assert.equal(handlers.get("tool_call")!({ toolName: name }).block, true);
 });

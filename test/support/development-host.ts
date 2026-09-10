@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TestContext } from "node:test";
-import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionCommandContextActions, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createPiFixture, testEnvironment } from "./pi-fixture.ts";
 import { approvalUI } from "./delivery-ui.ts";
@@ -14,7 +14,7 @@ const source = fileURLToPath(new URL("../../", import.meta.url));
 
 // 文件开发与容器组合共用同一个 SDK 父/模拟选择、真实 CLI 子宿主。
 export async function createDevelopmentHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void,
-	configureFixture?: (fixture: Awaited<ReturnType<typeof createPiFixture>>) => Promise<void>) {
+	configureFixture?: (fixture: Awaited<ReturnType<typeof createPiFixture>>) => Promise<void>, activate = true) {
 	const fixture = await createPiFixture(source, `development-${scenario}`);
 	await fixture.rpc.send("get_state");
 	await fixture.rpc.stop();
@@ -46,7 +46,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 			Object.assign(process.env, originalEnv);
 		}
 	});
-	await session.bindExtensions({ mode: "tui", abortHandler: () => { session.clearQueue(); void session.abort(); },
+	await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session.reload() } as ExtensionCommandContextActions, abortHandler: () => { session.clearQueue(); void session.abort(); },
 		uiContext: { ...session.extensionRunner.getUIContext(), select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args),
 		custom: (...args: Parameters<ExtensionUIContext["custom"]>) => custom(...args),
 		confirm: (...args: Parameters<ExtensionUIContext["confirm"]>) => confirm(...args), input: (...args: Parameters<ExtensionUIContext["input"]>) => input(...args),
@@ -54,6 +54,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 	const model = modelRuntime.getModel("adaptive-fixture", "fake");
 	assert.ok(model);
 	await session.setModel(model);
+	if (activate) await session.prompt("/delivery-shape");
 	const workspace = await resolveWorkspaceIdentity(fixture.cwd);
 	const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 	const call = async (name: string, args: Record<string, unknown>) => {

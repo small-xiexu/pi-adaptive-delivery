@@ -68,6 +68,30 @@ function assertEnhancements(events: any[]) {
 	assert.ok(events.filter((event) => event.child && event.phase === "model").every((event) => event.parentMarkerSeen === false));
 }
 
+test("真实 Structured 未启用时沿用原执行，shape 接管，exit 恢复原实现及工具集合", { timeout: 45_000 }, async (t) => {
+	const h = await createDevelopmentHost(t, "structured-normal", undefined, (f) => configure(f), false);
+	const sourcePath = () => h.session.getAllTools().find((tool) => tool.name === "exec_command")!.sourceInfo.path;
+	assert.equal(sourcePath(), path.join(adapter, "dist/index.js"));
+	assert.ok(!h.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
+	const before = await h.call("exec_command", { cmd: "printf ORIGINAL_HOST > original.txt", yield_time_ms: 1000 });
+	assert.equal(before.isError, false, JSON.stringify(before));
+	assert.equal(await readFile(path.join(h.cwd, "original.txt"), "utf8"), "ORIGINAL_HOST");
+	// 原插件会在模型回合前重设工具；核对的是用户进入交付前的实际选择。
+	h.session.setActiveToolsByName(h.session.getActiveToolNames().filter((name) => name !== "view_image"));
+	const original = h.session.getActiveToolNames();
+	await h.session.prompt("/delivery-shape");
+	assert.equal(sourcePath(), path.join(h.productDir!, "extensions/delivery-gate/index.ts"));
+	const blocked = await h.call("apply_patch", { patch: "*** Begin Patch\n*** Add File: forbidden.txt\n+blocked\n*** End Patch" });
+	assert.equal(blocked.isError, true);
+	await h.session.prompt("/delivery-exit");
+	assert.equal(sourcePath(), path.join(adapter, "dist/index.js"));
+	assert.deepEqual(h.session.getActiveToolNames(), original);
+	assert.equal((await h.call("exec_command", { cmd: "printf RESTORED >> original.txt", yield_time_ms: 1000 })).isError, false);
+	assert.equal(await readFile(path.join(h.cwd, "original.txt"), "utf8"), "ORIGINAL_HOSTRESTORED");
+	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
+	assert.equal(h.choices.length, 0);
+});
+
 for (const seven of [false, true]) test(`真实 Structured ${seven ? "显式七工具" : "Pi 默认四工具"} 父子只读、请求与上下文增强保留`, { timeout: 60_000 }, async (t) => {
 	const f = await createPiFixture(source, "structured-readonly");
 	await f.rpc.send("get_state");
@@ -77,6 +101,7 @@ for (const seven of [false, true]) test(`真实 Structured ${seven ? "显式七�
 	t.after(() => rpc.stop());
 	await auditResources(t, f);
 	await rpc.send("get_state");
+	await rpc.send("prompt", { message: "/delivery-shape" });
 	await rpc.send("prompt", { message: "/fixture-isolation" });
 	await rpc.send("prompt", { message: "fixture-delegate" });
 	await rpc.waitFor((row) => row.type === "agent_settled", 0, 45_000);
@@ -110,6 +135,7 @@ for (const seven of [false, true]) test(`真实 Structured ${seven ? "显式七�
 	assert.ok(last);
 	// agent_settled 的通知可早于扩展收尾，下一条调用由真实工具边界等待或拒绝。
 	await rpc.send("new_session");
+	await rpc.send("prompt", { message: "/delivery-shape" });
 	const again = await invoke("new-session-read", { cmd: "cat input.txt", yield_time_ms: 30_000 });
 	assert.equal(again.isError, false, JSON.stringify(again));
 	assert.equal(again.result.details.exit_code, 0);
@@ -124,7 +150,7 @@ test("Structured 加载顺序未接管时明确拒绝，不执行原插件宿主
 	await f.rpc.send("get_state"); await f.rpc.stop(); await configure(f, true);
 	const rpc = new FixtureRpc(f.cwd, { ...testEnvironment(f.root), ADAPTIVE_FIXTURE_SCENARIO: "structured-readonly" });
 	t.after(() => rpc.stop());
-	await rpc.send("get_state"); await rpc.send("prompt", { message: "fixture-delegate" });
+	await rpc.send("get_state"); await rpc.send("prompt", { message: "/delivery-shape" }); await rpc.send("prompt", { message: "fixture-delegate" });
 	await rpc.waitFor((row) => row.type === "agent_settled");
 	assert.match(JSON.stringify(rpc.records.find((row) => row.type === "tool_execution_end" && row.toolName === "delivery_readonly")), /之前加载/);
 	await rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id: "unsafe", name: "exec_command", arguments: { cmd: "touch forbidden.txt" } })}` });
@@ -307,6 +333,7 @@ test("真实 Structured 并发只读子分别读取不同文件，卡片与增�
 	await writeFile(path.join(f.cwd, "input-b.txt"), "EVIDENCE_B\n");
 	const rpc = new FixtureRpc(f.cwd, { ...testEnvironment(f.root), ADAPTIVE_FIXTURE_SCENARIO: "structured-readonly-parallel" });
 	t.after(() => rpc.stop()); await auditResources(t, f);
+	await rpc.send("prompt", { message: "/delivery-shape" });
 	await rpc.send("prompt", { message: "fixture-delegate" });
 	await rpc.waitFor((row) => row.type === "agent_settled", 0, 45_000);
 	const results = rpc.records.filter((row) => row.type === "tool_execution_end" && row.toolName === "delivery_readonly");
@@ -328,6 +355,7 @@ test("真实 Structured 同回合并发 Shell 只创建一个可跟踪命令，�
 	await f.rpc.send("get_state"); await f.rpc.stop(); await configure(f);
 	const rpc = new FixtureRpc(f.cwd, { ...testEnvironment(f.root), ADAPTIVE_FIXTURE_SCENARIO: "structured-command-parallel" });
 	t.after(() => rpc.stop()); await auditResources(t, f);
+	await rpc.send("prompt", { message: "/delivery-shape" });
 	await rpc.send("prompt", { message: "并发只读命令" });
 	await rpc.waitFor((row) => row.type === "agent_settled");
 	const results = rpc.records.filter((row) => row.type === "tool_execution_end" && row.toolName === "exec_command");
