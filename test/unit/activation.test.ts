@@ -85,3 +85,13 @@ test("退出经重载恢复原工具集合，只消费一次恢复记录", async
 	await resumed.handlers.get("resources_discover")!();
 	assert.deepEqual(resumed.pi.getActiveTools(), ["read"]);
 });
+
+test("重载说明确认失效与退出恢复入口，提示不重新启用被停用工具", async () => {
+	const h = host([{ type: "custom", customType: "delivery-activation", data: { enabled: true, tools: ["read", "bash", "plugin"] } }]);
+	await h.handlers.get("session_start")!({ reason: "reload" }, h.ctx);
+	assert.match(h.notices.at(-1)!, /确认.*重新/);
+	assert.match(h.notices.at(-1)!, /保留.*工具.*\/delivery-exit/);
+	assert.deepEqual(h.pi.getActiveTools(), ["read"]);
+	assert.equal(h.messages.length, 0);
+	assert.equal(h.entries.length, 1);
+});

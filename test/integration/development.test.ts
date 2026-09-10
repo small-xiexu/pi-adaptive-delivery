@@ -123,6 +123,34 @@ test("状态查询展示确认阶段及下一步，查询不调用模型、不�
 	assert.equal((await h.call("delivery_develop", { task: "状态查询不能恢复旧批准" })).isError, true);
 });
 
+test("旧版裁剪现场重载新版后保留工具选择，退出恢复原工具并完成已授权本地提交", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "normal", undefined, undefined, false);
+	const original = h.session.getActiveToolNames();
+	for (const name of ["bash", "edit", "write"]) assert.ok(original.includes(name));
+	await h.session.prompt("/delivery-shape");
+	await h.prepare();
+	// 重现旧版已运行会话留下的工具裁剪；重载执行真实 Pi 生命周期，不加载历史兼容代码。
+	h.session.setActiveToolsByName(h.session.getActiveToolNames().filter((name) => !["bash", "edit", "write"].includes(name)));
+	const calls = (await h.audit()).filter((row) => row.phase === "model").length;
+	await h.session.reload();
+	assert.ok(h.notices.some((notice) => /保留.*工具.*\/delivery-exit/.test(notice)));
+	for (const name of ["bash", "edit", "write"]) assert.ok(!h.session.getActiveToolNames().includes(name));
+	await h.session.prompt("/delivery-status");
+	assert.match(h.notices.at(-1)!, /等待方案确认/);
+	assert.equal(await h.readLease(), undefined);
+	await h.session.prompt("/delivery-exit");
+	assert.deepEqual(h.session.getActiveToolNames(), original);
+	assert.equal((await h.audit()).filter((row) => row.phase === "model").length, calls);
+	assert.ok(!h.session.getAllTools().some((tool) => tool.name === "delivery_develop"));
+	const choices = h.choices.length;
+	const result = await h.call("bash", { command: "git add -- input.txt && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m 'fixture authorized commit'", timeout: 10 });
+	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.equal(execFileSync("git", ["log", "-1", "--format=%s"], { cwd: h.cwd, encoding: "utf8" }).trim(), "fixture authorized commit");
+	assert.equal(execFileSync("git", ["show", "HEAD:input.txt"], { cwd: h.cwd, encoding: "utf8" }), "fixture-read-ok\n");
+	assert.equal(h.choices.length, choices);
+	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
+});
+
 test("无规划文档的真实 Pi 开发、固定验收和独立审查沿用会话批准正文", { timeout: 60_000 }, async (t) => {
 	let h: Awaited<ReturnType<typeof host>>;
 	h = await host(t, "local-review-normal", (pi) => {
@@ -239,6 +267,29 @@ for (const tool of ["delivery_readonly", "delivery_develop"]) test(`${tool} 拒�
 	assert.throws(() => process.kill(events.find((row) => row.phase === "start").pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
+});
+
+test("握手失败后子退出异常保留父 writer，不因任务尚未发送而放行", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "selection-mismatch-stop-error");
+	const progress: any[] = [];
+	t.after(h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName === "delivery_develop") progress.push(event.partialResult.details.progress); }));
+	await h.prepare();
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	const result = await h.call("delivery_develop", { task: "只核验启动异常", agent: { thinking: "high", reason: "核对未发任务的异常关闭" } });
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result.content), /子收尾核验：未取得证明/);
+	assert.equal(progress.at(-1).status, "收尾未知");
+	assert.equal((await h.readLease())?.owner.kind, "parent");
+	assert.ok(h.notices.some((notice) => notice.includes("开发 writer 未交回")));
+	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
+	assert.equal(children.length, 1);
+	assert.throws(() => process.kill(children[0].pid, 0), { code: "ESRCH" });
+	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
+	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-development"));
+	await h.session.prompt("/delivery-exit");
+	assert.match(h.notices.at(-1)!, /暂不能退出交付/);
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "未核实前不能写进度" })).isError, true);
+	await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
 });
 
 test("真实验收与审查子可分别选择级别，原批准与工具参数绑定保持", { timeout: 40_000 }, async (t) => {
@@ -953,12 +1004,20 @@ test("真实子 Pi 的本机命令失败保留错误与执行引用，不把模�
 
 for (const name of ["edit", "write"]) test(`父 ${name} 仅在内存被覆盖而子未加载同一实现时，不发送任务`, { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
+	const progress: any[] = [];
+	t.after(h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName === "delivery_develop") progress.push(event.partialResult.details.progress); }));
 	await h.prepare();
 	await h.session.prompt(`/fixture-replace-tool ${name}`);
 	assert.notEqual(h.session.getAllTools().find((tool) => tool.name === name)?.sourceInfo.source, "builtin");
 	const result = await h.call("delivery_develop", { task: "需要实际配置工具的文件任务" });
 	assert.equal(result.isError, true);
 	assert.match(JSON.stringify(result.content), /父子工具定义或来源未对齐/);
+	assert.match(JSON.stringify(result.content), new RegExp(`定义或来源不同：${name}`));
+	assert.match(JSON.stringify(result.content), /子收尾核验：已取得证明/);
+	assert.equal(progress.at(-1).status, "启动失败");
 	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
+	for (const child of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined);
+	await h.session.prompt("/delivery-exit");
+	assert.ok(!h.session.getAllTools().some((tool) => tool.name === "delivery_develop"));
 });

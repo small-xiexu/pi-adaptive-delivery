@@ -15,13 +15,14 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		runtime ??= start(ctx);
 		await runtime.initialize();
 	};
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		const entry = ctx.sessionManager.getEntries().findLast((row) => row.type === "custom" && row.customType === ENTRY);
 		if (entry?.type !== "custom") return;
 		const state = entry.data as Activation;
 		if (state.enabled) {
 			originalTools = state.tools ?? [];
 			await enter(ctx);
+			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载，旧方案与实施确认已失效，继续开发须重新确认。Pi 保留当前启用的工具列表；若升级后工具缺失，待执行收尾后用 /delivery-exit 恢复进入前工具。", "info");
 		} else if (state.tools) {
 			restoreTools = state.tools;
 		}

@@ -119,7 +119,7 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			if (progress) context.state.progress = progress;
 			const latest = (progress ?? context.state.progress) as TaskProgress | undefined;
 			const body = outputText(result);
-			const status = isPartial ? latest?.status ?? "准备中" : context.isError ? (latest?.status === "已取消" || latest?.status === "收尾未知" ? latest.status : "失败") : latest?.status ?? "执行结束，结果待核实";
+			const status = isPartial ? latest?.status ?? "准备中" : context.isError ? (latest && ["已取消", "收尾未知", "启动失败"].includes(latest.status) ? latest.status : "失败") : latest?.status ?? "执行结束，结果待核实";
 			const heading = `${status === "执行结束，结果待核实" ? "已结束，待核对" : status} · ${label} · ${short((context.args as { task?: string })?.task ?? "固定候选验收", 64)}`;
 			const detail = (latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking} · ` : "") + (latest?.action ?? (isPartial ? "核对任务环境" : short(body)));
 			const component = {

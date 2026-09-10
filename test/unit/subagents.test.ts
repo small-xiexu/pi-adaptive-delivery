@@ -162,6 +162,22 @@ test("父协调工具提示与只读子工具提示不同，不当作基础指�
 	assert.doesNotThrow(() => assertReadOnlyEnvironment(expected, snapshotReadOnlyEnvironment(options, tools)));
 });
 
+test("工具环境不一致明确列出缺少、新增和定义差异，并引导收尾后退出恢复", () => {
+	const base = snapshotReadOnlyEnvironment({ cwd: "/repo" }, []);
+	const expected = { ...base, tools: [{ name: "read", digest: "original" }, { name: "grep", digest: "original" }] };
+	const actual = { ...base, tools: [{ name: "read", digest: "changed" }, { name: "bash", digest: "new" }] };
+	assert.throws(() => assertReadOnlyEnvironment(expected, actual), (error: Error) => {
+		assert.match(error.message, /子会话缺少：grep/);
+		assert.match(error.message, /子会话额外启用：bash/);
+		assert.match(error.message, /定义或来源不同：read/);
+		assert.match(error.message, /未发送任务/);
+		assert.match(error.message, /收尾.*\/delivery-exit/s);
+		assert.match(error.message, /\/reload.*保留.*工具/s);
+		assert.doesNotMatch(error.message, /digest|original|changed/);
+		return true;
+	});
+});
+
 test("内部命令来源不符时不能执行，即使名字相同", async () => {
 	const { rpc, process, requests, emit } = fixture();
 	process.stdin.on("data", (chunk) => {

@@ -181,7 +181,10 @@ interface DevelopmentRun extends SessionBinding {
 
 async function childTerminal(state: DevelopmentRun) {
 	const { rpc, child, owner } = state;
-	if (!rpc || !child?.sessionFile || !owner || rpc.exit?.code !== 0 || rpc.exit.signal !== null || rpc.failure || rpc.openTools.size) throw new Error("子 Pi 或工具终态未知，保留 writer");
+	if (!rpc || rpc.exit?.code !== 0 || rpc.exit.signal !== null || rpc.failure || rpc.openTools.size) throw new Error("子 Pi 或工具终态未知，保留 writer");
+	// 握手失败时 writer 仍属于父；只核实已启动进程的关闭，不要求尚未发送任务的模型记录。
+	if (!state.taskSent && owner?.kind === "parent") return { digest: digest({ pid: rpc.process.pid, exit: rpc.exit, taskSent: false }), last: undefined, validation: undefined };
+	if (!child?.sessionFile || !owner) throw new Error("子 Pi 或工具终态未知，保留 writer");
 	let content: string;
 	try { content = await readFile(child.sessionFile, "utf8"); }
 	catch (error) {
@@ -217,7 +220,7 @@ async function readonlyTerminal(state: DevelopmentRun) {
 }
 
 export async function verifyRecordedResult(state: DevelopmentRun, ctx: ExtensionContext) {
-	if (state.owner?.kind === "child" && (!state.childTerminal || (await childTerminal(state)).digest !== state.childTerminal)) throw new Error("子执行终态已变化");
+	if ((state.rpc || state.owner?.kind === "child") && (!state.childTerminal || (await childTerminal(state)).digest !== state.childTerminal)) throw new Error("子执行终态已变化");
 	if (state.readonlyReference?.pid && (!state.readonlyTerminal || await readonlyTerminal(state) !== state.readonlyTerminal)) throw new Error("审查子执行终态已变化或未知");
 	const records = await nativeEntries(state, ctx);
 	records.requireEntry(state.call!);
@@ -364,7 +367,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 			catch (error) { state.problem ??= error; }
 			try {
 				if (state.rpc) await state.rpc.stop(input.entryPath);
-				if (state.owner?.kind === "child") {
+				if (state.rpc) {
 					const terminal = await childTerminal(state);
 					state.childTerminal = terminal.digest;
 					if (terminal.incompleteCommand) state.problem ??= new Error("Structured 子命令未通过原生工具交回最终退出结果；已停止命令，不能作为成功任务");
@@ -397,7 +400,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				state.result = snapshot({ ...result, isError: false });
 				return result;
 			} catch (error) {
-				progress.end((state.rpc || state.readonlyReference?.pid) && !state.childTerminal && !state.readonlyTerminal ? "收尾未知" : executionSignal.aborted ? "已取消" : "失败");
+				progress.end((state.rpc || state.readonlyReference?.pid) && !state.childTerminal && !state.readonlyTerminal ? "收尾未知" : executionSignal.aborted ? "已取消" : !state.taskSent && !state.readonlyStarted ? "启动失败" : "失败");
 				const childSession = state.child?.sessionFile ?? state.readonlyReference?.sessionFile;
 				const text = (error instanceof Error ? error.message : String(error))
 					+ (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。")

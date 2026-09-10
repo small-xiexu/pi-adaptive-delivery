@@ -40,7 +40,15 @@ export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, t
 export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?: ReadOnlyEnvironment): void {
 	if (JSON.stringify(expected.structured) !== JSON.stringify(actual?.structured)) throw new Error("Structured 插件模式或来源未对齐，未发送任务");
 	if (JSON.stringify(expected.tools) !== JSON.stringify(actual?.tools)) {
-		throw new Error(`父子工具定义或来源未对齐：需要 ${expected.tools.map((tool) => tool.name).join(",")}；实际 ${JSON.stringify(actual?.tools)}。未发送任务`);
+		const parent = new Map(expected.tools.map((tool) => [tool.name, tool.digest]));
+		const child = new Map((actual?.tools ?? []).map((tool) => [tool.name, tool.digest]));
+		const missing = [...parent.keys()].filter((name) => !child.has(name));
+		const extra = [...child.keys()].filter((name) => !parent.has(name));
+		const changed = [...parent.keys()].filter((name) => child.has(name) && parent.get(name) !== child.get(name));
+		throw new Error("父子工具定义或来源未对齐，未发送任务。"
+			+ `\n子会话缺少：${missing.join(", ") || "无"}；子会话额外启用：${extra.join(", ") || "无"}；定义或来源不同：${changed.join(", ") || "无"}。`
+			+ "\n父会话可能仍保留更新前的插件或工具选择。先用 /delivery-status details 核对收尾；空闲且执行已收尾后，在父终端用 /delivery-exit 恢复进入前工具并重载。继续开发时再用 /delivery-shape 进入。"
+			+ "\n单独 /reload 会保留当前启用的工具列表；若退出后仍不一致，按上述差异核对插件配置与实现，不自动启用工具或重复委派。");
 	}
 	if (expected.instructions !== actual?.instructions) throw new Error("基础指令未对齐；请按配置提供子任务所需指令。未发送任务");
 	if (expected.rules !== actual?.rules) throw new Error("项目或全局规则未对齐；请核对配置与已加载内容。未发送任务");

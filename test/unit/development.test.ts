@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import test from "node:test";
 import { createEditTool, createWriteTool, SessionManager } from "@earendil-works/pi-coding-agent";
 import { captureCandidate } from "../../extensions/delivery-gate/src/candidate.ts";
 import { createChildDevelopment, verifyRecordedResult } from "../../extensions/delivery-gate/src/development.ts";
+import type { ChildRpc } from "../../extensions/delivery-gate/src/subagents.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WRITER_LEASE_VERSION } from "../../extensions/delivery-gate/src/workspace.ts";
 
 async function host(separateGit = false, pristine = false) {
@@ -93,6 +95,31 @@ test("子已有消息后丢失 Session 不能按未开始收尾", async () => {
 	const h = await host();
 	await rm(h.sm.getSessionFile()!, { force: true });
 	await assert.rejects(h.writer.finish(h.ctx), { code: "ENOENT" });
+});
+
+test("任务发送前的父 writer 交接核实子关闭证明，退出异常或已发任务不能按启动失败放行", async () => {
+	const h = await host();
+	const first = h.sm.getBranch()[0]!;
+	assert.ok(first.type === "message" && first.message.role === "assistant");
+	h.sm.appendMessage({ ...first.message, content: [{ type: "toolCall", id: "startup", name: "delivery_develop", arguments: { task: "启动失败" } }] });
+	const call = structuredClone(h.sm.getBranch().at(-1)!);
+	const result = { content: [{ type: "text" as const, text: "工具环境不一致，未发送任务" }], details: {}, isError: true };
+	h.sm.appendMessage({ role: "toolResult", toolCallId: "startup", toolName: "delivery_develop", ...result, timestamp: Date.now() });
+	const rpc = { process: { pid: 42 }, exit: { code: 0, signal: null }, openTools: new Set<string>() } as ChildRpc;
+	const proof = createHash("sha256").update(JSON.stringify({ pid: 42, exit: rpc.exit, taskSent: false })).digest("hex");
+	const state: Parameters<typeof verifyRecordedResult>[0] = { id: "startup", name: "delivery_develop", cwd: h.cwd,
+		sessionId: h.sm.getSessionId(), sessionFile: h.sm.getSessionFile()!, lifetime: new AbortController(),
+		finished: true, attemptedLease: true, owner: h.grant.parent, call, result, rpc, childTerminal: proof };
+	await verifyRecordedResult(state, h.ctx);
+	for (const change of [
+		{ childTerminal: undefined },
+		{ rpc: { ...rpc, exit: undefined } },
+		{ rpc: { ...rpc, exit: { code: 13, signal: null } } },
+		{ rpc: { ...rpc, exit: { code: null, signal: "SIGKILL" } } },
+		{ rpc: { ...rpc, failure: new Error("协议失效") } },
+		{ rpc: { ...rpc, openTools: new Set(["inflight"]) } },
+		{ taskSent: true },
+	]) await assert.rejects(verifyRecordedResult({ ...state, ...change } as typeof state, h.ctx), /子.*终态未知|子执行终态已变化/);
 });
 
 for (const field of ["content", "isError"]) test(`失败结果的证据或错误标记 ${field} 被改写时不能交接`, async () => {

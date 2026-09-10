@@ -92,7 +92,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 			assert.equal(ended.parentSessionId, parent.sessionId);
 			assert.equal(ended.status === "completed", success || toolErrors);
 		}
-		if (scenario === "missing-tools") assert.match(ended.error, /需要 bash,edit,read,write.*实际 \[\]/);
+		if (scenario === "missing-tools") assert.match(ended.error, /子会话缺少：bash, edit, read, write；子会话额外启用：无；定义或来源不同：无/);
 		if (scenario === "crash") assert.equal(ended.status, "unknown");
 		if (scenario === "tool-fail" || scenario === "readonly-recover") {
 			const text = tool.result.content[0].text;

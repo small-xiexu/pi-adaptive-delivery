@@ -49,6 +49,21 @@ test("进度大量输出有界，通知错误不影响状态和真实结束", ()
 	assert.equal(p.snapshot().status, "收尾未知");
 });
 
+for (const status of ["启动失败", "收尾未知"]) test(`真实 Pi 卡片保留 ${status}，原生失败结果不覆盖已核实的展示状态`, () => {
+	initTheme("dark");
+	const tool: ToolDefinition = { name: "delivery_develop", label: "开发", description: "", parameters: Type.Object({ task: Type.String() }),
+		...taskRenderers("开发"), execute: async () => ({ content: [], details: {} }) };
+	const component = new ToolExecutionComponent(tool.name, "startup", { task: "启动检查" }, {}, tool, { requestRender() {} } as TUI, "/tmp");
+	const progress = createTaskProgress("startup", "开发", "启动检查", (message, view) => {
+		component.updateResult({ content: [{ type: "text", text: message }], details: { progress: view }, isError: false }, true);
+	});
+	component.markExecutionStarted();
+	progress.end(status);
+	component.render(100);
+	component.updateResult({ content: [{ type: "text", text: "本次执行失败" }], details: {}, isError: true }, false);
+	assert.match(component.render(100).join("\n"), new RegExp(status));
+});
+
 test("在途输出按调用关联，累计工具更新不重复追加，结束和取消清除临时正文", () => {
 	const p = createTaskProgress("a", "开发", "并行读取", () => {});
 	for (const id of ["one", "two"]) p.event({ type: "tool_execution_start", toolCallId: id, toolName: "read", args: { path: `${id}.ts` } });

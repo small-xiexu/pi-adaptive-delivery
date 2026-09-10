@@ -40,7 +40,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		audit("start", { sessionId: ctx.sessionManager.getSessionId(), commands: pi.getCommands().map((command) => command.name),
 			tools: pi.getAllTools().map((tool) => tool.name) });
 		if (isChild() && scenario === "missing-tools") pi.setActiveTools([]);
-		if (isChild() && scenario === "development-selection-mismatch") pi.setThinkingLevel("low");
+		if (isChild() && ["development-selection-mismatch", "development-selection-mismatch-stop-error"].includes(scenario)) pi.setThinkingLevel("low");
 		if (isChild() && scenario === "boot-failure") process.exit(13);
 		if (isChild() && (scenario === "environment-tool-replaced" || process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-tool-replaced"))) {
 			replaceTool("read");
@@ -298,6 +298,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		},
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
+		if (isChild() && scenario === "development-selection-mismatch-stop-error") process.exit(13);
 		pi.appendEntry("fixture-shutdown", { pid: process.pid });
 		if (isChild() && scenario === "persistence") unlinkSync(ctx.sessionManager.getSessionFile()!);
 		if (isChild() && (scenario.startsWith("readonly-record-") || scenario.endsWith("structured-dev-unclean")
