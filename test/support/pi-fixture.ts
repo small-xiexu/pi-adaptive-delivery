@@ -12,7 +12,6 @@ export function testEnvironment(root: string): NodeJS.ProcessEnv {
 		TMPDIR: root,
 		PI_CODING_AGENT_DIR: path.join(root, "agent"),
 		PI_ADAPTIVE_TEST_ROOT: root,
-		PI_OFFLINE: "1",
 		PI_SKIP_VERSION_CHECK: "1",
 		PI_TELEMETRY: "0",
 		GIT_CONFIG_NOSYSTEM: "1",
@@ -39,7 +38,6 @@ export function sandboxProfile(root: string, sourceRoot?: string): string {
 	}
 	return `(version 1)
 (allow default)
-(deny network*)
 (deny file-read* ${blockedHome})
 ${sourceParents.length ? `(allow file-read-metadata ${sourceParents.join(" ")})` : ""}
 (deny file-write* (require-not (require-any
@@ -68,7 +66,7 @@ export class FixtureRpc {
 	constructor(cwd: string, env: NodeJS.ProcessEnv) {
 		// 继承隔离测试入口的系统策略，不在 macOS 子进程中重复 sandbox_apply。
 		this.process = spawn("pi", [
-			"--mode", "rpc", "--offline",
+			"--mode", "rpc",
 			"--session-dir", path.join(env.PI_CODING_AGENT_DIR!, "sessions"),
 		], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
 		const decoder = new StringDecoder("utf8");

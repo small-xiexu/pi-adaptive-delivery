@@ -26,7 +26,7 @@ function auditResources(t: TestContext, f: Awaited<ReturnType<typeof createPiFix
 	t.after(async () => {
 		const events = await jsonl(path.join(f.agentDir, "fixture-events.jsonl"));
 		for (const row of events.filter((event) => event.child && event.phase === "start")) assert.throws(() => process.kill(row.pid, 0), { code: "ESRCH" });
-		t.diagnostic(JSON.stringify({ root: f.root, environment: "本机 / 测试系统禁网 / 临时 HOME" }));
+		t.diagnostic(JSON.stringify({ root: f.root, environment: "本机 / 不额外禁网 / 临时 HOME" }));
 	});
 }
 

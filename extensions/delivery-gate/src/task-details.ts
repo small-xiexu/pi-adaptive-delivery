@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
@@ -63,47 +63,64 @@ interface DetailEntry {
 }
 interface TaskRecord { task: TaskDetail; entries: DetailEntry[]; cwd?: string; notice?: string }
 
-// 仅供当前弹层使用的原记录投影，不写入第二份日志。
-export async function readTaskRecord(task: TaskDetail): Promise<TaskRecord> {
+async function readStoredTaskRecord(task: TaskDetail): Promise<TaskRecord> {
 	const record: TaskRecord = { task, entries: [] };
 	if (!task.sessionFile) record.notice = "尚未取得原始子 Session。";
-	try {
-		const source = task.sessionFile ? await readFile(task.sessionFile, "utf8") : "";
-		const lines = source.split("\n");
-		const partial = lines.pop(); // 活动 Session 的最后一行可能仍在追加，不把半行解释成事件。
-		const calls = new Map<string, DetailEntry>();
-		for (let index = 0; index < lines.length; index++) {
-			const row = JSON.parse(lines[index]!);
-			if (row.type === "session") record.cwd = row.cwd;
-			const message = row.type === "message" ? row.message : undefined;
-			if (message?.role === "assistant") {
-				const content = text(message);
-				if (content) record.entries.push({ id: `text:${message.timestamp ?? `line:${index}`}`, line: index + 1, name: "子任务说明", output: content });
-				for (const part of message.content ?? []) if (part.type === "toolCall") {
-					const call = { id: `call:${part.id}`, callId: part.id, line: index + 1, name: part.name, args: part.arguments };
-					calls.set(part.id, call);
-					record.entries.push(call);
-				}
-				if (message.errorMessage) record.entries.push({ id: `error:${index}`, line: index + 1, name: "模型错误", output: message.errorMessage, failed: true });
-			} else if (message?.role === "toolResult") {
-				let call = calls.get(message.toolCallId);
-				if (!call) {
-					call = { id: `call:${message.toolCallId}`, callId: message.toolCallId, line: index + 1, name: message.toolName };
-					record.entries.push(call);
-				}
-				Object.assign(call, { output: text(message), resultLine: index + 1, failed: Boolean(message.isError) });
+	const source = task.sessionFile ? await readFile(task.sessionFile, "utf8") : "";
+	const lines = source.split("\n");
+	const partial = lines.pop(); // 活动 Session 的最后一行可能仍在追加，不把半行解释成事件。
+	const calls = new Map<string, DetailEntry>();
+	for (let index = 0; index < lines.length; index++) {
+		const row = JSON.parse(lines[index]!);
+		if (row.type === "session") record.cwd = row.cwd;
+		const message = row.type === "message" ? row.message : undefined;
+		if (message?.role === "assistant") {
+			const content = text(message);
+			if (content) record.entries.push({ id: `text:${message.timestamp ?? `line:${index}`}`, line: index + 1, name: "子任务说明", output: content });
+			for (const part of message.content ?? []) if (part.type === "toolCall") {
+				const call = { id: `call:${part.id}`, callId: part.id, line: index + 1, name: part.name, args: part.arguments };
+				calls.set(part.id, call);
+				record.entries.push(call);
 			}
+			if (message.errorMessage) record.entries.push({ id: `error:${index}`, line: index + 1, name: "模型错误", output: message.errorMessage, failed: true });
+		} else if (message?.role === "toolResult") {
+			let call = calls.get(message.toolCallId);
+			if (!call) {
+				call = { id: `call:${message.toolCallId}`, callId: message.toolCallId, line: index + 1, name: message.toolName };
+				record.entries.push(call);
+			}
+			Object.assign(call, { output: text(message), resultLine: index + 1, failed: Boolean(message.isError) });
 		}
-		if (partial) record.notice = "原始记录末行未完整写入，等待更新。";
-	} catch (error) { record.notice = `原始记录读取失败：${String(error)}`; }
-	// 原始返回优先；在途输出仅补充尚未落盘的正文，不参与终态判断。
-	for (const pending of task.result === undefined ? task.progress?.pending ?? [] : []) {
-		const original = record.entries.find((entry) => entry.id === pending.id);
-		if (original?.resultLine || original && !pending.callId) continue;
-		if (original) Object.assign(original, { output: pending.output, live: true });
-		else record.entries.push({ ...pending, live: true });
 	}
+	if (partial) record.notice = "原始记录末行未完整写入，等待更新。";
 	return record;
+}
+
+// 每个弹层只复用同一文件未变化时的投影；不保存原文、thinking 或第二份日志。
+export function createTaskRecordReader() {
+	let cached: { file: string | undefined; stamp: string; record: TaskRecord } | undefined;
+	return async (task: TaskDetail): Promise<TaskRecord> => {
+		let record: TaskRecord;
+		try {
+			const info = task.sessionFile ? await stat(task.sessionFile) : undefined;
+			const stamp = info ? [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs].join(":") : "";
+			if (!cached || cached.file !== task.sessionFile || cached.stamp !== stamp) {
+				cached = { file: task.sessionFile, stamp, record: await readStoredTaskRecord(task) };
+			}
+			record = { ...cached.record, task, entries: cached.record.entries.map((entry) => ({ ...entry })) };
+		} catch (error) {
+			cached = undefined;
+			record = { task, entries: [], notice: `原始记录读取失败：${String(error)}` };
+		}
+		// 在途正文每次重新合并，不能污染下次复用的落盘投影；原始返回优先。
+		for (const pending of task.result === undefined ? task.progress?.pending ?? [] : []) {
+			const original = record.entries.find((entry) => entry.id === pending.id);
+			if (original?.resultLine || original && !pending.callId) continue;
+			if (original) Object.assign(original, { output: pending.output, live: true });
+			else record.entries.push({ ...pending, live: true });
+		}
+		return record;
+	};
 }
 
 const clean = (value: string) => displayText(stripTerminalSequences(value)).replace(/\t/g, "    ");
@@ -235,6 +252,7 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[],
 				let closed = false;
 				let loading = false;
 				const panel = new TaskDetailsPanel(tasks.find((task) => task.id === id)!, tui, theme, () => done());
+				const readTaskRecord = createTaskRecordReader();
 				close = () => done();
 				const refresh = async () => {
 					if (closed || loading) return;

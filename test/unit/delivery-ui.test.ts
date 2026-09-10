@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { CURSOR_MARKER, TuiAltScreen, TuiMainScreen, visibleWidth, type Terminal
 import { Type } from "typebox";
 import { DeliveryPanel, DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
 import { createTaskProgress, taskRenderers, TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
-import { installTaskDetails, taskDetails, readTaskRecord, TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
+import { installTaskDetails, taskDetails, createTaskRecordReader, TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 
 const tui = { terminal: { rows: 32 }, requestRender() {} } as TUI;
@@ -219,6 +219,7 @@ test("首次按需安装即能从卡片打开详情，分支切换更新上下�
 });
 
 test("详情复用原生分支与长 Session，保留完整调用/结果、末行提示且排除 thinking", async () => {
+	const readTaskRecord = createTaskRecordReader();
 	const root = await mkdtemp(path.join(os.tmpdir(), "delivery-detail-"));
 	await mkdir(path.join(root, "sessions"));
 	const sm = SessionManager.create(root, path.join(root, "sessions"));
@@ -328,6 +329,7 @@ test("详情只留连续输出，万行滚动和完整任务切换保留阅读�
 });
 
 test("缺失原记录与父最终失败原因直接显示，鼠标不打开已删除页面", async () => {
+	const readTaskRecord = createTaskRecordReader();
 	const task = { id: "a", label: "只读", status: "运行中", task: "检查文件", sessionFile: "/missing/session.jsonl" };
 	const panel = new TaskDetailsPanel(task, tui, plainTheme, () => {});
 	panel.update(await readTaskRecord(task));
@@ -342,6 +344,7 @@ test("缺失原记录与父最终失败原因直接显示，鼠标不打开已�
 });
 
 test("执行中的连续输出跟随最新行，上翻暂停，最终结果替换在途缓存且不展示元数据", async () => {
+	const readTaskRecord = createTaskRecordReader();
 	const root = await mkdtemp(path.join(os.tmpdir(), "delivery-stream-detail-"));
 	const file = path.join(root, "child.jsonl");
 	const rows: any[] = [{ type: "session", cwd: root }, { type: "message", message: { role: "assistant", timestamp: 10,
@@ -382,6 +385,7 @@ test("执行中的连续输出跟随最新行，上翻暂停，最终结果替�
 });
 
 test("模型正文在结束前可读且不重复落盘内容，切换工具不串输出，小终端仍可关闭", async () => {
+	const readTaskRecord = createTaskRecordReader();
 	const root = await mkdtemp(path.join(os.tmpdir(), "delivery-stream-message-"));
 	const file = path.join(root, "child.jsonl");
 	const rows: any[] = [{ type: "session", cwd: root }];
@@ -424,4 +428,40 @@ test("模型正文在结束前可读且不重复落盘内容，切换工具不�
 	assert.equal(closed, 1);
 	const final = await readTaskRecord({ ...task, result: "父结果已返回", progress: p.snapshot() });
 	assert.equal(final.entries.length, 1, "父结果已落盘时不能重新展示旧在途工具");
+});
+
+test("详情复用未变化记录时仍跟进覆盖、替换、半行追加和删除，不把实时输出写入投影", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "delivery-record-refresh-"));
+	const file = path.join(root, "child.jsonl"), replacement = path.join(root, "replacement.jsonl");
+	const read = createTaskRecordReader();
+	const task = { id: "a", label: "开发", status: "运行中", task: "测试刷新", sessionFile: file };
+	const row = (value: string) => JSON.stringify({ type: "message", message: { role: "assistant", timestamp: 1, content: [{ type: "text", text: value }] } }) + "\n";
+	await writeFile(file, row("FIRST"));
+	const first = await read(task);
+	assert.equal(first.entries[0]!.output, "FIRST");
+	assert.deepEqual((await read(task)).entries, first.entries);
+	await writeFile(file, row("OTHER"));
+	assert.equal((await read(task)).entries[0]!.output, "OTHER", "同长度覆盖必须刷新");
+	await writeFile(replacement, row("THIRD"));
+	await rename(replacement, file);
+	assert.equal((await read(task)).entries[0]!.output, "THIRD", "原路径换文件必须刷新");
+	await appendFile(file, row("ADDED").slice(0, -1));
+	assert.match((await read(task)).notice!, /末行未完整/);
+	await appendFile(file, "\n");
+	const appended = await read(task);
+	assert.equal(appended.notice, undefined);
+	assert.equal(appended.entries.at(-1)!.output, "ADDED");
+	const progress = createTaskProgress("a", "开发", "测试刷新", () => {});
+	progress.event({ type: "tool_execution_start", toolCallId: "live", toolName: "bash", args: { command: "test" } });
+	progress.event({ type: "tool_execution_update", toolCallId: "live", partialResult: { content: [{ type: "text", text: "LIVE" }] } });
+	assert.equal((await read({ ...task, progress: progress.snapshot() })).entries.at(-1)!.output, "LIVE");
+	assert.deepEqual((await read({ ...task, result: "已结束" })).entries, appended.entries);
+	await rm(file);
+	const missing = await read(task);
+	assert.match(missing.notice!, /原始记录读取失败/);
+	assert.deepEqual(missing.entries, [], "不能把已删除记录的旧正文显示成当前结果");
+	await writeFile(file, "invalid\n");
+	assert.match((await read(task)).notice!, /原始记录读取失败/);
+	await writeFile(file, row("RECOVERED"));
+	assert.equal((await read(task)).entries[0]!.output, "RECOVERED");
 });

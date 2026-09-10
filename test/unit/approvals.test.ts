@@ -36,7 +36,7 @@ async function host(persist = true) {
 	const run = (request: { stage: string; body: string; paths: string[]; validationCommands: string[]; inputs?: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
-	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages,
+	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages, approvals,
 		resume: () => commands.get("delivery-resume").handler("", ctx),
 		readImplementation: (signal?: AbortSignal) => approvals.readImplementationApproval(ctx, signal),
 		event: async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); } };
@@ -44,11 +44,14 @@ async function host(persist = true) {
 
 test("仅方案与实施两次确认，规划文档冻结为保护路径，文档内容更新不替换批准", async () => {
 	const h = await host();
+	assert.equal(h.approvals.confirmedStage, undefined);
 	await assert.rejects(h.run({ ...design, stage: "documents" }), /无需单独授权/);
 	await assert.rejects(h.run(implementation), /尚无可信方案确认/);
 	const first = await h.run();
+	assert.equal(h.approvals.confirmedStage, "design");
 	await assert.rejects(h.readImplementation(), /本轮没有/);
 	const second = await h.run(implementation);
+	assert.equal(h.approvals.confirmedStage, "implementation");
 	const grant = await h.readImplementation();
 	assert.equal(grant.designApprovalId, first.details.approvalId);
 	assert.equal(grant.approvalId, second.details.approvalId);
@@ -64,6 +67,22 @@ test("仅方案与实施两次确认，规划文档冻结为保护路径，文�
 	assert.equal(rows.filter((row) => row.customType === APPROVAL_ENTRY).length, 2);
 	assert.equal(rows.find((row) => row.customType === PROPOSAL_ENTRY).data.body, design.body);
 	assert.deepEqual(h.displayed.map((row) => row.options.at(-1)), ["稍后再看", "暂不批准"]);
+});
+
+test("状态展示只读取本次确认，导航、重载与取消新提案均不恢复旧批准", async () => {
+	const h = await host();
+	await h.run();
+	await h.run(implementation);
+	await h.event("session_tree");
+	assert.equal(h.approvals.confirmedStage, undefined);
+	await assert.rejects(h.readImplementation(), /本轮没有/);
+	await h.run();
+	await h.event("session_start");
+	assert.equal(h.approvals.confirmedStage, undefined);
+	await h.run();
+	h.ctx.ui.select = async () => "稍后再看";
+	await h.run();
+	assert.equal(h.approvals.confirmedStage, undefined);
 });
 
 test("无规划文档的简单任务保留两次确认与持久正文，实施路径仍须非空", async () => {

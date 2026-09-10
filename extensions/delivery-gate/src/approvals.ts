@@ -280,6 +280,8 @@ export function installApprovals(pi: ExtensionAPI) {
 	}
 	return {
 		get pending() { return pending !== undefined; },
+		// 仅供界面说明本次运行已记录的确认；执行仍须调用原有持久核验。
+		get confirmedStage() { return implementation ? "implementation" as const : design ? "design" as const : undefined; },
 		// 只核实批准依据，不授予 writer；执行方不能把返回快照缓存为持续有效的权限。
 		async readImplementationApproval(ctx: ExtensionContext, signal?: AbortSignal) {
 			const { expected, expectedDesign, workspace } = await readCurrent(ctx, signal);

@@ -136,7 +136,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerProvider("adaptive-fixture", {
-		name: "禁网测试替身", api: structured ? "openai-responses" : "adaptive-fixture", baseUrl: "http://127.0.0.1", apiKey: "fixture-not-a-credential",
+		name: "测试替身", api: structured ? "openai-responses" : "adaptive-fixture", baseUrl: "http://127.0.0.1", apiKey: "fixture-not-a-credential",
 		models: [{ id: "fake", name: "Fake", reasoning: false, input: structured ? ["text", "image"] : ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1024 },
 			{ id: "fake-reasoner", name: "Fake Reasoner", reasoning: true, input: structured ? ["text", "image"] : ["text"],
@@ -284,10 +284,10 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	});
 	pi.registerCommand("fixture-isolation", {
 		description: "只检查临时测试隔离，不提供产品批准入口",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
 			const homeAccess = await readdir(os.userInfo().homedir).then(() => "allowed", (error: NodeJS.ErrnoException) => error.code);
 			const network = await new Promise<string | undefined>((resolve) => {
-				const socket = connect({ host: "127.0.0.1", port: 9 });
+				const socket = connect({ host: "127.0.0.1", port: Number(args) });
 				socket.once("connect", () => { socket.destroy(); resolve("allowed"); });
 				socket.once("error", (error: NodeJS.ErrnoException) => { socket.destroy(); resolve(error.code); });
 				socket.setTimeout(1000, () => { socket.destroy(); resolve("timeout"); });

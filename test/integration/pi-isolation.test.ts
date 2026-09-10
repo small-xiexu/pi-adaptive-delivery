@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import path from "node:path";
 import test from "node:test";
 import { createPiFixture, testEnvironment } from "../support/pi-fixture.ts";
@@ -9,14 +10,22 @@ test("测试环境仅构造必要变量，不复制宿主凭证或加载选项",
 	const env = testEnvironment("/tmp/fixture");
 	assert.equal(env.HOME, "/tmp/fixture/home");
 	assert.equal(env.PI_CODING_AGENT_DIR, "/tmp/fixture/agent");
-	assert.equal(env.PI_OFFLINE, "1");
+	assert.equal(env.PI_OFFLINE, undefined);
 	assert.equal(env.NODE_OPTIONS, undefined);
 	assert.equal(env.OPENAI_API_KEY, undefined);
 	assert.equal(env.HTTP_PROXY, undefined);
 	assert.equal(env.NPM_CONFIG_USERCONFIG, "/dev/null");
 });
 
-test("普通 Package 在禁网、空凭证、拒读真实 HOME 的 Pi 中执行并持久化", { timeout: 40_000 }, async (t) => {
+test("普通 Package 在允许联网、空凭证、拒读真实 HOME 的 Pi 中执行并持久化", { timeout: 40_000 }, async (t) => {
+	const server = createServer((socket) => socket.end());
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	t.after(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+	const address = server.address();
+	assert.ok(address && typeof address === "object");
 	const fixture = await createPiFixture();
 	t.after(() => fixture.rpc.stop());
 	const { rpc } = fixture;
@@ -29,11 +38,11 @@ test("普通 Package 在禁网、空凭证、拒读真实 HOME 的 Pi 中执行�
 		&& command.sourceInfo.path === path.join(fixture.packageDir, "provider.ts")));
 	assert.ok(!commands.some((command: any) => command.name === "subagent"));
 	const cursor = rpc.records.length;
-	await rpc.send("prompt", { message: "/fixture-isolation" });
+	await rpc.send("prompt", { message: `/fixture-isolation ${address.port}` });
 	const report = JSON.parse((await rpc.waitFor((record) => record.type === "extension_ui_request"
 		&& record.method === "notify", cursor)).message);
 	assert.equal(report.homeAccess, "EPERM");
-	assert.equal(report.network, "EPERM");
+	assert.equal(report.network, "allowed");
 	assert.equal(report.credentials, 0);
 	assert.equal(report.calls, 0);
 	assert.equal(report.home, path.join(fixture.root, "home"));

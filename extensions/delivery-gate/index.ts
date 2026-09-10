@@ -204,7 +204,15 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const running = tasks();
 				const inherited = inheritedTools(pi, entryPath).map((tool) => tool.name);
 				const structuredMode = Boolean(structured);
-				ctx.ui.notify(`交付状态 · ${structuredMode ? "Structured" : "原生 Pi"}\n工作区：${workspace.workspacePath}`
+				const executing = running.filter((task) => !task.endedAt);
+				let stage = approvals.confirmedStage === "implementation" ? "实施已确认" : approvals.confirmedStage === "design" ? "等待实施确认" : "等待方案确认";
+				let next = approvals.confirmedStage === "implementation" ? "核对已完成工作，按需继续开发、固定验收或独立审查。"
+					: approvals.confirmedStage === "design" ? "整理修改范围和验收命令，再确认实施。" : "继续讨论或修订方案，准备好后确认方案。";
+				if (approvals.pending) next = "处理当前审阅；可以确认、提出意见或暂停。";
+				if (executing.length) { stage = `正在执行：${executing.map((task) => task.name).join("；")}`; next = "用 /delivery-tasks 查看实时输出，等待任务结束。"; }
+				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，再继续下一步。"; }
+				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "用 /delivery-status details 定位原执行，核实结果后再继续；不自动解锁。"; }
+				ctx.ui.notify(`交付状态 · ${structuredMode ? "Structured" : "原生 Pi"}\n当前阶段：${stage}\n下一步：${next}\n工作区：${workspace.workspacePath}`
 					+ `\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。`
 					+ (running.length ? running.map((task) => `\n${task.status} · ${task.name}\n${task.action}`).join("") : "\n当前没有运行中的子任务。")
 					+ (writer.pending || developer.pending ? "\n文件操作尚在执行或收尾，请等待交回。" : "")

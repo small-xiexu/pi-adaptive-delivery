@@ -57,6 +57,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 			assert.ok(status?.message.includes(running.sessionFile));
 			assert.ok(status?.message.includes(running.id));
 			assert.match(status?.message, /运行中.*只读/);
+			assert.match(status?.message, /当前阶段：正在执行：只读/);
 			await rpc.send("follow_up", { message: "fixture-must-not-resume" });
 			const cleared = await rpc.send("clear_queue");
 			assert.match(JSON.stringify(cleared), /fixture-must-not-resume/);

@@ -23,7 +23,7 @@ if (adapter) {
 	const modules = path.dirname(path.dirname(adapter));
 	if (path.basename(modules) !== "node_modules") throw new Error("adapter 测试只接受已安装的 scoped Package 路径");
 	profile += `\n(allow file-read* (subpath ${JSON.stringify(modules)}))`;
-	// 本机 Structured PTY 测试只额外允许伪终端设备；不开放普通文件写入或网络。
+	// 本机 Structured PTY 测试只额外允许伪终端设备；不开放普通文件写入。
 	profile += '\n(allow file-write* (literal "/dev/ptmx") (regex #"^/dev/ttys[0-9]+$"))';
 	for (let parent = path.dirname(modules); parent !== path.dirname(parent); parent = path.dirname(parent)) profile += `\n(allow file-read-metadata (literal ${JSON.stringify(parent)}))`;
 }

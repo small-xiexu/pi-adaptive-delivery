@@ -33,7 +33,7 @@ test("正式 Package 进入和退出均保留 RPC Shell，交付批准独立处�
 	t.diagnostic(JSON.stringify({ root: f.root, pid: f.rpc.process.pid }));
 });
 
-test("离线 npm tarball 在无 node_modules 的隔离目录加载完整自有资源并执行真实 Pi", { timeout: 40_000 }, async (t) => {
+test("npm tarball 在无 node_modules 的隔离目录加载完整自有资源并执行真实 Pi", { timeout: 40_000 }, async (t) => {
 	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "adaptive-pack-")));
 	const stage = path.join(root, "stage");
 	const extracted = path.join(root, "extracted");
@@ -49,7 +49,7 @@ test("离线 npm tarball 在无 node_modules 的隔离目录加载完整自有�
 	env.NPM_CONFIG_USERCONFIG = path.join(root, "empty-user.npmrc");
 	env.NPM_CONFIG_GLOBALCONFIG = path.join(root, "empty-global.npmrc");
 	await mkdir(env.HOME!);
-	const [pack] = JSON.parse(execFileSync("npm", ["pack", "--offline", "--ignore-scripts", "--json", "--pack-destination", root],
+	const [pack] = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", root],
 		{ cwd: stage, env, encoding: "utf8", timeout: 30_000, maxBuffer: 1024 * 1024 }));
 	const files = pack.files.map((entry: { path: string }) => entry.path);
 	for (const file of ["extensions/delivery-gate/src/candidate.ts", "extensions/delivery-gate/src/validation.ts", "extensions/delivery-gate/src/review.ts", "skills/adaptive-delivery/SKILL.md"]) assert.ok(files.includes(file), file);

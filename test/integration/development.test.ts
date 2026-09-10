@@ -101,8 +101,37 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	assert.equal(h.choices.length, 2, "文件节点回写不重复请求批准");
 });
 
+test("状态查询展示确认阶段及下一步，查询不调用模型、不生成授权，重载后重新确认", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "normal", undefined, undefined, false);
+	const status = async () => {
+		const entries = h.sm.getEntries().length;
+		const calls = (await h.audit()).filter((row) => row.phase === "model").length;
+		await h.session.prompt("/delivery-status");
+		assert.equal(h.sm.getEntries().length, entries);
+		assert.equal((await h.audit()).filter((row) => row.phase === "model").length, calls);
+		return h.notices.at(-1)!;
+	};
+	assert.match(await status(), /交付未启用/);
+	await h.session.prompt("/delivery-shape");
+	assert.match(await status(), /当前阶段：等待方案确认\n下一步：继续讨论/);
+	await h.approve("design", []);
+	assert.match(await status(), /当前阶段：等待实施确认\n下一步：整理修改范围/);
+	await h.approve("implementation", ["src"]);
+	assert.match(await status(), /当前阶段：实施已确认\n下一步：核对已完成工作/);
+	await h.session.reload();
+	assert.match(await status(), /当前阶段：等待方案确认/);
+	assert.equal((await h.call("delivery_develop", { task: "状态查询不能恢复旧批准" })).isError, true);
+});
+
 test("无规划文档的真实 Pi 开发、固定验收和独立审查沿用会话批准正文", { timeout: 60_000 }, async (t) => {
-	const h = await host(t, "local-review-normal");
+	let h: Awaited<ReturnType<typeof host>>;
+	h = await host(t, "local-review-normal", (pi) => {
+		pi.on("tool_result", async (event) => {
+			if (event.toolName !== "delivery_validate") return;
+			await h.session.prompt("/delivery-status");
+			assert.match(h.notices.at(-1)!, /当前阶段：等待收尾/);
+		});
+	});
 	await mkdir(path.join(h.cwd, "inputs"));
 	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "console.log('fixture validation input');\n");
 	const before = await readdir(h.cwd);
@@ -568,6 +597,7 @@ test("P5 崩溃现场重开及 fork 真实 CLI 不调用模型或重放写入，
 	const cursor = rpc.records.length;
 	await rpc.send("prompt", { message: "/delivery-status details" });
 	assert.ok(rpc.records.slice(cursor).some((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes(lease!.leaseId) && row.message.includes("不自动解锁")));
+	assert.ok(rpc.records.slice(cursor).some((row) => row.message?.includes("当前阶段：需要核对未结束的执行")));
 	await rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id: "reopened-write", name: "delivery_develop", arguments: { task: "禁止沿用历史授权" } })}` });
 	const from = rpc.records.length;
 	await rpc.send("prompt", { message: "只有用户明确要求才尝试本次工具，不能重放旧任务" });
