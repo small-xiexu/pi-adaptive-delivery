@@ -316,7 +316,7 @@ test("执行中的连续输出跟随最新行，上翻暂停，最终结果替�
 	assert.match(render(), /SECOND_LATEST/);
 	assert.equal((await readFile(file, "utf8")).includes("SECOND_LATEST"), false);
 	rows.push({ type: "message", message: { role: "toolResult", toolCallId: "bash-a", toolName: "bash",
-		details: { container: { clean: true, status: "passed", exitCode: 0, inputs: Array.from({ length: 30 }, (_, i) => `input-${i}`) } },
+		details: { execution: { settled: true, status: "passed", exitCode: 0, inputs: Array.from({ length: 30 }, (_, i) => `input-${i}`) } },
 		content: [{ type: "text", text: "最终输出\n".repeat(50) + "FINAL_RESULT" }] } });
 	await writeFile(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
 	await refresh();

@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { createBashTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createDevelopmentHost as host } from "../support/development-host.ts";
-import { installFakeDocker } from "../support/fake-docker.ts";
 import { FixtureRpc, testEnvironment } from "../support/pi-fixture.ts";
 import { TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 
@@ -100,16 +99,15 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 });
 
 test("无规划文档的真实 Pi 开发、固定验收和独立审查沿用会话批准正文", { timeout: 60_000 }, async (t) => {
-	const h = await host(t, "container-review-normal");
-	await installFakeDocker(t, h.root, "normal");
+	const h = await host(t, "local-review-normal");
 	await mkdir(path.join(h.cwd, "inputs"));
-	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "fixture validation input\n");
+	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "console.log('fixture validation input');\n");
 	const before = await readdir(h.cwd);
 	assert.equal((await h.approve("design", [])).isError, false);
 	assert.equal((await h.call("delivery_develop", { task: "只有方案确认不能开发" })).isError, true);
 	assert.equal((await h.approve("implementation", [])).isError, true);
 	assert.ok(!(await h.audit()).some((row) => row.child));
-	assert.equal((await h.approve("implementation", ["src"], { image: "fixture:local", inputs: ["inputs"] }, ["node inputs/command.cjs"])).isError, false);
+	assert.equal((await h.approve("implementation", ["src"], ["inputs"], ["node inputs/command.cjs"])).isError, false);
 	const developed = await h.call("delivery_develop", { task: "局部修改 value 为 2，不需要规划文件" });
 	assert.equal(developed.isError, false, JSON.stringify(developed));
 	assert.equal((await h.call("delivery_review", { task: "没有固定验收不能审查" })).isError, true);
@@ -145,17 +143,16 @@ test("正式固定验收没有批准或命令时不启动子 Pi，不把零项�
 });
 
 async function reviewHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void) {
-	const h = await host(t, `container-review-${scenario}`, configure);
-	const fake = await installFakeDocker(t, h.root, "normal");
+	const h = await host(t, `local-review-${scenario}`, configure);
 	await h.prepare();
 	await mkdir(path.join(h.cwd, "src"));
 	await mkdir(path.join(h.cwd, "inputs"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
-	await writeFile(path.join(h.cwd, "inputs/test.js"), "fixture input\n");
-	const container = { image: "fixture:local", inputs: ["inputs"] };
+	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "console.log('fixture input');\n");
+	const inputs = ["inputs"];
 	const commands = ["node inputs/command.cjs"];
-	assert.equal((await h.approve("implementation", ["src"], container, commands)).isError, false);
-	return { ...h, fake, container, commands };
+	assert.equal((await h.approve("implementation", ["src"], inputs, commands)).isError, false);
+	return { ...h, inputs, commands };
 }
 
 test("真实父查询可用模型后选择只读子模型，未知模型和不支持级别在启动前拒绝", { timeout: 40_000 }, async (t) => {
@@ -207,19 +204,20 @@ test("真实验收与审查子可分别选择级别，原批准与工具参数�
 	assert.equal(await h.readLease(), undefined);
 });
 
-test("验收候选准备失败不启动子 Pi 或锁住 writer，原授权可继续开发后复验", { timeout: 40_000 }, async (t) => {
-	const h = await host(t, "container-review-normal");
-	await installFakeDocker(t, h.root, "normal");
+test("候选含符号链接时不启动子 Pi 或锁住 writer，修复范围后可继续验收", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "local-review-normal");
 	await h.prepare();
 	await mkdir(path.join(h.cwd, "inputs"));
-	await writeFile(path.join(h.cwd, "inputs/test.js"), "fixture input\n");
-	assert.equal((await h.approve("implementation", ["src"], { image: "fixture:local", inputs: ["inputs"] }, ["node inputs/command.cjs"])).isError, false);
+	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "console.log('fixture input');\n");
+	await symlink("inputs", path.join(h.cwd, "src"));
+	assert.equal((await h.approve("implementation", ["src"], ["inputs"], ["node inputs/command.cjs"])).isError, false);
 	const validation = await h.call("delivery_validate", {});
 	assert.equal(validation.isError, true);
-	assert.match(JSON.stringify(validation), /ENOENT/);
+	assert.match(JSON.stringify(validation), /链接/);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.ok(!(await h.audit()).some((row) => row.child));
 	const choices = h.choices.length;
+	await rm(path.join(h.cwd, "src"));
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "候选缺失，尚未验收。\n" })).isError, false);
 	assert.equal((await h.call("delivery_develop", { task: "创建缺失的 src 并完成修改" })).isError, false);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
@@ -293,7 +291,7 @@ test("真实 Pi 独立审查在 Git replace 存在时仍收到真实修改差异
 for (const kind of ["source", "input", "approval"]) test(`独立审查 ${kind} 变化使旧验收失效，重新验收后才可继续`, { timeout: 60_000 }, async (t) => {
 	const h = await reviewHost(t);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
-	if (kind === "approval") await h.approve("implementation", ["src"], h.container, h.commands);
+	if (kind === "approval") await h.approve("implementation", ["src"], h.inputs, h.commands);
 	else await writeFile(path.join(h.cwd, kind === "source" ? "src/value.js" : "inputs/test.js"), "changed candidate\n");
 	assert.equal((await h.call("delivery_review", { task: "不能沿用旧证据" })).isError, true);
 	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
@@ -307,7 +305,7 @@ for (const kind of ["source", "input", "approval"]) test(`独立审查 ${kind} �
 test("独立审查不回退最近一次失败之前的成功验收", { timeout: 60_000 }, async (t) => {
 	const h = await reviewHost(t);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
-	await writeFile(path.join(h.fake.bin, "scenario"), "logs-error");
+	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "process.exit(7);\n");
 	assert.equal((await h.call("delivery_validate", {})).isError, true);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.equal((await h.call("delivery_review", { task: "拒绝回退旧成功" })).isError, true);
@@ -489,7 +487,7 @@ for (const boundary of ["reload", "tree"]) test(`P5 正常收尾后 ${boundary} 
 	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
 	assert.equal(await h.readLease(), undefined);
 	await h.prepare();
-	assert.equal((await h.approve("implementation", ["src"], h.container, h.commands)).isError, false);
+	assert.equal((await h.approve("implementation", ["src"], h.inputs, h.commands)).isError, false);
 	assert.equal((await h.call("delivery_review", { task: "重新批准也不能复用旧验收" })).isError, true);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
 	assert.equal((await h.call("delivery_review", { task: "当前事实重新核实后审查" })).isError, false);
@@ -858,8 +856,8 @@ test("正式开发入口缺少实施确认或开发范围时不启动子模型",
 	assert.equal(await h.readLease(), undefined);
 });
 
-test("真实子 Pi 的文件批准不授予容器命令，不触达 Docker 或执行宿主脚本", { timeout: 40_000 }, async (t) => {
-	const h = await host(t, "container-unapproved");
+test("真实子 Pi 的本机命令失败保留错误与执行引用，不把模型总结当成功", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "local-missing-command");
 	await h.prepare();
 	const result = await h.call("delivery_develop", { task: "夹具尝试未批准的命令" });
 	assert.equal(result.isError, false);
@@ -868,22 +866,8 @@ test("真实子 Pi 的文件批准不授予容器命令，不触达 Docker 或�
 	const reference = h.sm.getEntries().find((entry) => entry.type === "custom" && entry.customType === "delivery-development");
 	assert.ok(reference?.type === "custom");
 	const text = await readFile((reference.data as { childSessionFile: string }).childSessionFile, "utf8");
-	assert.match(text, /未批准容器命令/);
-	assert.ok(!text.includes('"customType":"delivery-container"'));
-});
-
-for (const scenario of ["inspect-error", "remove-error"]) test(`真实 Pi 与模拟 Docker ${scenario}：子收尾未知后父子新写入都关闭`, { timeout: 40_000 }, async (t) => {
-	const h = await host(t, "container-normal");
-	const fake = await installFakeDocker(t, h.root, scenario);
-	await h.prepare();
-	assert.equal((await h.approve("implementation", ["src"], { image: "fixture:local", inputs: [] })).isError, false);
-	assert.equal((await h.call("delivery_develop", { task: "模拟容器收尾未知" })).isError, true);
-	assert.equal((await h.readLease())?.owner.kind, "child", h.notices.join("\n"));
-	assert.ok(fake.audit().some((row) => row.command === "start"));
-	assert.equal((await h.call("delivery_develop", { task: "禁止启动替代开发" })).isError, true);
-	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "不能误报进度" })).isError, true);
-	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
-	await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
+	assert.match(text, /Cannot find module/);
+	assert.ok(text.includes('"customType":"delivery-execution"'));
 });
 
 for (const name of ["edit", "write"]) test(`父配置的必需 ${name} 被覆盖时拒绝开发，不偷偷替换成原生实现`, { timeout: 40_000 }, async (t) => {

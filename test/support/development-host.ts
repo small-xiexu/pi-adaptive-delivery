@@ -12,7 +12,7 @@ import { approvalUI } from "./delivery-ui.ts";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
-// 文件开发与容器组合共用同一个 SDK 父/模拟选择、真实 CLI 子宿主。
+// 文件开发与本机命令共用同一个 SDK 父/模拟选择、真实 CLI 子宿主。
 export async function createDevelopmentHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void,
 	configureFixture?: (fixture: Awaited<ReturnType<typeof createPiFixture>>) => Promise<void>, activate = true) {
 	const fixture = await createPiFixture(source, `development-${scenario}`);
@@ -65,8 +65,8 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session.messages));
 		return row.message;
 	};
-	const approve = (stage: string, paths: string[], container?: { image: string; inputs: string[] }, validationCommands: string[] = []) => call("delivery_approval", {
-		stage, body: `APPROVED_${stage.toUpperCase()}_BODY`, paths, validationCommands, ...(container ? { container } : {}),
+	const approve = (stage: string, paths: string[], inputs: string[] = [], validationCommands: string[] = []) => call("delivery_approval", {
+		stage, body: `APPROVED_${stage.toUpperCase()}_BODY`, paths, inputs, validationCommands,
 	});
 	const prepare = async () => {
 		for (const [stage, paths] of [["design", ["plan.md"]], ["implementation", ["src", "plan.md"]]] as const) {

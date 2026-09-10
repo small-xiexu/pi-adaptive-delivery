@@ -23,10 +23,6 @@ test("只读持久结果拒绝截断、关闭记录重复、归属不符及关�
 	assert.throws(() => parseReadOnlySession(encode(rows.slice(0, 2)), "session", 42), /唯一持久关闭记录/);
 	assert.throws(() => parseReadOnlySession(encode(rows), "different", 42), /归属/);
 	assert.throws(() => parseReadOnlySession(encode(rows), "session", 43), /归属/);
-	for (const structured of [{ clean: false, incomplete: true }, { clean: true }]) {
-		const unsafe = [...rows.slice(0, 2), { ...rows[2], data: { ...rows[2]!.data, structured } }];
-		assert.throws(() => parseReadOnlySession(encode(unsafe), "session", 42), /持久清理证明未核实/);
-	}
 });
 
 function fixture() {

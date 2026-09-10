@@ -15,7 +15,7 @@ async function host() {
 	await writeFile(path.join(root, "src/value.js"), "export const value = 1;\n");
 	await writeFile(path.join(root, "inputs/check.js"), "console.log(1);\n");
 	await writeFile(path.join(root, "plan.md"), "原始台账\n");
-	const scope = { workspace: await resolveWorkspaceIdentity(root), image: `sha256:${"a".repeat(64)}`,
+	const scope = { workspace: await resolveWorkspaceIdentity(root),
 		readPaths: ["inputs"], writePaths: ["src"], protectedPaths: [path.join(root, "plan.md")] };
 	return { root, scope, commands: ["node inputs/check.js"], capture: () => captureCandidate(scope, ["node inputs/check.js"]) };
 }
@@ -30,7 +30,7 @@ test("候选来自实际输入/源码内容及元数据，重复读取稳定且�
 	assert.equal(await readFile(path.join(h.root, "src/value.js"), "utf8"), "export const value = 1;\n");
 });
 
-for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "same-content-rewrite", "image", "command", "command-order", "mount-mode", "cwd"]) {
+for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "same-content-rewrite", "command", "command-order", "scope", "cwd"]) {
 	test(`候选 ${kind} 变化使原指纹失效`, async () => {
 		const h = await host();
 		const original = await captureCandidate(h.scope, ["first", "second"]);
@@ -43,10 +43,9 @@ for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "s
 		if (kind === "rename") await rename(file, path.join(h.root, "src/renamed.js"));
 		if (kind === "mode") await chmod(file, 0o700);
 		if (kind === "same-content-rewrite") await writeFile(file, await readFile(file));
-		if (kind === "image") h.scope.image = `sha256:${"b".repeat(64)}`;
 		if (kind === "command") commands = ["changed", "second"];
 		if (kind === "command-order") commands.reverse();
-		if (kind === "mount-mode") h.scope.writePaths.push("inputs");
+		if (kind === "scope") h.scope.writePaths.push("new-directory");
 		if (kind === "cwd") {
 			h.scope.workspace.cwdPath = path.join(h.root, "src");
 			h.scope.readPaths = ["../inputs"];
@@ -56,7 +55,7 @@ for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "s
 	});
 }
 
-for (const kind of ["protected", "symlink", "hardlink", "cancel"]) test(`候选 ${kind} 无有效指纹，不放宽挂载边界`, async () => {
+for (const kind of ["protected", "symlink", "hardlink", "cancel"]) test(`候选 ${kind} 无有效指纹，不放宽文件范围`, async () => {
 	const h = await host();
 	const controller = new AbortController();
 	if (kind === "protected") h.scope.readPaths.push("plan.md");

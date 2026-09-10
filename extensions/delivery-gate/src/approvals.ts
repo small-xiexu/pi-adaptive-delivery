@@ -7,7 +7,6 @@ import { Text } from "@earendil-works/pi-tui";
 import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
-import { resolveContainerImage } from "./container.ts";
 import { DeliveryPanel, DesignReviewPanel, displayText, type DesignReviewResult } from "./ui.ts";
 
 export const APPROVAL_TOOL = "delivery_approval";
@@ -19,10 +18,7 @@ const parameters = Type.Object({
 	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用简短分行说明，不复制全文台账。design 说明目标、范围、关键设计、风险和验收方向；有规划文档时先给相对路径和修改摘要，简单任务可直接在正文说明，无须新建文档。implementation 说明计划修改的文件、步骤、环境、验收和停止条件，并区分计划文件与工具实际可写目录。工具提供原方案查看入口，无须重复抄写；不以路径或摘要 ID 代替决策内容。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "design 列明本任务由父维护的确切规划 Markdown 路径，随确认保护；简单任务没有规划文档时传 []，不得为填参数创建占位文档或遗漏已有需维护的方案/台账。implementation 必须列明允许子修改的文件或目录，不能传空数组。路径按 cwd 解析，不是 glob。" }),
 	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
-	container: Type.Optional(Type.Object({
-		image: Type.String({ minLength: 1, description: "已准备且不含凭据的本地 Linux 镜像，确认时解析并固定到镜像 ID；不拉取。容器命令使用 /bin/sh，不继承宿主 Shell。" }),
-		inputs: Type.Array(Type.String({ minLength: 1 }), { description: "额外只读输入文件/目录，必须在 worktree 内且不含凭据；不挂整个工作区、规划文档、Git 或执行记录。可写挂载沿用 paths。" }),
-	}, { additionalProperties: false })),
+	inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "implementation 中纳入候选指纹的额外源码、配置或测试输入，按 cwd 解析，必须在 worktree 内且不含凭据。不包含整个工作区、规划文档、Git 或执行记录；这是验收范围，不是 Shell 隔离。" })),
 }, { additionalProperties: false });
 
 type Request = Static<typeof parameters>;
@@ -36,7 +32,7 @@ interface Proposal {
 	paths: string[];
 	validationCommands: string[];
 	designApprovalId?: string;
-	container?: { image: string; inputs: string[] };
+	inputs: string[];
 }
 interface Approval {
 	id: string;
@@ -64,9 +60,8 @@ function presentation(proposal: Proposal, expanded = false): string {
 	const body = expanded || proposal.body.length <= 600 ? proposal.body : `${proposal.body.slice(0, 600)}\n…完整正文见详情`;
 	return (expanded ? `${titles[proposal.stage]}\n工作目录：${proposal.cwd}\n\n` : "") + permissions[proposal.stage]
 		+ (proposal.paths.length ? `\n\n${proposal.stage === "design" ? "规划文档（由父会话维护）" : "工具实际可写范围（文件或目录）"}：\n${proposal.paths.map((file) => `• ${relative(file)}`).join("\n")}` : proposal.stage === "design" ? "\n\n方案保存在会话中，无规划文档。" : "")
-		+ (proposal.container ? `\n\n运行环境：本地 Docker · 禁网 · 1 GiB · 每命令最多 300 秒`
-			+ (expanded ? `\n固定镜像：${proposal.container.image}\n额外只读输入：\n${proposal.container.inputs.map((file) => `• ${relative(file)}`).join("\n") || "无"}\n容器 /bin/sh，不继承宿主 Shell；可写挂载沿用上述范围。` : `\n${proposal.container.inputs.length} 项只读输入，${proposal.validationCommands.length} 条固定验收命令（详情可核对）`)
-			: proposal.stage === "implementation" ? "\n本次不授权容器命令。" : "")
+		+ (proposal.stage === "implementation" ? "\n\n运行环境：本机，使用当前用户的 Shell、工具链与权限。文件工具按上述范围检查；Shell 的文件、网络和后台进程不受这些路径隔离。"
+			+ (expanded ? `\n额外验收输入：\n${proposal.inputs.map((file) => `• ${relative(file)}`).join("\n") || "无"}` : `\n${proposal.inputs.length} 项额外验收输入，${proposal.validationCommands.length} 条固定验收命令（详情可核对）`) : "")
 		+ `\n\n${body}`
 		+ (expanded && proposal.validationCommands.length ? `\n\n固定验收命令：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n\n")}` : "")
 		+ (expanded ? `\n\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}` : "");
@@ -146,7 +141,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		: `${titles[entry.data!.stage]} · ${entry.data!.paths.length ? `${entry.data!.paths.length} 项路径 · ` : ""}Ctrl+O 查看完整提案`), 0, 0));
 	pi.registerTool({
 		name: APPROVAL_TOOL, label: "请求交付批准",
-		description: "在父 Pi TUI 请求方案审阅或实施确认。简单明确的任务直接以正文说明方案与实施步骤，无须落规划文档，design.paths 可为空；有需持续维护的方案/台账时列明其路径并使用父文档工具更新。用户可输入意见、确认方案或稍后再看；按最新意见和现场修订正文后发起新提案。两次阶段确认分开，RPC/JSON/print 不接受批准。实施必须列明可写范围，可申请本地 Docker 镜像与只读输入，不授予宿主 Shell。",
+		description: "在父 Pi TUI 分别请求方案和实施确认，RPC/JSON/print 不接受批准。简单任务直接说明正文，design.paths 可为空；需要持续维护的方案/台账沿用已有文档。实施须列明修改范围、步骤、本机环境与固定验收命令；确认后开发子会话可运行本机 Shell，文件工具的路径检查不构成 Shell 隔离。",
 		parameters,
 		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("批准只接受父 Pi 的真实 TUI 交互；当前模式不接受批准");
@@ -164,8 +159,8 @@ export function installApprovals(pi: ExtensionAPI) {
 				const cwd = ctx.cwd;
 				const workspace = await resolveWorkspaceIdentity(cwd);
 				const paths = request.paths.map((value) => path.resolve(workspace.cwdPath, value));
-				const inputs = request.container?.inputs.map((value) => path.resolve(workspace.cwdPath, value)) ?? [];
-				if (!request.body.trim() || [...request.paths, ...(request.container?.inputs ?? [])].some((value) => !value.trim()) || request.validationCommands.some((value) => !value.trim())) {
+				const inputs = request.inputs?.map((value) => path.resolve(workspace.cwdPath, value)) ?? [];
+				if (!request.body.trim() || [...request.paths, ...(request.inputs ?? [])].some((value) => !value.trim()) || request.validationCommands.some((value) => !value.trim())) {
 					throw new Error("批准正文、路径或验收命令不能为空白");
 				}
 				if ([...paths, ...inputs].some((value) => { const relative = path.relative(workspace.workspacePath, value); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); })) {
@@ -174,7 +169,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				if (request.stage === "implementation" && !paths.length) throw new Error("实施须列明开发路径");
 				if (request.stage === "design" && paths.some((value) => path.extname(value).toLowerCase() !== ".md")) throw new Error("规划文档只接受确切 Markdown 路径");
 				if (request.stage !== "implementation" && request.validationCommands.length) throw new Error("本阶段不授予命令执行权限");
-				if (request.stage !== "implementation" && request.container) throw new Error("只有实施阶段可请求容器命令授权");
+				if (request.stage !== "implementation" && inputs.length) throw new Error("只有实施阶段可声明额外验收输入");
 				const expectedDesign = request.stage === "implementation" ? design : undefined;
 				let approvedDesign: Proposal | undefined;
 				if (request.stage === "implementation") {
@@ -184,10 +179,9 @@ export function installApprovals(pi: ExtensionAPI) {
 					if (!isDeepStrictEqual(entry.data, expectedDesign.approval) || !isDeepStrictEqual(body.data, expectedDesign.proposal)) throw new Error("方案批准记录已变化");
 					approvedDesign = expectedDesign.proposal;
 				}
-				const container = request.container ? { image: await resolveContainerImage(request.container.image, workspace.workspacePath), inputs } : undefined;
 				const proposal: Proposal = { id: randomUUID(), sessionId, workspaceKey: workspace.key, cwd: workspace.cwdPath,
-					stage: request.stage, body: request.body, paths, validationCommands: [...request.validationCommands],
-					...(approvedDesign ? { designApprovalId: expectedDesign!.approval.id } : {}), ...(container ? { container } : {}) };
+					stage: request.stage, body: request.body, paths, inputs, validationCommands: [...request.validationCommands],
+					...(approvedDesign ? { designApprovalId: expectedDesign!.approval.id } : {}) };
 				const current = () => {
 					operation.throwIfAborted();
 					if (expectedDesign && design !== expectedDesign) throw new Error("本次实施所依赖的方案确认已失效");
@@ -239,7 +233,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				const live = { approval, proposal, sessionFile: sessionFile!, controller: new AbortController() };
 				if (proposal.stage === "design") design = live;
 				if (proposal.stage === "implementation") implementation = live;
-				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。${request.stage === "implementation" ? `用户未要求暂停且没有未决问题时，继续在本轮已批准范围和 writer 交接下委派开发，无须额外的“继续”；${container ? "仅按已确认镜像和挂载执行容器命令；固定验收使用本次命令清单。" : "本次不授权容器命令，固定验收不可用。"}独立审查仍需当前候选的可信验收，不开放宿主 Shell。` : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验收说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案或实施计划文件"}，实施仍须独立确认。`}` }],
+				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。${request.stage === "implementation" ? "用户未要求暂停且没有未决问题时，继续在本轮已批准范围和 writer 交接下委派本机开发，无须额外的“继续”。固定验收使用本次命令清单；独立审查仍需当前候选的可信验收。" : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验收说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案或实施计划文件"}，实施仍须独立确认。`}` }],
 					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
 			} finally {
 				pending = undefined;
@@ -290,8 +284,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				designBody: expectedDesign!.proposal.body, implementationBody: expected.proposal.body,
 				planningPaths: [...expectedDesign!.proposal.paths],
 				sessionId: expected.approval.sessionId, workspace, paths: [...expected.proposal.paths],
-				validationCommands: [...expected.proposal.validationCommands], signal: expected.controller.signal,
-				...(expected.proposal.container ? { container: structuredClone(expected.proposal.container) } : {}) };
+				validationCommands: [...expected.proposal.validationCommands], inputs: [...expected.proposal.inputs], signal: expected.controller.signal };
 		},
 	};
 }

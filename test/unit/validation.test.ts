@@ -7,7 +7,7 @@ import test from "node:test";
 import { createValidationRun as initializeValidationRun, validationPassed } from "../../extensions/delivery-gate/src/validation.ts";
 import { captureCandidate } from "../../extensions/delivery-gate/src/candidate.ts";
 import { prepareReview } from "../../extensions/delivery-gate/src/review.ts";
-import type { ContainerExecution } from "../../extensions/delivery-gate/src/container.ts";
+import type { LocalExecution } from "../../extensions/delivery-gate/src/local-execution.ts";
 import { resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
 
 async function host() {
@@ -15,7 +15,7 @@ async function host() {
 	execFileSync("git", ["init", "--quiet"], { cwd: root });
 	await mkdir(path.join(root, "src"));
 	await writeFile(path.join(root, "src/value.js"), "original\n");
-	const scope = { workspace: await resolveWorkspaceIdentity(root), image: `sha256:${"a".repeat(64)}`,
+	const scope = { workspace: await resolveWorkspaceIdentity(root),
 		readPaths: [], writePaths: ["src"], protectedPaths: [path.join(root, "plan.md")] };
 	return { root, scope };
 }
@@ -37,8 +37,8 @@ test("固定验收使用交接前的候选副本，准备后文件变化不能�
 	assert.equal(validationPassed(proof), false);
 });
 
-function completed(name: string, status: ContainerExecution["status"] = "passed"): ContainerExecution {
-	return { name, image: `sha256:${"a".repeat(64)}`, clean: status !== "unknown", status, exitCode: status === "passed" ? 0 : 7 };
+function completed(name: string, status: LocalExecution["status"] = "passed"): LocalExecution {
+	return { name, cwd: ".", settled: true, status, exitCode: status === "passed" ? 0 : 7 };
 }
 
 test("固定验收由实际执行引用和稳定候选组成，不能用返回文本声称通过", async () => {
@@ -46,17 +46,17 @@ test("固定验收由实际执行引用和稳定候选组成，不能用返回�
 	const commands = ["first", "second"];
 	const validation = await createValidationRun(h.scope, commands);
 	commands[0] = "not-approved";
-	let actual: ContainerExecution | undefined;
+	let actual: LocalExecution | undefined;
 	for (const [index, command] of ["first", "second"].entries()) {
 		assert.equal(await validation.execute(`tool-${index}`, { command, timeout: 10 }, async () => {
-			actual = completed(`container-${index}`);
+			actual = completed(`execution-${index}`);
 			return "model text is not authoritative";
 		}, () => actual), "model text is not authoritative");
 	}
 	const proof = await validation.finish();
 	assert.equal(validationPassed(proof), true);
 	assert.deepEqual(proof.commands, ["first", "second"]);
-	assert.deepEqual(proof.results.map((row) => [row.toolCallId, row.container, row.timeout]), [["tool-0", "container-0", 10], ["tool-1", "container-1", 10]]);
+	assert.deepEqual(proof.results.map((row) => [row.toolCallId, row.execution, row.timeout]), [["tool-0", "execution-0", 10], ["tool-1", "execution-1", 10]]);
 	proof.commands[0] = "mutated returned copy";
 	proof.results[0]!.status = "failed";
 	assert.equal(validationPassed(await validation.finish()), true);
@@ -65,8 +65,8 @@ test("固定验收由实际执行引用和稳定候选组成，不能用返回�
 for (const status of ["failed", "cancelled", "timeout", "unknown", "not-run"] as const) test(`实际命令 ${status} 不被模型成功声明覆盖`, async () => {
 	const h = await host();
 	const validation = await createValidationRun(h.scope, ["first", "second"]);
-	let actual: ContainerExecution | undefined;
-	await validation.execute("tool", { command: "first" }, async () => { actual = completed("container", status); return "通过"; }, () => actual);
+	let actual: LocalExecution | undefined;
+	await validation.execute("tool", { command: "first" }, async () => { actual = completed("execution", status); return "通过"; }, () => actual);
 	let invoked = false;
 	await assert.rejects(validation.execute("next", { command: "second" }, async () => { invoked = true; }, () => actual), /失败后继续/);
 	assert.equal(invoked, false);
@@ -88,10 +88,10 @@ test("固定验收没有执行的命令保持未运行，不能替换、跳序�
 	assert.equal(validationPassed(await validation.finish()), false);
 });
 
-test("下一命令在容器启动前失败不能复用上一容器成功终态", async () => {
+test("下一命令在启动前失败不能复用上一命令成功终态", async () => {
 	const h = await host();
 	const validation = await createValidationRun(h.scope, ["first", "second"]);
-	let actual: ContainerExecution | undefined;
+	let actual: LocalExecution | undefined;
 	await validation.execute("first", { command: "first" }, async () => { actual = completed("first"); }, () => actual);
 	await assert.rejects(validation.execute("second", { command: "second", timeout: 301 }, async () => { throw new Error("fixture pre-execution failure"); }, () => actual));
 	const proof = await validation.finish();
@@ -102,16 +102,16 @@ test("下一命令在容器启动前失败不能复用上一容器成功终态",
 for (const kind of ["changed", "missing"]) test(`命令退出 0 但候选 ${kind} 不产生验收通过`, async () => {
 	const h = await host();
 	const validation = await createValidationRun(h.scope, ["command"]);
-	let actual: ContainerExecution | undefined;
+	let actual: LocalExecution | undefined;
 	await validation.execute("tool", { command: "command" }, async () => {
 		if (kind === "changed") await writeFile(path.join(h.root, "src/value.js"), "changed\n");
 		else await rm(path.join(h.root, "src"), { recursive: true });
-		actual = completed("container");
+		actual = completed("execution");
 	}, () => actual);
 	const proof = await validation.finish();
 	assert.equal(proof.results[0]!.status, "passed");
 	assert.equal(validationPassed(proof), false);
-	if (kind === "missing") assert.match(proof.error!, /ENOENT/);
+	if (kind === "missing") assert.notEqual(proof.after?.digest, proof.before.digest);
 });
 
 test("空清单不是零项全部通过，未开始验收", async () => {

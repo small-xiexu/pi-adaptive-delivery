@@ -28,7 +28,7 @@ async function host(separateGit = false, pristine = false) {
 	const record = { version: WRITER_LEASE_VERSION, leaseId: lease.leaseId, workspace, owner, coordinator: parent,
 		createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
 	const leaseFile = path.join(stateRoot, "leases", `${workspace.key}.json`);
-	const grant = { lease, owner, parent, paths: [cwd], protectedPaths: [path.join(cwd, "plan.md")] };
+	const grant = { lease, owner, parent, paths: [cwd], inputs: [], protectedPaths: [path.join(cwd, "plan.md")] };
 	// 单元夹具模拟另一个父进程完成交接；实际跨进程证据由 SDK/CLI 集成提供。
 	const arm = async () => { await writeFile(leaseFile, JSON.stringify(record)); await writer.arm(grant, ctx); };
 	return { root, cwd, sm, ctx, writer, owner, grant, record, leaseFile, arm };
@@ -60,10 +60,10 @@ test("子 writer 复用原生创建与精确编辑，完整落盘后生成有限
 	await assert.rejects(h.writer.execute("write", "late", { path: "src.js", content: "禁止" }), /未取得/);
 });
 
-test("只有文件交接时不执行容器命令，更不回退宿主 Shell", async () => {
+test("子命令仍须核实真实工具调用，只有 writer 不能伪造调用", async () => {
 	const h = await host();
 	await h.arm();
-	await assert.rejects(h.writer.execute("bash", "no-container", { command: "touch forbidden" }), /未批准容器命令/);
+	await assert.rejects(h.writer.execute("bash", "forged-call", { command: "touch forbidden" }), /工具调用未核实/);
 	await assert.rejects(access(path.join(h.cwd, "forbidden")), { code: "ENOENT" });
 });
 

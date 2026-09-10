@@ -132,6 +132,15 @@ function createFileTools(scope: DocumentScope, kind: "parent" | "child", protect
 
 	return {
 		get cleanupFailed() { return cleanupFailed; },
+		async checkPaths(paths: string[], signal?: AbortSignal) {
+			approvalSignal.throwIfAborted();
+			signal?.throwIfAborted();
+			for (const file of paths) await checkPath(file);
+			await authorize();
+			await requireWriter();
+			approvalSignal.throwIfAborted();
+			signal?.throwIfAborted();
+		},
 		edit: (id: string, input: EditToolInput, signal?: AbortSignal) => execute("edit", id, input, signal),
 		write: (id: string, input: WriteToolInput, signal?: AbortSignal) => execute("write", id, input, signal),
 	};

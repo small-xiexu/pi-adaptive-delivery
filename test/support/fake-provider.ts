@@ -83,7 +83,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		if ((environment || development) && isChild()) {
 			audit("environment-tool-call", { toolCallId: event.toolCallId, toolName: event.toolName });
 			pi.appendEntry("fixture-child-tool-check", { toolCallId: event.toolCallId, sessionId: ctx.sessionManager.getSessionId() });
-			const checkedTool = process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" || !scenario.startsWith("development-container-")
+			const checkedTool = process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" || !scenario.startsWith("development-local-")
 				|| !scenario.includes("-review-") && event.toolName === "bash";
 			if (checkedTool && scenario.endsWith("-hook-deny")) return { block: true, reason: "CONFIGURED_TOOL_HOOK_DENIED" };
 			if (checkedTool && scenario.endsWith("-hook-error")) throw new Error("CONFIGURED_TOOL_HOOK_ERROR");
@@ -169,10 +169,10 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const recoverRead = !isChild() && scenario === "readonly-recover" && read?.role === "toolResult" && read.toolName === "delivery_readonly";
 				const searchStep = scenario === "readonly-search" && isChild() ? messages.filter((message) => message.role === "toolResult").length : undefined;
 				const developmentChild = development && process.env.PI_ADAPTIVE_DELIVERY_CHILD === "development";
-				const containerChild = developmentChild && scenario.startsWith("development-container-");
+				const localChild = developmentChild && scenario.startsWith("development-local-");
 				const validationChild = developmentChild && JSON.stringify(context.messages).includes("固定候选验收。严格按下列");
 				const step = messages.filter((message) => message.role === "toolResult").length;
-				const readBeforeWrite = developmentChild && !validationChild && scenario === "development-container-read-before-write";
+				const readBeforeWrite = developmentChild && !validationChild && scenario === "development-local-read-before-write";
 				const developmentStep = step - (readBeforeWrite ? 1 : 0);
 				const editRecovery = developmentChild && scenario === "development-edit-recovery";
 				const readSkill = environment && isChild() && read && !read.isError && messages.filter((message) => message.role === "toolResult").length === 1;
@@ -191,25 +191,25 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const readonlyEscalation = development && isChild() && !developmentChild && JSON.stringify(user?.content).includes("fixture-read-then-write");
 				const finished = !planned && read && !readSkill && !recoverRead && (editRecovery ? step >= 3 : structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
 					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
-					: !developmentChild || developmentStep >= (containerChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
+					: !developmentChild || developmentStep >= (localChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
 					&& (!readonlyEscalation || step >= 2 || read.isError);
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write") || readonlyEscalation && step === 1;
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
-				const toolName = planned?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && isChild() ? developmentChild && !validationChild && step === 0 ? "apply_patch" : developmentChild && scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
-					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && containerChild ? "bash" : "read"
+				const toolName = planned?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && developmentChild ? !validationChild && step === 0 ? "apply_patch" : scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
+					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && localChild ? "bash" : "read"
 					: writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
 					: document ? scenario.endsWith("edit") ? "delivery_document_edit" : "delivery_document_write" : approval ? "delivery_approval" : write ? "write" : "read");
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
 				const target = scenario === "development-outside" ? "../outside.js" : scenario === "development-plan" ? "plan.md"
 					: scenario === "development-git" ? ".git/forbidden.js" : scenario === "development-separate-git" ? "metadata/forbidden.js" : "src/value.js";
 				const args = planned?.arguments ?? (editRecovery ? { path: target, ...(step === 1 ? {} : { edits: step === 0 ? [{ oldText: " = 1", newText: " = 2" }]
-					: [{ oldText: "first = 1", newText: "first = 2" }, { oldText: "second = 1", newText: "second = 2" }] }) } : structured && isChild() ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
+					: [{ oldText: "first = 1", newText: "first = 2" }, { oldText: "second = 1", newText: "second = 2" }] }) } : structured && developmentChild ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
 					: toolName === "write_stdin" ? { session_id: (read as any)?.details?.session_id, chars: "TTY_INPUT_PROOF\n", yield_time_ms: 30_000 }
-					: { cmd: validationChild ? "python inputs/check.py" : reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile}'`
+					: { cmd: validationChild ? "node inputs/command.cjs" : reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile}'`
 						: developmentChild ? step === 1 ? scenario.endsWith("structured-pty") ? "read value; printf '%s' \"$value\" > src/typed.txt"
-							: scenario.endsWith("structured-cancel") ? "python -c 'import pathlib,time; pathlib.Path(\"src/ready.txt\").write_text(\"ready\"); print(\"LONG_COMMAND_STARTED\",flush=True); time.sleep(120)'"
-							: scenario.endsWith("structured-unfinished") ? "sleep 120" : "python inputs/check.py" : "cat src/value.js" : "cat input.txt",
+							: scenario.endsWith("structured-cancel") ? "node -e 'require(\"node:fs\").writeFileSync(\"src/ready.txt\",\"ready\"); console.log(\"LONG_COMMAND_STARTED\"); setInterval(()=>{},1000)'"
+							: scenario.endsWith("structured-unfinished") ? "sleep 120" : "node inputs/command.cjs" : "cat src/value.js" : "cat input.txt",
 						yield_time_ms: /structured-(unfinished|pty)$/.test(scenario) ? 250 : 30_000, ...(scenario.endsWith("structured-pty") ? { tty: true } : {}) } : searchStep !== undefined ? searchStep === 0 ? { path: "." } : searchStep === 1 ? { pattern: "*.txt", path: "." }
 					: searchStep === 2 ? { pattern: "fixture-read-ok", path: ".", glob: "*.txt" } : { path: "input.txt" }
 					: recoverRead ? { path: (read as any).details?.sessionFile ?? "missing-evidence" }
@@ -217,8 +217,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					: { command: scenario.endsWith("validation-wrong") ? "echo unapproved" : step === 1 ? "node inputs/second.cjs" : "node inputs/command.cjs",
 						timeout: scenario.endsWith("validation-timeout") ? 1 : 10 }
 					: developmentChild ? developmentStep === 0 ? { path: target, content: "export const value = 1;\n" }
-					: developmentStep === 1 ? { path: target, edits: [{ oldText: "value = 1", newText: containerChild && JSON.stringify(user?.content).includes("fixture-container-repair") ? "value = 3" : "value = 2" }] }
-					: developmentStep === 2 && containerChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-container-timeout" ? 1 : scenario === "development-container-details" ? 20 : 10 } : { path: target }
+					: developmentStep === 1 ? { path: target, edits: [{ oldText: "value = 1", newText: localChild && JSON.stringify(user?.content).includes("fixture-local-repair") ? "value = 3" : "value = 2" }] }
+					: developmentStep === 2 && localChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-local-timeout" ? 1 : scenario === "development-local-details" ? 20 : 10 } : { path: target }
 					: toolName === "delivery_document_write" ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
 					: toolName === "delivery_document_edit" ? { path: "plan.md", edits: [{ oldText: "原文", newText: "禁止" }] }
 					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: ["plan.md"], validationCommands: [] }
@@ -229,14 +229,10 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const aborted = options?.signal?.aborted === true;
 				if (isChild() && scenario.endsWith("readonly-parallel")) {
 					const target = taskText.includes("input-b.txt") ? "input-b.txt" : "input-a.txt";
-					Object.assign(args, structured ? { cmd: `cat ${target}` } : { path: target });
+					Object.assign(args, { path: target });
 				}
 				if (reviewChild && scenario.includes("structured-evidence")) {
-					const directory = path.dirname(reviewEvidence.diffFile);
-					const script = step === 0
-						? `const fs=require('node:fs'); const d=${JSON.stringify(directory)}; console.log(fs.readFileSync(d+'/before/src/value.js','utf8')); console.log(fs.readFileSync(d+'/after/src/value.js','utf8')); console.log(fs.readFileSync(d+'/diff.patch','utf8')); try { fs.writeFileSync(d+'/forbidden','bad'); throw Error('快照可写'); } catch(e) { if (!['EROFS','EACCES'].includes(e.code)) throw e; }`
-						: `const fs=require('node:fs'); const rows=fs.readFileSync(${JSON.stringify(reviewEvidence.validationSessionFile)},'utf8').split('\\n').filter(Boolean).map(JSON.parse); for(const row of rows) if(row.message?.role==='toolResult') for(const part of row.message.content) if(part.type==='text') console.log(part.text);`;
-					Object.assign(args, { cmd: `node - <<'JS'\n${script}\nJS`, max_output_tokens: step === 2 && scenario.endsWith("-fail") ? 13000 : 4000 });
+					Object.assign(args, { path: step === 0 ? reviewEvidence.diffFile : step === 2 && scenario.endsWith("-fail") ? "missing-review-input" : reviewEvidence.validationSessionFile });
 				}
 				const longReview = `LONG_REVIEW_BEGIN\n${"原始审查正文中文🔎\u2028".repeat(180)}\nLONG_REVIEW_END`;
 				const output: AssistantMessage = {
@@ -252,7 +248,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 				};
-				const childStreamError = isChild() && scenario.includes("stream-retry") && step === (containerChild ? 3 : 1)
+				const childStreamError = isChild() && scenario.includes("stream-retry") && step === (localChild ? 3 : 1)
 					&& (scenario.endsWith("exhausted") || streamFailures === 0);
 				if (!aborted && (childStreamError || streamError && streamError.remaining > 0 && step >= streamError.afterTools)) {
 					streamFailures++;
@@ -307,7 +303,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				if (!exit) throw new Error("测试夹具未取得真实关闭记录");
 				if (scenario.endsWith("unclean")) {
 					if (exit.data.development) exit.data.development.structured = { clean: false, incomplete: true };
-					else exit.data.structured = { clean: false, incomplete: true };
+					else exit.data.sessionId = "tampered-close";
 					writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
 				}
 				if (scenario.endsWith("missing-newline")) writeFileSync(file, content.slice(0, -1));

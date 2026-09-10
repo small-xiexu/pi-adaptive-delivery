@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { CandidateSnapshot } from "./candidate.ts";
-import type { ContainerScope } from "./container.ts";
+import type { CandidateScope } from "./candidate.ts";
 
 const execFileAsync = promisify(execFile);
 const LIMIT = 16 * 1024 * 1024;
@@ -13,7 +13,7 @@ const within = (root: string, file: string) => {
 	return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 };
 
-export async function prepareReview(scope: Omit<ContainerScope, "beforeCreate">, candidate: CandidateSnapshot) {
+export async function prepareReview(scope: CandidateScope, candidate: CandidateSnapshot) {
 	const root = scope.workspace.workspacePath;
 	const temporary = await realpath(os.tmpdir());
 	if (within(root, temporary)) throw new Error("审查制品临时目录必须在被审查 worktree 之外");

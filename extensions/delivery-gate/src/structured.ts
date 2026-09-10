@@ -1,144 +1,106 @@
-import { randomInt, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
-import { StringDecoder } from "node:string_decoder";
-import type { AgentToolResult, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { createContainerOperations, type ContainerScope, type ContainerReference } from "./container.ts";
+import { pathToFileURL } from "node:url";
+import { withFileMutationQueue, type AgentToolResult, type ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { ExecutionReference, LocalExecution } from "./local-execution.ts";
 
 export const STRUCTURED_TOOLS = ["exec_command", "write_stdin", "apply_patch", "view_image"];
-export const STRUCTURED_READ_IMAGE = "node:22-alpine";
 export interface ExecInput { cmd: string; workdir?: string; shell?: string; tty?: boolean; login?: boolean; yield_time_ms?: number; max_output_tokens?: number }
 export interface StdinInput { session_id: number; chars?: string; yield_time_ms?: number; max_output_tokens?: number }
-type Update = ((result: AgentToolResult<unknown>) => void) | undefined;
-type Runner = ReturnType<typeof createContainerOperations>;
-interface Command {
-	id: number;
-	command: string;
-	runner: Runner;
-	controller: AbortController;
-	done: Promise<void>;
-	ready?: Promise<void>;
-	output: string;
-	omitted: boolean;
-	startedAt: number;
-	ended?: boolean;
-	exitCode?: number;
-	error?: unknown;
-	write?: (chars: string) => Promise<void>;
+interface ExecResult { output: string; exit_code?: number; session_id?: number; chunk_id: string; wall_time_seconds: number }
+interface SessionManager {
+	exec(input: ExecInput & { wait_until_exit?: boolean }, cwd: string, signal?: AbortSignal, update?: (value: ExecResult) => void): Promise<ExecResult>;
+	write(input: StdinInput, signal?: AbortSignal, update?: (value: ExecResult) => void): Promise<ExecResult>;
+	shutdown(): Promise<void>;
 }
-const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+type Update = ((result: AgentToolResult<unknown>) => void) | undefined;
 
-// 一次交付子会话内最多一个未交回的命令。进程生命周期由 Docker 管理。
-export function createStructuredCommands(scope: Omit<ContainerScope, "beforeCreate">,
-	beforeCreate: (reference: ContainerReference, toolCallId: string, name: string) => Promise<void>) {
-	let active: Command | undefined;
-	let previous: Command | undefined;
-	let stopped = false;
+// 使用已核实插件原有的本机 exec bridge 和补丁执行器，不另建进程管理器。
+export function createStructuredCommands(packageRoot: string, cwd: string,
+	beforeExecute: (reference: ExecutionReference, toolCallId: string, name: string) => Promise<void>,
+	checkPaths: (paths: string[], signal?: AbortSignal) => Promise<void>) {
+	const load = (relative: string) => import(pathToFileURL(path.join(packageRoot, "dist", relative)).href);
+	let manager: SessionManager | undefined;
+	let sessionId: number | undefined;
+	let lastExecution: LocalExecution | undefined;
 	let busy = false;
-	const runner = (id: string, name: string, helper?: string) => createContainerOperations({ ...scope, helper,
-		beforeCreate: (reference) => beforeCreate(reference, id, name) });
-	const result = (state: Command, maxTokens = 4000) => {
-		if (!Number.isFinite(maxTokens) || maxTokens <= 0 || maxTokens > 12_500) throw new Error("max_output_tokens 必须在 1—12500 内");
-		const limit = Math.floor(maxTokens * 4);
-		const output = (state.omitted || state.output.length > limit ? "[较早输出已截断]\n" : "") + state.output.slice(-limit);
-		const details = { chunk_id: randomUUID(), output, wall_time_seconds: (Date.now() - state.startedAt) / 1000,
-			...(state.ended ? { exit_code: state.exitCode } : { session_id: state.id }), container: state.runner.lastExecution };
-		return { content: [{ type: "text" as const, text: `${output}\n${state.ended ? `Process exited with code ${state.exitCode}` : `Process running with session ID ${state.id}`}` }], details };
+	let stopped = false;
+	let cleanupFailed = false;
+	const result = (value: ExecResult): AgentToolResult<unknown> => ({
+		content: [{ type: "text", text: `${value.output}\n${value.session_id === undefined ? `Process exited with code ${value.exit_code}` : `Process running with session ID ${value.session_id}`}` }],
+		details: { ...value, execution: lastExecution ? { ...lastExecution } : undefined },
+	});
+	const record = (value: ExecResult) => {
+		sessionId = value.session_id;
+		if (lastExecution) Object.assign(lastExecution, { settled: sessionId === undefined, exitCode: value.exit_code,
+			status: sessionId !== undefined ? "unknown" : value.exit_code === 0 ? "passed" : value.exit_code === undefined ? "unknown" : "failed" });
+		return result(value);
 	};
-	const poll = async (state: Command, yieldTime: number | undefined, maxTokens: number | undefined, signal: AbortSignal | undefined, update: Update, untilExit = false, chars?: string) => {
-		if (busy) throw new Error("当前命令仍有原生调用在途，未并发操作同一执行");
-		if (yieldTime !== undefined && (!Number.isFinite(yieldTime) || yieldTime < 0 || yieldTime > 30_000)) throw new Error("yield_time_ms 必须在 0—30000 内");
-		// 参数先验证，再等待/消耗输出。
-		result(state, maxTokens);
-		busy = true;
-		const abort = () => state.controller.abort(signal?.reason ?? new Error("Structured 调用已取消"));
-		signal?.addEventListener("abort", abort, { once: true });
-		if (signal?.aborted) abort();
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const notify = setInterval(() => { try { update?.(result(state, maxTokens)); } catch { /* 仅丢弃 UI 更新。 */ } }, 250);
-		try {
-			await state.ready;
-			if (chars) await state.write!(chars);
-			if (untilExit) await state.done;
-			else await Promise.race([state.done, new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.max(250, yieldTime ?? 1000)); })]);
-			if (signal?.aborted) { abort(); await state.done; previous = state; if (active === state) active = undefined; throw signal.reason ?? new Error("Structured 调用已取消"); }
-			if (state.ended) {
-				previous = state;
-				if (active === state) active = undefined;
-				if (state.error) throw state.error;
-			}
-			const value = result(state, maxTokens);
-			state.output = "";
-			state.omitted = false;
-			return value;
-		} finally { clearTimeout(timer); clearInterval(notify); signal?.removeEventListener("abort", abort); busy = false; }
+	const stop = async () => {
+		stopped = true;
+		try { await manager?.shutdown(); sessionId = undefined; }
+		catch (error) { cleanupFailed = true; throw error; }
+	};
+	const failed = async (error: unknown, signal?: AbortSignal): Promise<never> => {
+		// exec/write 抛错不能当作原命令已经退出；等待插件真实关闭，再允许交回。
+		await stop();
+		if (lastExecution) Object.assign(lastExecution, { settled: true, status: signal?.aborted ? "cancelled" : "failed" });
+		throw error;
 	};
 	return {
 		async exec(id: string, input: ExecInput, signal?: AbortSignal, update?: Update, untilExit = false) {
-			if (stopped || active || previous?.runner.cleanupFailed) throw new Error("Structured 命令尚未交回、收尾未知或会话已关闭");
+			if (stopped || busy || sessionId !== undefined) throw new Error("Structured 命令尚未交回或会话已关闭");
 			signal?.throwIfAborted();
-			if (typeof input.cmd !== "string" || !input.cmd.trim()) throw new Error("cmd 不能为空");
-			if (input.max_output_tokens !== undefined && (!Number.isFinite(input.max_output_tokens) || input.max_output_tokens <= 0 || input.max_output_tokens > 12_500)) throw new Error("max_output_tokens 必须在 1—12500 内");
-			if (input.yield_time_ms !== undefined && (!Number.isFinite(input.yield_time_ms) || input.yield_time_ms < 0 || input.yield_time_ms > 30_000)) throw new Error("yield_time_ms 必须在 0—30000 内");
-			const state: Command = { id: randomInt(1, 2 ** 48 - 1), command: input.cmd, runner: runner(id, "exec_command"), controller: new AbortController(),
-				done: Promise.resolve(), output: "", omitted: false, startedAt: Date.now() };
-			active = state;
-			let ready!: () => void;
-			state.ready = new Promise<void>((resolve) => { ready = resolve; });
-			const decoder = new StringDecoder("utf8");
-			state.done = state.runner.execute(input.cmd, scope.workspace.cwdPath, { signal: state.controller.signal, timeout: 300,
-				onData(chunk) {
-					state.output += decoder.write(chunk);
-					if (state.output.length > 50_000) { state.output = state.output.slice(-50_000); state.omitted = true; }
-				} }, { ...input, onInput: (write) => { state.write = write; }, onStarted: ready }).then((value) => { state.exitCode = value.exitCode; }, (error) => { state.error = error; })
-				.finally(() => { state.output += decoder.end(); state.ended = true; ready(); });
-			return poll(state, input.yield_time_ms, input.max_output_tokens, signal, update, untilExit);
+			busy = true;
+			try {
+				lastExecution = { name: randomUUID(), cwd: path.resolve(cwd, input.workdir ?? "."), settled: false, status: "not-run" };
+				await beforeExecute({ name: lastExecution.name, cwd: lastExecution.cwd }, id, "exec_command");
+				signal?.throwIfAborted();
+				manager ??= (await load("tools/exec/session-manager.js")).createExecSessionManager();
+				return record(await manager!.exec({ ...input, login: input.login ?? false, wait_until_exit: untilExit }, cwd, signal,
+					update ? (value) => update(result(value)) : undefined));
+			} catch (error) { return await failed(error, signal); }
+			finally { busy = false; }
 		},
 		async stdin(input: StdinInput, signal?: AbortSignal, update?: Update) {
-			const state = active?.id === input.session_id ? active : previous?.id === input.session_id ? previous : undefined;
-			if (stopped || !state) throw new Error("session_id 不属于本次会话中的命令");
-			signal?.throwIfAborted();
-			result(state, input.max_output_tokens);
-			if (input.yield_time_ms !== undefined && (!Number.isFinite(input.yield_time_ms) || input.yield_time_ms < 0 || input.yield_time_ms > 30_000)) throw new Error("yield_time_ms 必须在 0—30000 内");
-			if (input.chars) {
-				if (busy || state.ended || !state.write) throw new Error("命令尚未接通输入、已退出或未使用 tty=true，不能写入");
-			}
-			return poll(state, input.yield_time_ms, input.max_output_tokens, signal, update, false, input.chars);
+			if (stopped || busy || sessionId === undefined || input.session_id !== sessionId) throw new Error("session_id 不属于本次尚未交回的命令");
+			busy = true;
+			try { return record(await manager!.write(input, signal, update ? (value) => update(result(value)) : undefined)); }
+			catch (error) { return await failed(error, signal); }
+			finally { busy = false; }
 		},
-		async patch(id: string, text: string, helper: string, signal?: AbortSignal) {
-			if (stopped || active || busy || previous?.runner.cleanupFailed) throw new Error("命令尚未交回或收尾未知，不能同时应用补丁");
-			if (scope.readonlyWorkspace) throw new Error("只读角色不提供补丁写入");
-			const operation = runner(id, "apply_patch", helper);
-			const state: Command = { id: randomInt(1, 2 ** 48 - 1), command: "apply_patch", runner: operation, controller: new AbortController(), done: Promise.resolve(), output: "", omitted: false, startedAt: Date.now() };
-			active = state;
-			const abort = () => state.controller.abort(signal?.reason);
-			signal?.addEventListener("abort", abort, { once: true });
-			if (signal?.aborted) abort();
-			const decoder = new StringDecoder("utf8");
-			state.done = operation.execute(`printf %s ${quote(text)} | PI_APPLY_PATCH_JSON=1 /adaptive-helper`, scope.workspace.cwdPath,
-				{ signal: state.controller.signal, timeout: 300, onData(chunk) { state.output += decoder.write(chunk); if (state.output.length > 50_000) throw new Error("补丁结果超过 50 KiB；请核对原始记录与实际文件"); } })
-				.then((value) => { state.exitCode = value.exitCode; }, (error) => { state.error = error; }).finally(() => { state.output += decoder.end(); state.ended = true; });
+		async patch(id: string, text: string, signal?: AbortSignal) {
+			if (stopped || busy || sessionId !== undefined) throw new Error("命令尚未交回或会话已关闭，不能同时应用补丁");
+			signal?.throwIfAborted();
+			busy = true;
 			try {
-				await state.done;
-				if (state.error) throw state.error;
-				let output: any;
-				// 3.0.29 helper 先输出人类摘要，再输出一行 JSON，与其公开工具的解析约定一致。
-				try { output = JSON.parse(state.output.trimEnd().split("\n").findLast((line) => line.trimStart().startsWith("{")) ?? ""); }
-				catch (error) { throw new Error(`补丁执行器没有返回 JSON，退出码 ${state.exitCode}：${state.output}`, { cause: error }); }
-				if (state.exitCode !== 0 || output.status !== "success") throw new Error(`补丁失败，可能已部分修改：${state.output}`);
-				return { content: [{ type: "text" as const, text: state.output }], details: { ...output.result, container: operation.lastExecution } };
-			} finally { signal?.removeEventListener("abort", abort); previous = state; active = undefined; }
+				const [{ parsePatchActions }, { resolvePatchPath }, { executePatchWithRust }] = await Promise.all([
+					load("patch/parser.js"), load("patch/paths.js"), load("tools/apply-patch/executor.js"),
+				]);
+				const actions: { path: string; movePath?: string }[] = parsePatchActions({ text });
+				const targets = [...new Set(actions.flatMap((action) => [action.path, ...(action.movePath ? [action.movePath] : [])])
+					.map((patchPath) => resolvePatchPath({ cwd, patchPath }) as string))].sort();
+				await beforeExecute({ name: randomUUID(), cwd }, id, "apply_patch");
+				const apply = async () => {
+					await checkPaths(targets, signal);
+					signal?.throwIfAborted();
+					return executePatchWithRust({ cwd, patchText: text, signal });
+				};
+				const queued = (index: number): Promise<any> => index === targets.length ? apply() : withFileMutationQueue(targets[index]!, () => queued(index + 1));
+				const details = await queued(0);
+				return { content: [{ type: "text" as const, text: `Applied patch successfully\n${JSON.stringify(details)}` }], details };
+			} finally { busy = false; }
 		},
 		async finish() {
-			stopped = true;
-			const incomplete = active !== undefined;
-			if (active) { active.controller.abort(new Error("Structured 子会话关闭，停止未交回命令")); await active.done; previous = active; active = undefined; }
-			if (previous?.runner.cleanupFailed) throw new Error("Structured 容器收尾未知");
+			if (busy) throw new Error("Structured 工具仍在执行，不能交回 writer");
+			const incomplete = sessionId !== undefined;
+			await stop();
 			return { incomplete, clean: true };
 		},
-		get active() { return active !== undefined; },
-		get cleanupFailed() { return previous?.runner.cleanupFailed || active?.runner.cleanupFailed || false; },
-		get lastExecution() { return (active ?? previous)?.runner.lastExecution; },
+		get active() { return busy || sessionId !== undefined; },
+		get cleanupFailed() { return cleanupFailed; },
+		get lastExecution() { return lastExecution; },
 	};
 }
 

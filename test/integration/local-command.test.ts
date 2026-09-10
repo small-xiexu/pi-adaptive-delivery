@@ -1,135 +1,20 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
-import { createBashTool, type CustomEntry } from "@earendil-works/pi-coding-agent";
-import { createContainerOperations, resolveContainerImage, type ContainerReference } from "../../extensions/delivery-gate/src/container.ts";
-import { resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
+import type { CustomEntry } from "@earendil-works/pi-coding-agent";
 import { createDevelopmentHost } from "../support/development-host.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 import type { TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 
-if (process.env.PI_ADAPTIVE_CONTAINER_TESTS !== "1") throw new Error("真实容器测试须显式使用 run-tests.ts --containers；不静默跳过或放宽默认禁网");
-
-async function host(t: TestContext, script: string, directory = "src") {
-	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "adaptive-container-")));
-	const cwd = path.join(root, "repo");
-	const config = path.join(root, "docker-config");
-	await Promise.all([path.join(cwd, directory), path.join(cwd, "inputs"), config].map((dir) => mkdir(dir, { recursive: true })));
-	execFileSync("git", ["init", "--quiet"], { cwd });
-	await writeFile(path.join(cwd, "inputs/command.cjs"), script);
-	await writeFile(path.join(cwd, "plan.md"), "protected plan\n");
-	await writeFile(path.join(root, "outside.txt"), "not mounted\n");
-	const refs: ContainerReference[] = [];
-	const cli = (...args: string[]) => execFileSync("docker", ["--config", config, "--host", "unix:///var/run/docker.sock", ...args],
-		{ env: { PATH: process.env.PATH, HOME: config, DOCKER_CONFIG: config }, encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
-	const workspace = await resolveWorkspaceIdentity(cwd);
-	const image = await resolveContainerImage("node:22-alpine", cwd);
-	const runner = createContainerOperations({ workspace, image, readPaths: ["inputs"], writePaths: [directory], protectedPaths: [path.join(cwd, "plan.md")],
-		beforeCreate: async (ref) => { refs.push(ref); await appendFile(path.join(root, "container-references.jsonl"), JSON.stringify(ref) + "\n"); } });
-	t.after(() => {
-		for (const ref of refs) {
-			const ids = cli("ps", "--all", "--quiet", "--no-trunc", "--filter", `label=pi-adaptive-delivery.execution=${ref.name}`);
-			if (ids) { cli("rm", "--force", "--volumes", ids); assert.fail(`产品未清理本次容器，夹具已强制清理：${ref.name}`); }
-		}
-	});
-	t.diagnostic(JSON.stringify({ root, image, dockerHost: "local Unix socket", input: "temporary fixture only" }));
-	return { root, cwd, directory, cli, runner, run: (signal?: AbortSignal, timeout = 10) => createBashTool(cwd, { operations: runner.operations, exposeSessionEnvironment: false })
-		.execute("container-probe", { command: "node inputs/command.cjs", timeout }, signal) };
-}
-
-test("真实容器执行产物可写，输入/台账/根目录/宿主外部文件不可写，无网络或 Docker socket", { timeout: 40_000 }, async (t) => {
-	const h = await host(t, `const fs = require("node:fs");
-const checks = {};
-for (const target of ["inputs/command.cjs", "plan.md", "/outside.txt"]) {
-  try { fs.writeFileSync(target, "forbidden"); checks[target] = "writable"; } catch (error) { checks[target] = error.code; }
-}
-for (const target of ["/var/run/docker.sock", "/workspace/.git", "../outside.txt"]) {
-  try { fs.readFileSync(target); checks[target] = "readable"; } catch (error) { checks[target] = error.code; }
-}
-checks.interfaces = Object.keys(require("node:os").networkInterfaces());
-checks.uid = process.getuid();
-checks.status = fs.readFileSync("/proc/self/status", "utf8").split("\\n").filter(line => /^(CapEff|NoNewPrivs):/.test(line));
-fs.writeFileSync("src/result.json", JSON.stringify(checks));
-console.log("container command completed");`);
-	await h.run();
-	const checks = JSON.parse(await readFile(path.join(h.cwd, "src/result.json"), "utf8"));
-	for (const target of ["inputs/command.cjs", "plan.md", "/outside.txt"]) assert.equal(checks[target], "EROFS");
-	for (const target of ["/var/run/docker.sock", "/workspace/.git", "../outside.txt"]) assert.equal(checks[target], "ENOENT");
-	assert.deepEqual(checks.interfaces, ["lo"]);
-	assert.ok(checks.uid > 0);
-	assert.match(checks.status.join("\n"), /CapEff:\s+0+\nNoNewPrivs:\s+1/);
-	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "protected plan\n");
-	assert.equal(h.runner.lastExecution?.clean, true);
-	assert.equal(h.runner.cleanupFailed, false);
-});
-
-test("Docker CSV 挂载保留逗号和引号目录，不作为命令或额外挂载解释", { timeout: 40_000 }, async (t) => {
-	const directory = 'src,with"quote';
-	const h = await host(t, `require("node:fs").writeFileSync(${JSON.stringify(`${directory}/result.txt`)}, "correct");`, directory);
-	await h.run();
-	assert.equal(await readFile(path.join(h.cwd, directory, "result.txt"), "utf8"), "correct");
-});
-
-test("普通命令失败保留真实退出码和部分产物，清理后可再次执行", { timeout: 40_000 }, async (t) => {
-	const h = await host(t, 'require("node:fs").writeFileSync("src/partial.txt", "partial"); process.exit(7);');
-	await assert.rejects(h.run(), /code 7/);
-	assert.equal(h.runner.lastExecution?.exitCode, 7);
-	assert.equal(h.runner.lastExecution?.clean, true);
-	await writeFile(path.join(h.cwd, "inputs/command.cjs"), 'require("node:fs").writeFileSync("src/partial.txt", "repaired");');
-	await h.run();
-	assert.equal(await readFile(path.join(h.cwd, "src/partial.txt"), "utf8"), "repaired");
-});
-
-test("真实容器 OOM 的原生错误包含 137、输出和已确认清理", { timeout: 40_000 }, async (t) => {
-	const h = await host(t, `console.log("OOM_PROBE_STARTED");
-console.log("memory.max=" + require("node:fs").readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
-const held=[]; setInterval(() => held.push(Buffer.alloc(16*1024*1024,1)), 10);`);
-	await assert.rejects(h.run(), (error: Error) => {
-		assert.match(error.message, /OOMKilled/);
-		assert.match(error.message, /退出码：137；容器清理：已确认/);
-		assert.match(error.message, /OOM_PROBE_STARTED/);
-		assert.match(error.message, /memory.max=1073741824/);
-		return true;
-	});
-	assert.equal(h.runner.lastExecution?.status, "failed");
-});
-
-for (const kind of ["cancel", "timeout", "background"]) test(`真实容器 ${kind} 收尾后，脱离 stdio 的后代不能继续写入`, { timeout: 40_000 }, async (t) => {
-	const worker = 'setInterval(() => require("node:fs").appendFileSync("src/ticks.txt", "tick\\n"), 30)';
-	const h = await host(t, `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(worker)}], { detached: true, stdio: "ignore" });
-child.unref();
-require("node:fs").writeFileSync("src/ready.json", JSON.stringify({ pid: child.pid }));
-${kind === "background" ? 'setTimeout(() => {}, 150);' : 'setInterval(() => {}, 1000);'}`);
-	const controller = new AbortController();
-	const run = h.run(controller.signal, kind === "timeout" ? 1 : 10);
-	const outcome = kind === "background" ? run : assert.rejects(run, kind === "cancel" ? /abort/i : /timeout/);
-	const deadline = Date.now() + 10_000;
-	while (!await readFile(path.join(h.cwd, "src/ready.json")).then(() => true, (error) => { if (error.code === "ENOENT") return false; throw error; })) {
-		assert.ok(Date.now() < deadline, "必须先观察到实际命令启动");
-		await setTimeout(20);
-	}
-	if (kind === "cancel") controller.abort();
-	await outcome;
-	assert.equal(h.runner.lastExecution?.clean, true);
-	assert.equal(h.runner.cleanupFailed, false);
-	const file = path.join(h.cwd, "src/ticks.txt");
-	const before = await readFile(file, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; });
-	await setTimeout(250);
-	const after = await readFile(file, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; });
-	assert.equal(after, before);
-});
-
 async function developmentHost(t: TestContext, scenario: string, script: string, commands: string[] = [], withPlanning = true) {
-	const h = await createDevelopmentHost(t, `container-${scenario}`);
+	const h = await createDevelopmentHost(t, `local-${scenario}`);
 	await mkdir(path.join(h.cwd, "inputs"));
 	await writeFile(path.join(h.cwd, "inputs/command.cjs"), script);
 	if (withPlanning) await h.prepare();
 	else assert.equal((await h.approve("design", [])).isError, false);
-	assert.equal((await h.approve("implementation", ["src"], { image: "node:22-alpine", inputs: ["inputs"] }, commands)).isError, false);
+	assert.equal((await h.approve("implementation", ["src"], ["inputs"], commands)).isError, false);
 	const children = async () => {
 		const entries = h.sm.getEntries().filter((entry): entry is CustomEntry => entry.type === "custom" && entry.customType === "delivery-development");
 		return Promise.all(entries.map(async (entry) => {
@@ -137,15 +22,8 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 			return (await readFile(childSessionFile, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 		}));
 	};
-	const config = path.join(h.root, "docker-config");
-	await mkdir(config);
-	const cli = (...args: string[]) => execFileSync("docker", ["--config", config, "--host", "unix:///var/run/docker.sock", ...args],
-		{ env: { PATH: process.env.PATH, HOME: config, DOCKER_CONFIG: config }, encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
 	t.after(async () => {
-		for (const rows of await children()) for (const row of rows.filter((entry: any) => entry.type === "custom" && entry.customType === "delivery-container")) {
-			const ids = cli("ps", "--all", "--quiet", "--no-trunc", "--filter", `label=pi-adaptive-delivery.execution=${row.data.name}`);
-			if (ids) { cli("rm", "--force", "--volumes", ids); assert.fail(`正式子工具遗留容器，夹具已清理：${row.data.name}`); }
-		}
+		for (const event of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(event.pid, 0), { code: "ESRCH" });
 	});
 	return { ...h, children };
 }
@@ -206,7 +84,7 @@ setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
 	await finished;
 });
 
-test("真实容器命令完成后模型断流，恢复不重复命令或委派", { timeout: 40_000 }, async (t) => {
+test("真实本机命令完成后模型断流，恢复不重复命令或委派", { timeout: 40_000 }, async (t) => {
 	const h = await developmentHost(t, "stream-retry-once", `require("node:fs").appendFileSync("src/executions.txt", "once\\n"); console.log("COMMAND_BEFORE_STREAM_ERROR");`);
 	const result = await h.call("delivery_develop", { task: "创建、编辑文件，执行一次命令并读回；模型断流后继续" });
 	assert.equal(result.isError, false, JSON.stringify(result));
@@ -218,8 +96,8 @@ test("真实容器命令完成后模型断流，恢复不重复命令或委派",
 	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
 	assert.deepEqual(tools.map((tool: any) => tool.toolName), ["write", "edit", "bash", "read"]);
 	assert.ok(tools.every((tool: any) => !tool.isError));
-	assert.equal(tools[2].details.container.exitCode, 0);
-	assert.equal(tools[2].details.container.clean, true);
+	assert.equal(tools[2].details.execution.exitCode, 0);
+	assert.equal(tools[2].details.execution.settled, true);
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.choices.length, 3);
 });
@@ -228,7 +106,7 @@ test("开发初始读取失败后写入与真实自检成功，父核对过程�
 	const h = await developmentHost(t, "read-before-write", `const assert = require("node:assert/strict");
 assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");
 console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
-	const result = await h.call("delivery_develop", { task: "先读取不存在的目标，然后创建、编辑并执行一次容器自检。" });
+	const result = await h.call("delivery_develop", { task: "先读取不存在的目标，然后创建、编辑并执行一次本机自检。" });
 	assert.equal(result.isError, false, "正常收尾返回结果，原始工具错误仍保留");
 	assert.equal((result.details as any).progress.status, "已结束，有工具错误待核对");
 	const [rows] = await h.children();
@@ -236,8 +114,8 @@ console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	assert.deepEqual(tools.map((tool: any) => [tool.toolName, tool.isError]), [["read", true], ["write", false], ["edit", false], ["bash", false], ["read", false]]);
 	assert.match(JSON.stringify(tools[0].content), /ENOENT/);
 	assert.match(JSON.stringify(tools[3].content), /READ_RECOVERY_SELF_CHECK_OK/);
-	assert.equal(tools[3].details.container.exitCode, 0);
-	assert.equal(tools[3].details.container.clean, true);
+	assert.equal(tools[3].details.execution.exitCode, 0);
+	assert.equal(tools[3].details.execution.settled, true);
 	assert.equal(rows.find((row: any) => row.customType === "delivery-child-exit").data.development.clean, true);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
@@ -255,65 +133,64 @@ console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	for (const child of children) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 });
 
-test("正式父批准/子 CLI/真实 Docker：文件开发、实际命令、持久收尾后父回写台账", { timeout: 60_000 }, async (t) => {
+test("正式父批准/子 CLI/真实本机 Shell：文件开发、实际命令、持久收尾后父回写台账", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "normal", `const fs = require("node:fs");
 const source = fs.readFileSync("src/value.js", "utf8");
 if (!source.includes("value = 2")) process.exit(8);
 fs.writeFileSync("src/value.js", source.replace("value = 2", "value = 3"));
-console.log("CONTAINER_REAL_COMMAND_OK");`);
+console.log("LOCAL_REAL_COMMAND_OK");`);
 	const progress: any[] = [];
 	const unsubscribe = h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName === "delivery_develop") progress.push(event.partialResult.details.progress); });
 	t.after(unsubscribe);
-	const result = await h.call("delivery_develop", { task: "创建、编辑后执行已批准的容器自检脚本，再读回文件。" });
+	const result = await h.call("delivery_develop", { task: "创建、编辑后执行已批准的本机自检脚本，再读回文件。" });
 	assert.equal(result.isError, false, JSON.stringify(result));
-	assert.ok(progress.some((view) => view.action === "正在执行：bash node inputs/command.cjs" && view.output.includes("CONTAINER_REAL_COMMAND_OK")), "容器实际日志在命令结束前沿子 RPC 实时到达父卡片");
+	assert.ok(progress.some((view) => view.action === "正在执行：bash node inputs/command.cjs" && view.output.includes("LOCAL_REAL_COMMAND_OK")), "本机实际日志在命令结束前沿子 RPC 实时到达父卡片");
 	assert.ok(progress.every((view) => view.id === result.toolCallId));
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
-	const ref = rows.find((row: any) => row.type === "custom" && row.customType === "delivery-container");
+	const ref = rows.find((row: any) => row.type === "custom" && row.customType === "delivery-execution");
 	assert.ok(ref);
 	const tool = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
 	assert.equal(tool.message.isError, false);
-	assert.match(JSON.stringify(tool.message.content), /CONTAINER_REAL_COMMAND_OK/);
-	assert.equal(tool.message.details.container.clean, true);
-	assert.equal(tool.message.details.container.exitCode, 0);
-	assert.equal(tool.message.details.container.name, ref.data.name);
+	assert.match(JSON.stringify(tool.message.content), /LOCAL_REAL_COMMAND_OK/);
+	assert.equal(tool.message.details.execution.settled, true);
+	assert.equal(tool.message.details.execution.exitCode, 0);
+	assert.equal(tool.message.details.execution.name, ref.data.name);
 	assert.ok(rows.indexOf(ref) < rows.indexOf(tool));
 	const events = await h.audit();
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-call" && row.toolName === "bash").length, 1);
 	assert.equal(events.filter((row) => row.child && row.phase === "environment-tool-result" && row.toolName === "bash").length, 1);
-	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "真实容器命令已执行，完整独立验收仍待后续。" })).isError, false);
+	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "真实本机命令已执行，完整独立验收仍待后续。" })).isError, false);
 	assert.equal(h.choices.length, 3, "节点回写不重复请求批准");
 });
 
-for (const kind of ["failure", "readonly", "hook-deny", "hook-error"]) test(`正式容器命令 ${kind} 保留失败，不误报成功或锁死已清理 writer`, { timeout: 60_000 }, async (t) => {
-	const script = kind === "readonly" ? 'require("node:fs").writeFileSync("inputs/command.cjs", "forbidden");'
-		: 'if (!require("node:fs").readFileSync("src/value.js", "utf8").includes("value = 3")) process.exit(7); console.log("repaired command");';
+for (const kind of ["failure", "hook-deny", "hook-error"]) test(`正式本机命令 ${kind} 保留失败，不误报成功或锁死已交回 writer`, { timeout: 60_000 }, async (t) => {
+	const script = 'if (!require("node:fs").readFileSync("src/value.js", "utf8").includes("value = 3")) process.exit(7); console.log("repaired command");';
 	const h = await developmentHost(t, kind, script);
-	const outcome = await h.call("delivery_develop", { task: "验证容器错误与配置检查" });
+	const outcome = await h.call("delivery_develop", { task: "验证本机错误与配置检查" });
 	assert.equal(outcome.isError, false);
 	assert.equal((outcome.details as any).progress.status, "已结束，有工具错误待核对");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	const result = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
 	assert.equal(result?.message.isError, true);
-	assert.match(JSON.stringify(result.message.content), kind === "readonly" ? /EROFS/ : kind === "hook-deny" ? /CONFIGURED_TOOL_HOOK_DENIED/ : kind === "hook-error" ? /CONFIGURED_TOOL_HOOK_ERROR/ : /code 7/);
-	assert.equal(rows.some((row: any) => row.customType === "delivery-container"), !kind.startsWith("hook-"));
+	assert.match(JSON.stringify(result.message.content), kind === "hook-deny" ? /CONFIGURED_TOOL_HOOK_DENIED/ : kind === "hook-error" ? /CONFIGURED_TOOL_HOOK_ERROR/ : /code 7/);
+	assert.equal(rows.some((row: any) => row.customType === "delivery-execution"), !kind.startsWith("hook-"));
 	if (kind === "failure") {
-		assert.equal((await h.call("delivery_develop", { task: "fixture-container-repair：在原授权范围内修复源码并复验" })).isError, false);
+		assert.equal((await h.call("delivery_develop", { task: "fixture-local-repair：在原授权范围内修复源码并复验" })).isError, false);
 		assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
 		assert.equal(await readFile(path.join(h.cwd, "inputs/command.cjs"), "utf8"), script);
 		assert.equal(h.choices.length, 3);
 	}
 });
 
-for (const kind of ["cancel", "timeout"]) test(`正式父子容器 ${kind} 等待命令清理和持久终态后才交回 writer`, { timeout: 60_000 }, async (t) => {
+for (const kind of ["cancel", "timeout"]) test(`正式父子本机 ${kind} 等待命令交回和持久终态后才交回 writer`, { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, kind, 'require("node:fs").writeFileSync("src/ready.txt", "ready"); setInterval(() => {}, 1000);');
-	const run = h.call("delivery_develop", { task: "执行在途容器命令" });
+	const run = h.call("delivery_develop", { task: "执行在途本机命令" });
 	const deadline = Date.now() + 15_000;
 	while (!await readFile(path.join(h.cwd, "src/ready.txt")).then(() => true, (error) => { if (error.code === "ENOENT") return false; throw error; })) {
-		assert.ok(Date.now() < deadline, "必须观察到真实容器已执行");
+		assert.ok(Date.now() < deadline, "必须观察到真实本机已执行");
 		await setTimeout(20);
 	}
 	assert.equal((await h.readLease())?.owner.kind, "child");
@@ -326,7 +203,7 @@ for (const kind of ["cancel", "timeout"]) test(`正式父子容器 ${kind} 等�
 	assert.ok(rows.some((row: any) => row.customType === "delivery-child-exit" && row.data.development.clean));
 });
 
-test("父 Bash 已被配置覆盖时不将其偷偷替换成容器实现", { timeout: 60_000 }, async (t) => {
+test("父 Bash 已被配置覆盖时不将其偷偷替换成本机实现", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "normal", 'console.log("must not execute");');
 	await h.session.prompt("/fixture-replace-tool bash");
 	assert.notEqual(h.session.getAllTools().find((tool) => tool.name === "bash")?.sourceInfo.source, "builtin");
@@ -349,22 +226,22 @@ test("正式固定验收运行完整原清单，绑定稳定候选和真实子�
 	assert.equal(proof.before.digest, proof.after.digest);
 	assert.deepEqual(proof.commands, commands);
 	assert.deepEqual(proof.results.map((row: any) => row.status), ["passed", "passed"]);
-	assert.equal(new Set(proof.results.map((row: any) => row.container)).size, 2);
+	assert.equal(new Set(proof.results.map((row: any) => row.execution)).size, 2);
 	const [rows] = await h.children();
 	for (const item of proof.results) {
 		const call = rows.find((row: any) => row.message?.role === "assistant" && row.message.content.some((part: any) => part.type === "toolCall" && part.id === item.toolCallId));
 		const outcome = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolCallId === item.toolCallId);
 		assert.ok(call && outcome);
 		assert.equal(outcome.message.isError, false);
-		assert.equal(outcome.message.details.container.name, item.container);
-		assert.equal(outcome.message.details.container.clean, true);
+		assert.equal(outcome.message.details.execution.name, item.execution);
+		assert.equal(outcome.message.details.execution.settled, true);
 	}
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: `固定验收通过，候选 ${proof.after.digest}；独立审查待实施。\n` })).isError, false);
 	assert.equal(h.choices.length, 3);
 });
 
-test("无规划文档的原生 Pi 完成开发、真实容器验收与独立审查", { timeout: 60_000 }, async (t) => {
+test("无规划文档的原生 Pi 完成开发、真实本机验收与独立审查", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "review-normal", `const assert = require("node:assert/strict");
 assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");
 console.log("NO_PLANNING_FILES_CHECK_OK");`, ["node inputs/command.cjs"], false);
@@ -409,7 +286,7 @@ test("独立审查读取原目标、代码、真实差异与原始验收记录�
 	assert.deepEqual(requests[0].tools, ["read"]);
 	assert.match(JSON.stringify(requests[0].messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
 	assert.match(JSON.stringify(requests[2].messages), /diff --git/);
-	assert.match(JSON.stringify(requests[3].messages), /delivery-container.*delivery-child-exit/s);
+	assert.match(JSON.stringify(requests[3].messages), /delivery-execution.*delivery-child-exit/s);
 	assert.notEqual(details.reviewSessionFile, (validation.details as any).childSessionFile);
 	assert.throws(() => process.kill(details.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
@@ -428,7 +305,7 @@ test("独立审查读取原目标、代码、真实差异与原始验收记录�
 	assert.equal(h.choices.length, 3, "同范围返工及节点回写不重复批准");
 });
 
-test("正式固定验收取消等待真实容器退出，不消费父排队消息或形成可审查证据", { timeout: 60_000 }, async (t) => {
+test("正式固定验收取消等待真实本机退出，不消费父排队消息或形成可审查证据", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "validation-cancel", 'require("node:fs").writeFileSync("src/ready.txt", "ready"); setInterval(() => {}, 1000);', ["node inputs/command.cjs"]);
 	await mkdir(path.join(h.cwd, "src"), { recursive: true });
 	const before = (await h.audit()).filter((row) => !row.child && row.phase === "model").length;

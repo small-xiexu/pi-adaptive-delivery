@@ -6,7 +6,6 @@ import path from "node:path";
 import test from "node:test";
 import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { APPROVAL_ENTRY, APPROVAL_TOOL, PROPOSAL_ENTRY, installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
-import { installFakeDocker } from "../support/fake-docker.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
 
 const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", paths: ["docs/方案.md", "docs/计划.md"], validationCommands: [] };
@@ -34,7 +33,7 @@ async function host(persist = true) {
 	};
 	const approvals = installApprovals(pi as ExtensionAPI);
 	assert.equal(tool.name, APPROVAL_TOOL);
-	const run = (request: { stage: string; body: string; paths: string[]; validationCommands: string[]; container?: { image: string; inputs: string[] } } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
+	const run = (request: { stage: string; body: string; paths: string[]; validationCommands: string[]; inputs?: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
 	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages,
@@ -208,11 +207,11 @@ for (const mode of ["rpc", "json", "print", undefined]) test(`非 TUI ${mode} �
 	await assert.rejects(h.run(), /真实 TUI/); assert.equal(h.entries(PROPOSAL_ENTRY).length, 0);
 });
 
-test("方案路径须为 worktree 内确切 Markdown，命令及容器只在实施阶段申请", async () => {
+test("方案路径须为 worktree 内确切 Markdown，命令及验收输入只在实施阶段申请", async () => {
 	const h = await host();
 	for (const request of [{ ...design, paths: ["src"] }, { ...design, paths: ["../outside.md"] },
 		{ ...design, paths: [" "] }, { ...design, body: " " }, { ...design, validationCommands: ["echo x"] },
-		{ ...design, container: { image: "fixture:local", inputs: [] } }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
+		{ ...design, inputs: ["src"] }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
 	assert.equal(h.displayed.length, 0);
 });
 
@@ -254,22 +253,23 @@ test("模型自称或伪造历史不能取得批准，压缩保留本轮真实�
 	await h.event("session_start"); await assert.rejects(h.readImplementation(), /本轮没有/);
 });
 
-test("容器确认冻结镜像、只读输入和原方案，目录权限与完整决策可展开核对", async (t) => {
-	const h = await host(); const fake = await installFakeDocker(t, h.cwd, "normal"); await h.run();
+test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，完整决策可展开核对", async () => {
+	const h = await host(); await h.run();
 	const body = "计划修改四个文件。\n" + "步骤与停止条件。\n".repeat(100) + "最后一项决策";
 	h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
 		const panel = await factory(...args);
 		assert.match(panel.body, /工具实际可写范围（文件或目录）：\n• src\n• test/);
 		assert.ok(!panel.body.includes("最后一项决策")); assert.ok(panel.detail.includes(body)); assert.ok(panel.detail.includes(design.body));
-		assert.match(panel.detail, /额外只读输入：\n• package.json/); return panel;
+		assert.match(panel.detail, /额外验收输入：\n• package.json/);
+		assert.match(panel.body, /本机.*当前用户/);
+		assert.match(panel.body, /Shell.*不受这些路径隔离/); return panel;
 	}, options);
-	await h.run({ ...implementation, body, container: { image: "fixture:local", inputs: ["package.json"] } });
+	await h.run({ ...implementation, body, inputs: ["package.json"] });
 	const grant = await h.readImplementation();
 	assert.equal(grant.implementationBody, body);
-	assert.deepEqual(grant.container, { image: `sha256:${"a".repeat(64)}`, inputs: [path.join(h.cwd, "package.json")] });
-	grant.container!.inputs.push("/other");
-	assert.equal((await h.readImplementation()).container!.inputs.length, 1);
-	assert.ok(fake.audit().every((row) => row.command === "image"));
+	assert.deepEqual(grant.inputs, [path.join(h.cwd, "package.json")]);
+	grant.inputs.push("/other");
+	assert.equal((await h.readImplementation()).inputs.length, 1);
 });
 
 for (const stage of ["design", "implementation"]) for (const type of [PROPOSAL_ENTRY, APPROVAL_ENTRY]) test(`同时篡改内存与磁盘 ${stage}/${type} 不能扩大权限`, async () => {

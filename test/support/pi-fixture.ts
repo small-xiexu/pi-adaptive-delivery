@@ -25,7 +25,7 @@ export function testEnvironment(root: string): NodeJS.ProcessEnv {
 }
 
 // 仅测试使用系统沙箱；不将它作为 Package 的生产权限实现。
-export function sandboxProfile(root: string, sourceRoot?: string, containerSocket?: string): string {
+export function sandboxProfile(root: string, sourceRoot?: string): string {
 	if (process.platform !== "darwin") {
 		throw new Error("正式隔离测试当前只验收 macOS；没有系统隔离时不执行测试。");
 	}
@@ -37,15 +37,11 @@ export function sandboxProfile(root: string, sourceRoot?: string, containerSocke
 	for (let parent = sourceRoot && path.dirname(sourceRoot); parent && parent !== path.dirname(parent); parent = path.dirname(parent)) {
 		sourceParents.push(`(literal ${JSON.stringify(parent)})`);
 	}
-	if (containerSocket) for (let file = containerSocket; file !== path.dirname(file); file = path.dirname(file)) {
-		sourceParents.push(`(literal ${JSON.stringify(file)})`);
-	}
 	return `(version 1)
 (allow default)
 (deny network*)
 (deny file-read* ${blockedHome})
 ${sourceParents.length ? `(allow file-read-metadata ${sourceParents.join(" ")})` : ""}
-${containerSocket ? `(allow network-outbound (literal ${JSON.stringify(containerSocket)}))` : ""}
 (deny file-write* (require-not (require-any
   (subpath ${JSON.stringify(root)}) (literal "/dev/null"))))`;
 }

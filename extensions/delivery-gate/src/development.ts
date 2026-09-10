@@ -8,10 +8,10 @@ import type { installApprovals } from "./approvals.ts";
 import { createDevelopmentFileTools } from "./planning-documents.ts";
 import { current, nativeEntries, snapshot, type SessionBinding } from "./parent-writer.ts";
 import { CHILD_EXIT, DELEGATION_ENTRY, createChildDialogs, delegateReadOnly, parseReadOnlySession, readyChild, startChild, type ChildRpc, type ChildTask } from "./subagents.ts";
-import { createContainerOperations, type ContainerReference, type ContainerScope } from "./container.ts";
+import { createLocalOperations, type ExecutionReference } from "./local-execution.ts";
 import { createTaskProgress, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 import { createStructuredCommands, type ExecInput, type StdinInput } from "./structured.ts";
-import { captureCandidate, type CandidateSnapshot } from "./candidate.ts";
+import { captureCandidate, type CandidateSnapshot, type CandidateScope } from "./candidate.ts";
 import { prepareReview } from "./review.ts";
 import { createValidationRun, validationPassed, type ValidationProof } from "./validation.ts";
 import { getWriterStateRoot, parseWriterLeaseReference, resolveWorkspaceIdentity, WriterLeaseManager,
@@ -22,7 +22,7 @@ export const VALIDATION_TOOL = "delivery_validate";
 export const REVIEW_TOOL = "delivery_review";
 export const CHILD_ARM = "delivery-child-arm";
 export const DEVELOPMENT_ENTRY = "delivery-development";
-export const CONTAINER_ENTRY = "delivery-container";
+export const EXECUTION_ENTRY = "delivery-execution";
 
 interface ChildGrant {
 	lease: WriterLeaseReference;
@@ -30,7 +30,7 @@ interface ChildGrant {
 	parent: WriterLeaseOwner;
 	paths: string[];
 	protectedPaths: string[];
-	container?: { image: string; inputs: string[] };
+	inputs: string[];
 	validation?: { commands: string[]; before: CandidateSnapshot };
 }
 
@@ -39,10 +39,10 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 	let prepared: { workspace: WorkspaceIdentity; gitDir: string; leases: WriterLeaseManager; owner: WriterLeaseOwner } | undefined;
 	let tools: ReturnType<typeof createDevelopmentFileTools> | undefined;
-	let container: ReturnType<typeof createContainerOperations> | undefined;
+	let local: ReturnType<typeof createLocalOperations> | undefined;
 	let structured: ReturnType<typeof createStructuredCommands> | undefined;
-	let commandScope: Omit<ContainerScope, "beforeCreate"> | undefined;
-	let beforeCommand: ((reference: ContainerReference, id: string, name: string) => Promise<void>) | undefined;
+	let commandScope: CandidateScope | undefined;
+	let beforeCommand: ((reference: ExecutionReference, id: string, name: string) => Promise<void>) | undefined;
 	let validation: Awaited<ReturnType<typeof createValidationRun>> | undefined;
 	let commandId: string | undefined;
 	let active = 0;
@@ -73,31 +73,30 @@ export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 			const owner = { ...prepared.owner };
 			const sessionFile = ctx.sessionManager.getSessionFile();
 			if (!sessionFile) throw new Error("子 Session 不持久化，未开放文件写入");
-			if (grant.container && (!Array.isArray(grant.container.inputs) || grant.container.inputs.some((item) => typeof item !== "string" || !path.isAbsolute(item)))) throw new Error("容器只读输入范围无效");
+			if (!Array.isArray(grant.inputs) || grant.inputs.some((item) => typeof item !== "string" || !path.isAbsolute(item))) throw new Error("验收输入范围无效");
 			const protectedPaths = [...grant.protectedPaths, sessionFile, prepared.gitDir];
-			if (grant.validation && (!grant.container || !Array.isArray(grant.validation.commands) || !grant.validation.before)) throw new Error("固定验收缺少已批准容器、命令清单或准备候选");
-			if (grant.container) {
-				commandScope = { workspace: prepared.workspace, image: grant.container.image, readPaths: grant.container.inputs, writePaths: grant.paths, protectedPaths };
+			if (grant.validation && (!Array.isArray(grant.validation.commands) || !grant.validation.before)) throw new Error("固定验收缺少命令清单或准备候选");
+			{
+				commandScope = { workspace: prepared.workspace, readPaths: grant.inputs, writePaths: grant.paths, protectedPaths };
 				beforeCommand = async (reference, callId, name) => {
 					const binding = { cwd: ctx.cwd, sessionId: owner.sessionId, sessionFile, lifetime };
 					current(binding, ctx);
 					const record = await prepared!.leases.read(prepared!.workspace.key);
-					if (!record || record.leaseId !== lease.leaseId || !isDeepStrictEqual(record.owner, owner)) throw new Error("容器执行前子 writer 已失效");
+					if (!record || record.leaseId !== lease.leaseId || !isDeepStrictEqual(record.owner, owner)) throw new Error("本机执行前子 writer 已失效");
 					const records = await nativeEntries(binding, ctx);
 					const call = records.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
 					if (!callId || !call || call.type !== "message" || call.message.role !== "assistant"
-						|| !call.message.content.some((part) => part.type === "toolCall" && part.id === callId && part.name === name)) throw new Error("本次容器工具调用未核实");
+						|| !call.message.content.some((part) => part.type === "toolCall" && part.id === callId && part.name === name)) throw new Error("本次本机工具调用未核实");
 					records.requireEntry(call);
-					pi.appendEntry(CONTAINER_ENTRY, { ...reference, toolCallId: callId });
+					pi.appendEntry(EXECUTION_ENTRY, { ...reference, toolCallId: callId });
 					const saved = await nativeEntries(binding, ctx);
-					const entry = saved.branch.findLast((row) => row.type === "custom" && row.customType === CONTAINER_ENTRY);
-					if (!entry || entry.type !== "custom" || !isDeepStrictEqual(entry.data, { ...reference, toolCallId: callId })) throw new Error("容器执行引用未核实");
+					const entry = saved.branch.findLast((row) => row.type === "custom" && row.customType === EXECUTION_ENTRY);
+					if (!entry || entry.type !== "custom" || !isDeepStrictEqual(entry.data, { ...reference, toolCallId: callId })) throw new Error("本机执行引用未核实");
 					saved.requireEntry(entry);
 				};
-				container = createContainerOperations({ ...commandScope, beforeCreate: (reference) => beforeCommand!(reference, commandId!, "bash") });
+				local = createLocalOperations(prepared.workspace.cwdPath, (reference) => beforeCommand!(reference, commandId!, "bash"));
 			}
-			if (grant.validation) validation = await createValidationRun({ workspace: prepared.workspace, image: grant.container!.image,
-				readPaths: grant.container!.inputs, writePaths: grant.paths, protectedPaths }, grant.validation.commands, grant.validation.before);
+			if (grant.validation) validation = await createValidationRun(commandScope, grant.validation.commands, grant.validation.before);
 			tools = createDevelopmentFileTools({ ...prepared, lease, paths: grant.paths, signal: lifetime.signal,
 				authorize: async () => {
 					if (stopped || ctx.sessionManager.getSessionId() !== owner.sessionId || ctx.sessionManager.getSessionFile() !== sessionFile) throw new Error("子 writer 生命周期已变化");
@@ -105,8 +104,7 @@ export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 		},
 		async execute(kind: "edit" | "write" | "bash", id: string, input: EditToolInput | WriteToolInput | BashToolInput, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
 			if (!tools || stopped) throw new Error("本子会话未取得已授权 writer，未执行文件变更");
-			if (active || structured?.active || structured?.cleanupFailed || container?.cleanupFailed) throw new Error("子 writer 尚有执行或容器收尾未知，未开始新操作");
-			if (kind === "bash" && !container) throw new Error("本次实施未批准容器命令，不执行宿主 Shell");
+			if (active || structured?.active || structured?.cleanupFailed || local?.active) throw new Error("子 writer 尚有执行或收尾未知，未开始新操作");
 			if (validation && kind !== "bash") throw new Error("固定候选验收不提供文件编辑权限，修改后须重新形成候选");
 			executed = true;
 			active++;
@@ -114,35 +112,35 @@ export function createChildDevelopment(pi: Pick<ExtensionAPI, "appendEntry">) {
 				if (kind === "bash") {
 					commandId = id;
 					const operation = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
-					const invoke = () => createBashTool(prepared!.workspace.cwdPath, { operations: container!.operations, exposeSessionEnvironment: false })
+					const invoke = () => createBashTool(prepared!.workspace.cwdPath, { operations: local!.operations, exposeSessionEnvironment: false })
 						.execute(id, input as BashToolInput, operation, update);
-					const result = validation ? await validation.execute(id, input as BashToolInput, invoke, () => container!.lastExecution) : await invoke();
-					return { ...result, details: { ...result.details, container: container!.lastExecution } };
+					const result = validation ? await validation.execute(id, input as BashToolInput, invoke, () => local!.lastExecution) : await invoke();
+					return { ...result, details: { ...result.details, execution: local!.lastExecution } };
 				}
 				return kind === "edit" ? await tools.edit(id, input as EditToolInput, signal) : await tools.write(id, input as WriteToolInput, signal);
 			} finally { commandId = undefined; active--; }
 		},
-		async executeStructured(name: string, id: string, input: any, helper: string, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
-			if (!tools || stopped || !commandScope || !beforeCommand) throw new Error("Structured 子开发需要本轮已交接的 writer 和容器授权");
-			if (active || container?.cleanupFailed || structured?.cleanupFailed) throw new Error("子 writer 尚有原生调用或收尾未知");
-			if (validation && (name !== "exec_command" || input.tty || input.login || input.shell && input.shell !== "/bin/sh"
-				|| input.workdir && path.resolve(prepared!.workspace.cwdPath, input.workdir) !== prepared!.workspace.cwdPath)) throw new Error("固定验收仅使用原工作目录、/bin/sh 与固定命令，不接收补丁、交互或其他 Shell");
-			structured ??= createStructuredCommands({ ...commandScope, hostPaths: true }, beforeCommand);
+		async executeStructured(name: string, id: string, input: any, packageRoot: string, signal?: AbortSignal, update?: (result: AgentToolResult<unknown>) => void) {
+			if (!tools || stopped || !commandScope || !beforeCommand) throw new Error("Structured 子开发需要本轮已交接的 writer");
+			if (active || local?.active || structured?.cleanupFailed) throw new Error("子 writer 尚有原生调用或收尾未知");
+			if (validation && (name !== "exec_command" || input.tty || input.login || input.shell
+				|| input.workdir && path.resolve(prepared!.workspace.cwdPath, input.workdir) !== prepared!.workspace.cwdPath)) throw new Error("固定验收仅使用原工作目录与默认 Shell，不接收补丁、交互或其他 Shell");
+			structured ??= createStructuredCommands(packageRoot, prepared!.workspace.cwdPath, beforeCommand, tools.checkPaths);
 			const operation = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
 			executed = true;
 			active++;
 			try {
-				if (name === "apply_patch") return await structured.patch(id, input.input, helper, operation);
+				if (name === "apply_patch") return await structured.patch(id, input.input, operation);
 				if (name === "write_stdin") return await structured.stdin(input as StdinInput, operation, update);
 				if (name !== "exec_command") throw new Error("未知 Structured 写工具");
 				const invoke = () => structured!.exec(id, input as ExecInput, operation, update, Boolean(validation));
-				return validation ? await validation.execute(id, { command: input.cmd, timeout: 300 }, invoke, () => structured!.lastExecution) : await invoke();
+				return validation ? await validation.execute(id, { command: input.cmd }, invoke, () => structured!.lastExecution) : await invoke();
 			} finally { active--; }
 		},
 		async finish(ctx: ExtensionContext) {
 			stopped = true;
 			lifetime.abort(new Error("子会话正在关闭"));
-			if (!prepared || active || tools?.cleanupFailed || container?.cleanupFailed) throw new Error("子 writer 的执行、容器或句柄清理尚未核实");
+			if (!prepared || active || tools?.cleanupFailed || local?.active) throw new Error("子 writer 的执行或句柄清理尚未核实");
 			const structuredClose = await structured?.finish();
 			const file = ctx.sessionManager.getSessionFile();
 			if (!file) throw new Error("子 Session 文件缺失");
@@ -269,15 +267,14 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 			let validationBefore: CandidateSnapshot | undefined;
 			try {
 				const grant = await approvals.readImplementationApproval(ctx, operation);
-				if (input.environment.structured && name !== REVIEW_TOOL && !grant.container) throw new Error("Structured 开发/验收需要原实施确认中的本地容器镜像与挂载授权");
 				state.approvalId = grant.approvalId;
 				state.designApprovalId = grant.designApprovalId;
 				if (name === VALIDATION_TOOL) {
-					if (!grant.container || !grant.validationCommands.length) throw new Error("固定验收缺少容器授权或验收命令，未运行");
+					if (!grant.validationCommands.length) throw new Error("固定验收缺少验收命令，未运行");
 					validationCommands = [...grant.validationCommands];
 				}
 				const running = executionSignal = AbortSignal.any([operation, grant.signal]);
-				for (const toolName of name === REVIEW_TOOL || input.environment.structured ? [] : ["edit", "write", ...(grant.container ? ["bash"] : [])]) {
+				for (const toolName of name === REVIEW_TOOL || input.environment.structured ? [] : ["edit", "write", "bash"]) {
 					if (pi.getAllTools().find((tool) => tool.name === toolName)?.sourceInfo.source !== "builtin") throw new Error(`任务所需 ${toolName} 已被覆盖，当前受控开发路径不能重建该实现，未委派`);
 				}
 				const records = await nativeEntries(state, ctx);
@@ -299,9 +296,9 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				state.owner = { ...acquired.record.owner };
 				const parent = state.parent = { ...state.owner };
 				if (name === REVIEW_TOOL) {
-					if (!validated?.validation?.after || !grant.container || validated.approvalId !== grant.approvalId || validated.designApprovalId !== grant.designApprovalId) throw new Error("没有本轮已交回 writer 的可信验收，不开始候选审查");
+					if (!validated?.validation?.after || validated.approvalId !== grant.approvalId || validated.designApprovalId !== grant.designApprovalId) throw new Error("没有本轮已交回 writer 的可信验收，不开始候选审查");
 					const validation = validated;
-					const scope = { workspace: grant.workspace, image: grant.container.image, readPaths: grant.container.inputs,
+					const scope = { workspace: grant.workspace, readPaths: grant.inputs,
 						writePaths: grant.paths, protectedPaths: [...grant.planningPaths, sessionFile, path.dirname(stateRoot)] };
 					let candidate: CandidateSnapshot;
 					try {
@@ -312,7 +309,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					const artifact = await prepareReview(scope, candidate);
 					const result = await delegateReadOnly({ ...input, readPaths: [...(input.readPaths ?? []), artifact.directory, validation.child!.sessionFile!], task: `独立候选代码审查。对照原始目标和批准要求读取当前代码、实际差异与原始验收记录，不只看实现者总结。发现由父会话裁决，不批准、不修改或继续委派。\n`
 						+ `已批准方案：\n${grant.designBody}\n\n已批准实施计划：\n${grant.implementationBody}\n\n候选：${candidate.digest}\n`
-						+ `代码路径：${JSON.stringify(grant.paths)}\n只读输入：${JSON.stringify(grant.container.inputs)}\n固定验收命令：${JSON.stringify(grant.validationCommands)}\n`
+						+ `代码路径：${JSON.stringify(grant.paths)}\n额外验收输入：${JSON.stringify(grant.inputs)}\n固定验收命令：${JSON.stringify(grant.validationCommands)}\n`
 						+ `审查证据：${JSON.stringify({ reviewDirectory: artifact.directory, diffFile: artifact.diffFile, validationSessionFile: validation.child!.sessionFile })}\n`
 						+ `差异基线：${artifact.baseHead ?? "无 HEAD，空基线"}；before/after 为原始 Git blob/当前文件副本。差异覆盖全部可写候选和 Git 常规列出的输入，忽略的只读依赖按原路径核对。\n重点：${input.task}` }, running,
 						(data) => {
@@ -333,8 +330,8 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					state.reviewValidation = validation;
 					state.review = { result, artifact, candidate };
 				} else {
-					if (validationCommands) validationBefore = await captureCandidate({ workspace: grant.workspace, image: grant.container!.image,
-						readPaths: grant.container!.inputs, writePaths: grant.paths, protectedPaths: [...grant.planningPaths, sessionFile, path.dirname(stateRoot)] }, validationCommands, running);
+					if (validationCommands) validationBefore = await captureCandidate({ workspace: grant.workspace,
+						readPaths: grant.inputs, writePaths: grant.paths, protectedPaths: [...grant.planningPaths, sessionFile, path.dirname(stateRoot)] }, validationCommands, running);
 					const rpc = state.rpc = await startChild(input, "development");
 					const interrupt = new AbortController();
 					const childSignal = AbortSignal.any([running, interrupt.signal]);
@@ -345,7 +342,12 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					};
 					const { state: child, data } = await readyChild(rpc, input, childSignal, (value) => { state.child = value; });
 					progress.agent({ provider: child.model!.provider, id: child.model!.id, thinking: child.thinkingLevel, reason: input.selectionReason });
-					for (const [name, parameters] of input.environment.structured ? [] : [["edit", createEditTool(".").parameters], ["write", createWriteTool(".").parameters], ["bash", createBashTool(".").parameters]] as const) {
+					const expectedTools = input.environment.structured ? ["exec_command", "write_stdin", "apply_patch"].map((name) => {
+						const tool = pi.getAllTools().find((tool) => tool.name === name);
+						if (tool?.sourceInfo.path !== input.environment.structured!.entry) throw new Error(`Structured ${name} 的原实现已变化`);
+						return [name, tool.parameters] as const;
+					}) : [["edit", createEditTool(".").parameters], ["write", createWriteTool(".").parameters], ["bash", createBashTool(".").parameters]] as const;
+					for (const [name, parameters] of expectedTools) {
 						const tool = data.developmentTools?.find((item: any) => item.name === name);
 						if (tool?.sourceInfo?.path !== input.entryPath || !isDeepStrictEqual(tool.parameters, snapshot(parameters))) throw new Error(`子 ${name} 实现来源或参数未核实`);
 					}
@@ -358,7 +360,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					}, childSignal);
 					state.owner = childOwner;
 					await rpc.control(CHILD_ARM, input.entryPath, childSignal, JSON.stringify({ lease: state.lease, owner: state.owner!, parent,
-						paths: grant.paths, protectedPaths: [...grant.planningPaths, sessionFile], ...(grant.container ? { container: grant.container } : {}),
+						paths: grant.paths, inputs: grant.inputs, protectedPaths: [...grant.planningPaths, sessionFile],
 						...(validationCommands ? { validation: { commands: validationCommands, before: validationBefore! } } : {}) } satisfies ChildGrant));
 					pi.appendEntry(DEVELOPMENT_ENTRY, { id: input.id, phase: "started", lease: state.lease, childSessionFile: child.sessionFile,
 						approvalId: grant.approvalId, designApprovalId: grant.designApprovalId, agent: progress.snapshot().agent });
@@ -366,8 +368,8 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					progress.phase("运行中", "子任务已接收 writer", child.sessionFile);
 					await Promise.all([rpc.waitSettled(childSignal), rpc.request({ type: "prompt", message:
 						(validationCommands ? `固定候选验收。严格按下列固定验收命令顺序逐条调用 ${input.environment.structured ? "exec_command" : "bash"}，不替换命令、不编辑文件，失败后停止。验收调用等待真实退出，不使用 tty/write_stdin。不得用文字或手工模拟结果代替执行。\n`
-							: "开发子任务。只使用已交接的工具，不修改父规划文档，不执行宿主 Shell，不继续委派。\n")
-						+ (grant.container ? `已批准容器 /bin/sh 命令，镜像 ${grant.container.image}；额外只读输入 ${JSON.stringify(grant.container.inputs)}；可写挂载 ${JSON.stringify(grant.paths)}。容器工作目录为 ${input.environment.structured ? input.cwd : path.posix.join("/workspace", path.relative(grant.workspace.workspacePath, input.cwd).split(path.sep).join("/"))}，${input.environment.structured ? "挂载使用原绝对路径" : "宿主绝对路径在容器内无效"}，不继承宿主 Shell 配置。\n` : "本次没有容器命令权限。\n")
+							: "开发子任务。只使用已交接的工具，不修改父规划文档，不继续委派。\n")
+						+ `本机开发，工作目录 ${input.cwd}，使用本机已有工具链与当前用户权限。遵守已批准范围，不擅自安装依赖、访问外部系统或留下后台服务；Shell 不提供路径或网络隔离。额外验收输入 ${JSON.stringify(grant.inputs)}。\n`
 						+ `\n已批准开发路径：${JSON.stringify(grant.paths)}\n固定验收命令：${JSON.stringify(grant.validationCommands)}\n`
 						+ `\n已批准方案：\n${grant.designBody}\n\n已批准实施计划：\n${grant.implementationBody}\n\n本次任务：\n${input.task}` }, childSignal)]);
 					if (validationCommands && rpc.toolError) throw new Error("固定验收存在工具失败，请核对原生记录");

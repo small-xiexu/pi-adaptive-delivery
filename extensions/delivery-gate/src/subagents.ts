@@ -298,7 +298,9 @@ export interface ChildTask {
 export async function startChild(input: ChildTask, kind: "readonly" | "development"): Promise<ChildRpc> {
 	const tools = input.environment.tools.map((tool) => tool.name);
 	if (!tools.length) throw new Error("没有已启用的原生只读工具，未启动子 Pi");
-	if (kind === "development" && !input.environment.structured) tools.push("edit", "write", "bash");
+	// Structured 只读子也需加载原工具定义以核实来源；实际调用仍由角色门禁拒绝命令与补丁。
+	if (input.environment.structured) tools.push("exec_command", "write_stdin", "apply_patch");
+	else if (kind === "development") tools.push("edit", "write", "bash");
 	const { workspacePath } = await resolveWorkspaceIdentity(input.cwd);
 	const outside = (file: string) => {
 		const relative = path.relative(workspacePath, file);
@@ -326,6 +328,7 @@ export async function startChild(input: ChildTask, kind: "readonly" | "developme
 		"--provider", input.model.provider, "--model", input.model.id, "--thinking", input.thinking,
 		"--tools", tools.join(","), input.projectTrusted ? "--approve" : "--no-approve",
 	], { cwd: input.cwd, env: { ...process.env, [CHILD_ENV]: kind === "development" ? "development" : "1",
+		PI_ADAPTIVE_DELIVERY_STRUCTURED: input.environment.structured ? "1" : "",
 		PI_ADAPTIVE_DELIVERY_READ_PATHS: JSON.stringify(input.readPaths ?? []) }, stdio: ["pipe", "pipe", "pipe"] }));
 }
 
@@ -358,8 +361,6 @@ export function parseReadOnlySession(content: string, sessionId: string, pid: nu
 		|| rows.slice(rows.indexOf(exits[0]) + 1).some((row) => row.type === "message")) {
 		throw new Error("只读子 Session 的唯一持久关闭记录、归属或关闭后消息不符");
 	}
-	const structured = exits[0].data?.structured;
-	if (structured !== undefined && (structured.clean !== true || typeof structured.incomplete !== "boolean")) throw new Error("Structured 只读容器的持久清理证明未核实");
 	return rows;
 }
 
@@ -412,10 +413,6 @@ export async function delegateReadOnly(
 		try {
 			const rows = parseReadOnlySession(await readFile(state.sessionFile, "utf8"), state.sessionId, rpc.process.pid!);
 			recordedClose = true;
-			if (input.environment.structured) {
-				const cleanup = rows.find((row) => row.customType === CHILD_EXIT)?.data?.structured;
-				if (cleanup?.clean !== true || cleanup.incomplete !== false) throw new Error("Structured 子命令未完整交回或清理未核实");
-			}
 			// 最终正文只从已关闭进程的原生记录取得，不把 RPC 内存读回当成落盘证明。
 			const last = rows.findLast((row) => row.type === "message" && row.message?.role === "assistant")?.message;
 			if (last?.stopReason !== "stop") throw new Error("子任务没有正常完成的持久模型终态");

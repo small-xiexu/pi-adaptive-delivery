@@ -5,7 +5,7 @@ import { DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./parent-writer.ts";
 import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
 import { GIT_STATUS_TOOL } from "./workspace.ts";
 
-export const CAPABILITY_NOTICE = "当前支持原生工具或已核实的 Structured 工具、父 TUI 默认 Markdown 编辑与受控子开发、本地禁网容器命令、固定候选验收及独立只读审查。父使用专用文档工具，普通子仅可只读；AI 源码开发和命令须方案及实施确认，AI 宿主 Shell 关闭。用户在父 TUI 手动输入的 !/!! 沿用 Pi 原生行为，不授予 AI 权限或替代固定验收。旧批准和验收不自动恢复；当前任务的权限与完成情况仍须按实际工具和证据核实。";
+export const CAPABILITY_NOTICE = "交付已启用：父会话负责讨论、Markdown 和委派；开发须方案及实施确认与 writer 交接，原生或已核实 Structured 命令在本机执行。文件工具检查路径，Shell 使用当前用户权限，不提供文件、网络或后台进程隔离。讨论与独立审查仅提供读取工具。用户在父 TUI 手动 !/!! 沿用 Pi 原生行为，不授予 AI 权限或替代固定验收。旧批准和验收不自动恢复，完成结论须有当前候选证据。";
 const NATIVE_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 export function allowedReadTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">): string[] {
