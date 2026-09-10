@@ -135,16 +135,40 @@ test("Structured 加载顺序未接管时明确拒绝，不执行原插件宿主
 	await assert.rejects(access(path.join(f.cwd, "forbidden.txt")), { code: "ENOENT" });
 });
 
-async function development(t: TestContext, scenario = "normal") {
+async function development(t: TestContext, scenario = "normal", withPlanning = true) {
 	const h = await createDevelopmentHost(t, `structured-${scenario}`, undefined, (fixture) => configure(fixture));
 	await auditResources(t, h);
 	await mkdir(path.join(h.cwd, "src"));
 	await mkdir(path.join(h.cwd, "inputs"));
 	await writeFile(path.join(h.cwd, "inputs/check.py"), 'from pathlib import Path\nassert Path("src/value.js").read_text() == "export const value = 2;\\n"\nprint("STRUCTURED_REAL_CHECK_OK")\n');
-	await h.prepare();
+	if (withPlanning) await h.prepare();
+	else assert.equal((await h.approve("design", [])).isError, false);
 	assert.equal((await h.approve("implementation", ["src"], { image: "python:3.12-slim", inputs: ["inputs"] }, ["python inputs/check.py"])).isError, false);
 	return h;
 }
+
+test("无规划文档的 Structured 完成两次确认、补丁开发、真实验收和审查", { timeout: 90_000 }, async (t) => {
+	const h = await development(t, "normal", false), before = await readdir(h.cwd);
+	const developed = await h.call("delivery_develop", { task: "局部修改 value 为 2，不新建规划文件" });
+	assert.equal(developed.isError, false, JSON.stringify(developed));
+	const validated = await h.call("delivery_validate", {});
+	assert.equal(validated.isError, false, JSON.stringify(validated));
+	const proof = (validated.details as any).validation;
+	assert.equal(proof.before.digest, proof.after.digest);
+	assert.deepEqual(proof.results.map((row: any) => [row.status, row.exitCode]), [["passed", 0]]);
+	const reviewed = await h.call("delivery_review", { task: "根据原批准正文、实际差异和原始验收独立核对" });
+	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
+	assert.equal((reviewed.details as any).candidate.digest, proof.after.digest);
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 2);
+	assert.deepEqual(await readdir(h.cwd), before);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
+	const events = await h.audit();
+	for (const result of [developed, validated, reviewed]) {
+		assert.match(JSON.stringify(events.find((row) => row.pid === (result.details as any).pid && row.phase === "model")?.messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
+	}
+	assertEnhancements(events);
+});
 
 test("真实 Structured 完成独立批准、补丁开发、自检、固定验收、审查和父文档交接", { timeout: 90_000 }, async (t) => {
 	const h = await development(t);

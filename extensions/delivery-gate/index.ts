@@ -130,7 +130,7 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。`
 				+ (childDevelopment ? "\n开发子会话只使用已交接的文件/容器工具，不修改父规划文档、不执行宿主 Shell、不批准或继续委派。"
-					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n任务所需 Markdown 编辑默认允许，直接使用父文档工具，不申请单独文档授权；先读取现场并保留用户内容。每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择 agent 配置；delivery_models 查询可用模型，不统计费用。"),
+					: child ? "\n子会话只能只读，不提供批准或文档编辑。" : "\n简单明确、可一次完成并验证的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和验收，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择 agent 配置；delivery_models 查询可用模型，不统计费用。"),
 		};
 	});
 	if (child) {

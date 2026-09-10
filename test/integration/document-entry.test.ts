@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,7 +93,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		setSelect: (callback: typeof select) => { select = callback; } };
 }
 
-const reviewCall = (body: string): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: { stage: "design", body, paths: ["plan.md"], validationCommands: [] } });
+const reviewCall = (body: string, paths = ["plan.md"]): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: { stage: "design", body, paths, validationCommands: [] } });
 const editCall = (oldText: string, newText: string): ToolCall => ({ type: "toolCall", id: randomUUID(), name: documentEdit, arguments: { path: "plan.md", edits: [{ oldText, newText }] } });
 const readCall = (): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "read", arguments: { path: "plan.md" } });
 
@@ -123,6 +123,41 @@ test("真实 SDK 在同一模型回合接收两轮意见、修订同一方案并
 	for (const text of ["改为 V2，保留用户段落", "再调整为 V3"]) assert.ok(h.contexts.some((messages) => messages.some((message) => message.role === "toolResult" && (message.details as any)?.feedback === text)));
 	assert.ok(!rows.some((row) => row.message?.toolName === "delivery_develop" || row.data?.stage === "implementation"));
 	assert.equal(h.notices.length, 0);
+});
+
+test("无规划文档的真实 SDK 方案反馈、暂停和重载恢复仅使用会话正文", async (t) => {
+	const h = await host(t), files = await readdir(h.cwd);
+	const suggestions = ["保留原接口，只调整参数值"];
+	h.setFeedback(() => suggestions.shift());
+	h.setSelect(async (_title, items) => items.at(-1));
+	h.setFollowups([[reviewCall("V2：保留接口，只修参数", [])]]);
+	const first = await h.call("delivery_approval", reviewCall("V1：局部参数修改", []).arguments);
+	assert.equal(first.isError, false, JSON.stringify(first));
+	assert.equal((first.details as any).feedback, "保留原接口，只调整参数值");
+	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length, 0);
+	await h.session.reload();
+	assert.equal((await h.approve("implementation", ["src"])).isError, true);
+	h.setSelect(async (_title, items) => items[0]);
+	const resumed = reviewCall("V3：核对现场后修正参数，接口保持", []);
+	h.setFollowups([[resumed]]);
+	await h.session.prompt("/delivery-resume");
+	for (let i = 0; i < 100 && !h.sm.getBranch().some((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === resumed.id); i++) await setTimeout(20);
+	await h.session.agent.waitForIdle();
+	const result = h.sm.getBranch().find((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === resumed.id);
+	assert.ok(result?.type === "message" && result.message.role === "toolResult", JSON.stringify(h.notices));
+	assert.equal(result.message.isError, false);
+	assert.equal((result.message.details as any).approved, true);
+	assert.equal((await h.approve("implementation", ["src"])).isError, false);
+	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	const designs = rows.filter((row) => row.customType === "delivery-approval-proposal" && row.data.stage === "design");
+	assert.deepEqual(designs.map((row) => row.data.paths), [[], [], []]);
+	const approved = rows.filter((row) => row.customType === "delivery-approval");
+	assert.equal(approved.length, 2);
+	assert.equal(approved[0].data.proposalId, designs[2].data.id);
+	assert.ok(h.contexts.some((messages) => messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes("V2：保留接口，只修参数"))));
+	assert.ok(!rows.some((row) => ["read", documentWrite, documentEdit].includes(row.message?.toolName)));
+	assert.deepEqual(await readdir(h.cwd), files);
+	assert.equal(await h.readLease(), undefined);
 });
 
 for (const mode of ["language", "command", "reload", "reopen"]) test(`真实 SDK 暂停后 ${mode} 读取用户最新文件，用新提案恢复审阅`, async (t) => {

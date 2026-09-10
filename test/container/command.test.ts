@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { appendFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout } from "node:timers/promises";
@@ -123,11 +123,12 @@ ${kind === "background" ? 'setTimeout(() => {}, 150);' : 'setInterval(() => {}, 
 	assert.equal(after, before);
 });
 
-async function developmentHost(t: TestContext, scenario: string, script: string, commands: string[] = []) {
+async function developmentHost(t: TestContext, scenario: string, script: string, commands: string[] = [], withPlanning = true) {
 	const h = await createDevelopmentHost(t, `container-${scenario}`);
 	await mkdir(path.join(h.cwd, "inputs"));
 	await writeFile(path.join(h.cwd, "inputs/command.cjs"), script);
-	await h.prepare();
+	if (withPlanning) await h.prepare();
+	else assert.equal((await h.approve("design", [])).isError, false);
 	assert.equal((await h.approve("implementation", ["src"], { image: "node:22-alpine", inputs: ["inputs"] }, commands)).isError, false);
 	const children = async () => {
 		const entries = h.sm.getEntries().filter((entry): entry is CustomEntry => entry.type === "custom" && entry.customType === "delivery-development");
@@ -361,6 +362,32 @@ test("正式固定验收运行完整原清单，绑定稳定候选和真实子�
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: `固定验收通过，候选 ${proof.after.digest}；独立审查待实施。\n` })).isError, false);
 	assert.equal(h.choices.length, 3);
+});
+
+test("无规划文档的原生 Pi 完成开发、真实容器验收与独立审查", { timeout: 60_000 }, async (t) => {
+	const h = await developmentHost(t, "review-normal", `const assert = require("node:assert/strict");
+assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");
+console.log("NO_PLANNING_FILES_CHECK_OK");`, ["node inputs/command.cjs"], false);
+	const before = await readdir(h.cwd);
+	const developed = await h.call("delivery_develop", { task: "局部修正 value，直接在会话交付" });
+	assert.equal(developed.isError, false, JSON.stringify(developed));
+	const validated = await h.call("delivery_validate", {});
+	assert.equal(validated.isError, false, JSON.stringify(validated));
+	const proof = (validated.details as any).validation;
+	assert.equal(proof.before.digest, proof.after.digest);
+	assert.deepEqual(proof.results.map((row: any) => [row.status, row.exitCode]), [["passed", 0]]);
+	const reviewed = await h.call("delivery_review", { task: "对照会话中的原批准、源码差异与原验收" });
+	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
+	assert.equal((reviewed.details as any).candidate.digest, proof.after.digest);
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 2);
+	assert.deepEqual((await readdir(h.cwd)).sort(), [...before, "src"].sort());
+	const requests = (await h.audit()).filter((row) => row.child && row.phase === "model");
+	for (const result of [developed, validated, reviewed]) {
+		const pid = (result.details as any).pid;
+		assert.match(JSON.stringify(requests.find((row) => row.pid === pid)?.messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
+		assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+	}
 });
 
 test("独立审查读取原目标、代码、真实差异与原始验收记录，父裁决后原授权返工/复验/回写", { timeout: 90_000 }, async (t) => {

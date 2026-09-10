@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, copyFile, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, readdir, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -65,6 +65,61 @@ test("仅方案与实施两次确认，规划文档冻结为保护路径，文�
 	assert.equal(rows.filter((row) => row.customType === APPROVAL_ENTRY).length, 2);
 	assert.equal(rows.find((row) => row.customType === PROPOSAL_ENTRY).data.body, design.body);
 	assert.deepEqual(h.displayed.map((row) => row.options.at(-1)), ["稍后再看", "暂不批准"]);
+});
+
+test("无规划文档的简单任务保留两次确认与持久正文，实施路径仍须非空", async () => {
+	const h = await host(), files = await readdir(h.cwd);
+	await assert.rejects(h.run(implementation), /尚无可信方案确认/);
+	const first = await h.run({ ...design, paths: [] });
+	await assert.rejects(h.readImplementation(), /本轮没有/);
+	await assert.rejects(h.run({ ...implementation, paths: [] }), /实施须列明开发路径/);
+	const second = await h.run(implementation), grant = await h.readImplementation();
+	assert.equal(grant.designApprovalId, first.details.approvalId);
+	assert.equal(grant.approvalId, second.details.approvalId);
+	assert.deepEqual(grant.planningPaths, []);
+	assert.deepEqual(grant.paths, implementation.paths.map((file) => path.join(h.cwd, file)));
+	assert.equal(grant.designBody, design.body);
+	assert.equal(grant.implementationBody, implementation.body);
+	assert.deepEqual(await readdir(h.cwd), files, "批准不创建规划文件或目录");
+	const rows = await h.disk();
+	assert.deepEqual(rows.filter((row) => row.customType === PROPOSAL_ENTRY).map((row) => row.data.body), [design.body, implementation.body]);
+	assert.equal(rows.filter((row) => row.customType === APPROVAL_ENTRY).length, 2);
+	assert.equal(h.displayed.length, 2);
+});
+
+test("无规划文档方案的反馈与暂停恢复直接修订会话正文，不生成批准", async () => {
+	const h = await host(), request = { ...design, paths: [] };
+	h.ctx.ui.custom = approvalUI(async () => undefined, () => "保持原接口，只修参数值");
+	const feedback = await h.run(request);
+	assert.equal(feedback.details.approved, false);
+	assert.equal(feedback.terminate, undefined);
+	assert.match(JSON.stringify(feedback.content), /会话.*修订/s);
+	h.ctx.ui.custom = approvalUI(async () => undefined);
+	const paused = await h.run({ ...request, body: "修订后的局部方案" });
+	assert.equal(paused.terminate, true);
+	await h.event("session_start");
+	await h.resume();
+	assert.equal(h.messages.length, 1);
+	assert.match(h.messages[0]!, /修订后的局部方案/);
+	assert.match(h.messages[0]!, /会话.*正文/s);
+	assert.doesNotMatch(h.messages[0]!, /先读取.*最新方案文件/);
+	assert.equal(h.entries(APPROVAL_ENTRY).length, 0);
+	await assert.rejects(h.run(implementation), /尚无可信方案确认/);
+});
+
+for (const change of ["reload", "tamper"]) test(`无规划文档批准 ${change} 后仍关闭旧权限`, async () => {
+	const h = await host();
+	await h.run({ ...design, paths: [] }); await h.run(implementation);
+	const grant = await h.readImplementation();
+	if (change === "reload") await h.event("session_start");
+	else {
+		const rows = await h.disk(), row = rows.find((row) => row.customType === PROPOSAL_ENTRY);
+		row.data.body = "未经确认的新方案";
+		const memory = h.sm.getEntry(row.id)!; assert.equal(memory.type, "custom"); memory.data = structuredClone(row.data);
+		await writeFile(h.sm.getSessionFile()!, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+	}
+	await assert.rejects(h.readImplementation());
+	assert.equal(grant.signal.aborted, true);
 });
 
 test("方案意见继续模型、不生成批准，新提案撤销旧实施引用，最后只确认修订正文", async () => {
@@ -155,7 +210,7 @@ for (const mode of ["rpc", "json", "print", undefined]) test(`非 TUI ${mode} �
 
 test("方案路径须为 worktree 内确切 Markdown，命令及容器只在实施阶段申请", async () => {
 	const h = await host();
-	for (const request of [{ ...design, paths: [] }, { ...design, paths: ["src"] }, { ...design, paths: ["../outside.md"] },
+	for (const request of [{ ...design, paths: ["src"] }, { ...design, paths: ["../outside.md"] },
 		{ ...design, paths: [" "] }, { ...design, body: " " }, { ...design, validationCommands: ["echo x"] },
 		{ ...design, container: { image: "fixture:local", inputs: [] } }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
 	assert.equal(h.displayed.length, 0);

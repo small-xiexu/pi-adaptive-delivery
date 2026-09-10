@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
@@ -97,6 +97,40 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "父核对后记录文件变更，命令验证尚未执行。\n" })).isError, false);
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.choices.length, 2, "文件节点回写不重复请求批准");
+});
+
+test("无规划文档的真实 Pi 开发、固定验收和独立审查沿用会话批准正文", { timeout: 60_000 }, async (t) => {
+	const h = await host(t, "container-review-normal");
+	await installFakeDocker(t, h.root, "normal");
+	await mkdir(path.join(h.cwd, "inputs"));
+	await writeFile(path.join(h.cwd, "inputs/command.cjs"), "fixture validation input\n");
+	const before = await readdir(h.cwd);
+	assert.equal((await h.approve("design", [])).isError, false);
+	assert.equal((await h.call("delivery_develop", { task: "只有方案确认不能开发" })).isError, true);
+	assert.equal((await h.approve("implementation", [])).isError, true);
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.equal((await h.approve("implementation", ["src"], { image: "fixture:local", inputs: ["inputs"] }, ["node inputs/command.cjs"])).isError, false);
+	const developed = await h.call("delivery_develop", { task: "局部修改 value 为 2，不需要规划文件" });
+	assert.equal(developed.isError, false, JSON.stringify(developed));
+	assert.equal((await h.call("delivery_review", { task: "没有固定验收不能审查" })).isError, true);
+	const validated = await h.call("delivery_validate", {});
+	assert.equal(validated.isError, false, JSON.stringify(validated));
+	const reviewed = await h.call("delivery_review", { task: "按原方案、实际差异和验收记录核对结果" });
+	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
+	assert.equal((reviewed.details as any).candidate.digest, (validated.details as any).validation.after.digest);
+	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
+	assert.deepEqual((await readdir(h.cwd)).sort(), [...before, "src"].sort(), "只增加源码目录，无规划文件或目录");
+	assert.equal(await h.readLease(), undefined);
+	assert.equal(h.choices.length, 2);
+	const requests = (await h.audit()).filter((row) => row.child && row.phase === "model");
+	for (const result of [developed, validated, reviewed]) {
+		const pid = (result.details as any).pid;
+		assert.match(JSON.stringify(requests.find((row) => row.pid === pid)?.messages), /APPROVED_DESIGN_BODY.*APPROVED_IMPLEMENTATION_BODY/s);
+		assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+	}
+	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	assert.equal(rows.filter((row) => row.customType === "delivery-approval").length, 2);
+	assert.ok(!rows.some((row) => /^delivery_document_/.test(row.message?.toolName ?? "")));
 });
 
 test("正式固定验收没有批准或命令时不启动子 Pi，不把零项算通过", { timeout: 40_000 }, async (t) => {
@@ -811,15 +845,15 @@ child.unref();`;
 	}
 });
 
-test("正式开发入口缺少实施确认或规划文档边界时不启动子模型", { timeout: 40_000 }, async (t) => {
+test("正式开发入口缺少实施确认或开发范围时不启动子模型", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	const unapproved = await h.call("delivery_develop", { task: "未授权变更" });
 	assert.equal(unapproved.isError, true);
 	assert.match(JSON.stringify(unapproved.content), /子 Session 引用尚未取得/);
 	assert.doesNotMatch(JSON.stringify(unapproved.content), /原始子 Session：|子收尾核验：已取得证明/);
-	assert.equal((await h.approve("design", [])).isError, true);
-	assert.equal((await h.approve("implementation", ["src"])).isError, true);
-	assert.equal((await h.call("delivery_develop", { task: "缺少规划文档边界" })).isError, true);
+	assert.equal((await h.approve("design", [])).isError, false);
+	assert.equal((await h.approve("implementation", [])).isError, true);
+	assert.equal((await h.call("delivery_develop", { task: "缺少有效实施确认" })).isError, true);
 	assert.ok(!(await h.audit()).some((row) => row.child));
 	assert.equal(await h.readLease(), undefined);
 });
