@@ -8,7 +8,7 @@
 
 **进入交付后，查资料、联网、改文件和运行命令仍用 Pi 原来的工具。** 子 Agent 跟随主 Pi 已启用的工具和原有权限检查，这个包不另外禁网，也不按角色删减普通工具。
 
-[完整流程](#完整流程) · [快速开始](#快速开始) · [协作时序](#协作时序) · [命令速查](#命令速查)
+[完整流程](#完整流程) · [快速开始](#快速开始) · [协作时序](#协作时序) · [命令速查](#命令速查) · [开发验证](#开发验证)
 
 ## 完整流程
 
@@ -75,7 +75,7 @@ flowchart TD
 
    也可以先输入 `/delivery-shape`，再直接聊天描述需求。如果 Pi 已经开着，等当前任务结束后用 `/reload` 加载扩展包。
 
-目前验证过的组合是 **macOS、Pi 0.85.1、Node 25.2.1**，其他平台和版本还没验证。使用 `pi-codex-conversion` 的用户，先按 [Structured 接入说明](docs/技术方案.md)（第 14.2 节）配置加载顺序。
+目前验证过的组合是 **macOS、Pi 0.85.1、Node 25.2.1**，其他平台和版本还没验证。使用 `pi-codex-conversion` 的用户，先按[Structured 接入说明](docs/技术方案.md)（第 14.2 节）配置加载顺序。升级 Package 或修改 `.pi/settings.json` 后，如果 Pi 已在运行，等当前任务收尾再用 `/reload`；如果交付任务已结束并要回到普通使用，使用 `/delivery-exit`。
 
 ## 协作时序
 
@@ -122,7 +122,7 @@ sequenceDiagram
 
 ## 命令速查
 
-全部 7 个交付命令都在这里，`status` 的详情用法单独列了一行。`[内容]` 可以省略，输入时不用带方括号。
+8 个交付命令都在这里，`/delivery-status` 的详情用法单独列了一行。`[内容]` 可以省略，输入时不用带方括号。
 
 | 命令 | 做什么 | 什么时候用 |
 |---|---|---|
@@ -150,6 +150,26 @@ sequenceDiagram
 退出交付只表示回到普通使用，不代表任务已经验收通过。
 
 任务完成后，你明确要求提交代码，Pi 会核对差异和验证结果，再用普通工具完成已授权的本地提交，无须为了提交现有改动重走方案和实施确认。工具缺失时先用 `/delivery-exit` 恢复；提交不会自动推送或发布。
+
+## 开发验证
+
+以下命令在本仓库运行，需要先安装项目依赖。默认测试不额外禁网，使用临时 Git、临时 HOME/agent dir、空凭证和 fake provider；不调用真实模型，也不读取用户凭证。
+
+```sh
+npm run typecheck
+npm run test:all
+git diff --check
+```
+
+`test:all` 包含单元、集成和 E2E 测试。使用 `pi-codex-conversion` 时，再按已安装插件的实际路径运行 Structured 专项：
+
+```sh
+node --import tsx test/support/run-tests.ts \
+  --adapter /absolute/path/to/pi-codex-conversion \
+  test/structured/flow.test.ts
+```
+
+测试缺少项目依赖或本机工具时应报告实际错误，不自动安装依赖或跳过场景。验证结果和临时测试制品以[实施计划](docs/实施计划.md)为准；fake provider 和模拟批准只能验证工具链路，不能代表真实模型质量或完整终端体验。
 
 ## 当前边界与进一步阅读
 
