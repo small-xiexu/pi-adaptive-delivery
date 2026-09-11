@@ -61,6 +61,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		const id = randomUUID();
 		await session.prompt(`/fixture-next-tool ${JSON.stringify({ type: "toolCall", id, name, arguments: args })}`);
 		await session.prompt("执行本轮隔离测试");
+		await session.waitForIdle();
 		const row = sm.getBranch().findLast((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id);
 		assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session.messages));
 		return row.message;

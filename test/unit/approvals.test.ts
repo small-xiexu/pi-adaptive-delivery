@@ -20,7 +20,7 @@ async function host(persist = true) {
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
 	const handlers = new Map<string, Function[]>(), renderers = new Map<string, Function>(), commands = new Map<string, any>();
 	let tool: any;
-	const displayed: { title: string; options: string[] }[] = [], notices: string[] = [], messages: string[] = [];
+	const displayed: { title: string; options: string[] }[] = [], notices: string[] = [], messages: string[] = [], continuations: unknown[] = [];
 	const ctx: any = { cwd, mode: "tui", hasUI: true, sessionManager: sm, isIdle: () => true, hasPendingMessages: () => false,
 		ui: { select: async (title: string, options: string[]) => { displayed.push({ title, options }); return options[0]; },
 			notify: (text: string) => { notices.push(text); } } };
@@ -28,7 +28,7 @@ async function host(persist = true) {
 	const pi: any = {
 		on: (name: string, handler: Function) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
 		registerTool: (value: any) => { tool = value; }, registerCommand: (name: string, command: any) => commands.set(name, command),
-		sendUserMessage: (text: string) => messages.push(text), registerEntryRenderer: (name: string, renderer: Function) => renderers.set(name, renderer),
+		sendUserMessage: (text: string) => messages.push(text), sendMessage: (message: unknown, options: unknown) => continuations.push({ message, options }), registerEntryRenderer: (name: string, renderer: Function) => renderers.set(name, renderer),
 		appendEntry: (name: string, data: unknown) => { sm.appendCustomEntry(name, data); },
 	};
 	const approvals = installApprovals(pi as ExtensionAPI);
@@ -36,11 +36,31 @@ async function host(persist = true) {
 	const run = (request: { stage: string; body: string; documentStrategy: string; technicalPlanPath?: string; implementationPlanPath?: string; paths: string[]; validationCommands: string[]; inputs?: string[]; validationRevisionOf?: string } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
-	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages, approvals,
+	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages, continuations, approvals,
 		resume: () => commands.get("delivery-resume").handler("", ctx),
 		readImplementation: (signal?: AbortSignal) => approvals.readImplementationApproval(ctx, signal),
-		event: async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); } };
+		event: async (name: string, payload: unknown = {}) => { for (const handler of handlers.get(name) ?? []) await handler(payload, ctx); } };
 }
+
+test("阶段批准后在 agent settled 时自动衔接下一回合，模型已衔接时不重复发送", async () => {
+	const h = await host();
+	await h.run();
+	await h.event("agent_settled");
+	assert.equal(h.continuations.length, 1);
+	assert.match(JSON.stringify(h.continuations[0]), /implementation/);
+
+	await h.event("tool_call", { toolName: APPROVAL_TOOL, input: { stage: "implementation" } });
+	await h.event("agent_settled");
+	assert.equal(h.continuations.length, 1);
+
+	await h.run(implementation);
+	await h.event("agent_settled");
+	assert.equal(h.continuations.length, 2);
+	assert.match(JSON.stringify(h.continuations[1]), /delivery_develop/);
+	await h.event("tool_call", { toolName: "delivery_develop", input: {} });
+	await h.event("agent_settled");
+	assert.equal(h.continuations.length, 2);
+});
 
 test("仅方案与实施两次确认，规划文档冻结为保护路径，文档内容更新不替换批准", async () => {
 	const h = await host();

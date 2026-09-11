@@ -84,6 +84,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		const id = randomUUID();
 		calls = [{ type: "toolCall", id, name, arguments: args }];
 		await session.prompt("执行本轮测试调用");
+		await session.waitForIdle();
 		const result = sm.getBranch().findLast((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === id);
 		assert.ok(result?.type === "message" && result.message.role === "toolResult", JSON.stringify(session.messages));
 		return result.message;
@@ -138,6 +139,27 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.equal(await readFile(path.join(h.cwd, "normal.txt"), "utf8"), "正常写入");
 	assert.equal(await readFile(path.join(h.cwd, "blocked.txt"), "utf8"), "原工具");
 	assert.equal(h.choices.length, 0);
+});
+
+test("真实 Pi 在方案批准回合结束后自动触发实施准备回合", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	const result = await h.approve("design", []);
+	assert.equal(result.isError, false, JSON.stringify(result));
+	await h.session.waitForIdle();
+	assert.ok(h.contexts.some((messages) => JSON.stringify(messages).includes("当前方案已由用户明确确认")), JSON.stringify(h.contexts));
+	assert.ok(!h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "implementation"));
+});
+
+test("真实 Pi 可沿自动衔接回合提交实施确认", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	h.setFollowups([[{ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: {
+		stage: "implementation", body: "自动衔接生成的实施步骤", documentStrategy: "none", paths: ["src"], inputs: [], validationCommands: [],
+	} }]]);
+	const result = await h.approve("design", []);
+	assert.equal(result.isError, false, JSON.stringify(result));
+	const approvals = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval");
+	assert.equal(approvals.length, 2, JSON.stringify(h.sm.getBranch()));
+	assert.ok(h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "implementation"));
 });
 
 test("显式进入后的 reload 和重开保留交付入口及普通工具，旧批准不恢复", async (t) => {

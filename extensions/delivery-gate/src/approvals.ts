@@ -59,6 +59,8 @@ interface Confirmed {
 	controller: AbortController;
 }
 
+type Continuation = { stage: "design" | "implementation"; approvalId: string };
+
 const titles = { design: "方案确认", implementation: "实施确认" };
 const actions = { design: "确认方案", implementation: "确认实施" };
 const permissions = {
@@ -160,6 +162,22 @@ export function installApprovals(pi: ExtensionAPI) {
 	// 仅保留上一份已确认实施作为命令修订的对照来源，不代表仍有写入权限。
 	let implementationBasis: Confirmed | undefined;
 	let pending: AbortController | undefined;
+	let continuation: Continuation | undefined;
+	const clearContinuation = () => { continuation = undefined; };
+	pi.on("tool_call", (event) => {
+		if (event.toolName === APPROVAL_TOOL || event.toolName === "delivery_develop") clearContinuation();
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		const next = continuation;
+		if (!next) return;
+		clearContinuation();
+		if (ctx.mode !== "tui" || !ctx.hasUI || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		const content = next.stage === "design"
+			? "当前方案已由用户明确确认。请基于已确认方案整理实施步骤、修改范围、固定验收命令和停止条件，并立即调用 delivery_approval 提交 implementation 阶段实施确认；不要修改源码、不要启动子任务，不要把方案批准当作实施批准。"
+			: "当前实施已由用户明确确认。请基于已批准范围立即调用 delivery_develop 委派当前最小可验证节点；不要再次请求相同实施确认，不要扩大修改范围。";
+		pi.sendMessage({ customType: "delivery-continuation", content, display: false, details: { stage: next.stage, approvalId: next.approvalId } },
+			{ deliverAs: "followUp", triggerTurn: true });
+	});
 	const invalidateImplementation = () => {
 		const previous = implementation;
 		implementation = undefined;
@@ -172,6 +190,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		implementationBasis = undefined;
 	};
 	const invalidate = () => {
+		clearContinuation();
 		invalidateDesign();
 		pending?.abort(new Error("会话发生切换、重载或分支导航，批准请求已失效"));
 	};
@@ -359,6 +378,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				const live = { approval, proposal, sessionFile: sessionFile!, controller: new AbortController() };
 				if (proposal.stage === "design") design = live;
 				if (proposal.stage === "implementation") { implementation = live; implementationBasis = live; }
+				continuation = { stage: proposal.stage, approvalId: approval.id };
 				return { content: [{ type: "text", text: `${request.validationRevisionOf ? "验收命令修订" : titles[request.stage]}已记录。${request.stage === "implementation" ? "用户未要求暂停且没有未决问题时，继续在本轮已批准范围和 writer 交接下委派本机开发，无须额外的“继续”。固定验收使用本次命令清单；独立审查仍需当前候选的可信验收。" : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验收说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案或实施计划文件"}，实施仍须独立确认。`}` }],
 					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
 			} catch (error) {
