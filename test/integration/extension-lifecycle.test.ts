@@ -51,13 +51,19 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
 			const running = (await rpc.send("get_entries")).data.entries.findLast((row: any) => row.customType === "delivery-delegation")?.data;
+			const briefCursor = rpc.records.length;
+			await rpc.send("prompt", { message: "/delivery-status" });
+			const brief = rpc.records.slice(briefCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify")?.message;
+			assert.match(brief, /当前阶段：等待方案确认\n下一步：等待当前任务结束，再核对结果。\n当前任务：只读（运行中）/);
+			assert.doesNotMatch(brief, /读取 input.txt|原始子 Session|工作区：|沿用 Pi 的工具/);
+			assert.equal(brief.split("\n").length, 5);
 			const statusCursor = rpc.records.length;
 			await rpc.send("prompt", { message: "/delivery-status details" });
 			const status = rpc.records.slice(statusCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify");
 			assert.ok(status?.message.includes(running.sessionFile));
 			assert.ok(status?.message.includes(running.id));
-			assert.match(status?.message, /运行中.*只读/);
-			assert.match(status?.message, /当前阶段：正在执行：只读/);
+			assert.match(status?.message, /当前阶段：等待方案确认/);
+			assert.match(status?.message, /当前任务：只读（运行中）/);
 			await rpc.send("follow_up", { message: "fixture-must-not-resume" });
 			const cleared = await rpc.send("clear_queue");
 			assert.match(JSON.stringify(cleared), /fixture-must-not-resume/);

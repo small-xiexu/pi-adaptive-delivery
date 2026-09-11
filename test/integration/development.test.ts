@@ -39,7 +39,7 @@ for (const name of ["git", "pi", "node"]) test(`未批准时状态查询和只�
 	await writeFile(path.join(bin, name), `#!/bin/sh\nprintf executed > '${h.cwd}/path-executed'\n${name === "git" ? 'exec /usr/bin/git "$@"' : "exit 0"}\n`, { mode: 0o700 });
 	process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
 	await h.session.prompt("/delivery-status");
-	assert.ok(h.notices.some((notice) => notice.includes("当前没有运行中的子任务")), h.notices.join("\n"));
+	assert.ok(h.notices.some((notice) => notice.includes("当前任务：无")), h.notices.join("\n"));
 	const result = await h.call("delivery_readonly", { task: "读取 input.txt，不提供实施授权" });
 	assert.equal(result.isError, name === "pi", JSON.stringify(result));
 	if (name === "pi") assert.match(JSON.stringify(result), /Pi.*工作区外/);
