@@ -228,6 +228,19 @@ test("首次按需安装即能从卡片打开详情，分支切换更新上下�
 	assert.equal(opened.length, 2);
 });
 
+test("子任务列表显示当前模型和推理级别", async () => {
+	let choice: string | undefined;
+	let command!: (args: string, context: any) => Promise<void>;
+	const pi: any = { on: () => {}, registerCommand: (_name: string, definition: any) => { command = definition.handler; } };
+	const context: any = { mode: "tui", hasUI: true, sessionManager: { getBranch: () => [
+		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "a", name: "delivery_readonly", arguments: { task: "检查当前仓库" } }] } },
+		{ type: "custom", customType: "delivery-delegation", data: { id: "a", agent: { provider: "openai", id: "gpt-6-astra", thinking: "high", reason: "复杂度高" } } },
+	] }, ui: { select: async (_title: string, choices: string[]) => { choice = choices[0]; return undefined; }, notify() {}, custom: async () => {} } };
+	installTaskDetails(pi, () => [], context);
+	await command("", context);
+	assert.match(choice!, /模型：gpt-6-astra · 推理：high/);
+});
+
 test("详情复用原生分支与长 Session，保留完整调用/结果、末行提示且排除 thinking", async () => {
 	const readTaskRecord = createTaskRecordReader();
 	const root = await mkdtemp(path.join(os.tmpdir(), "delivery-detail-"));

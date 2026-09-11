@@ -202,23 +202,22 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const stateRoot = await getWriterStateRoot(workspace);
 				const lease = await new WriterLeaseManager(stateRoot).read(workspace.key);
 				const running = tasks();
-				const inherited = inheritedTools(pi, entryPath).map((tool) => tool.name);
-				const structuredMode = Boolean(structured);
+				const diagnostic = args.trim() === "details";
+				const inherited = diagnostic ? inheritedTools(pi, entryPath).map((tool) => tool.name) : [];
 				const executing = running.filter((task) => !task.endedAt);
 				let stage = approvals.confirmedStage === "implementation" ? "实施已确认" : approvals.confirmedStage === "design" ? "等待实施确认" : "等待方案确认";
 				let next = approvals.confirmedStage === "implementation" ? "核对已完成工作，按需继续开发、固定验收或独立审查。"
-					: approvals.confirmedStage === "design" ? "整理修改范围和验收命令，再确认实施。" : "继续讨论或修订方案，准备好后确认方案。";
+					: approvals.confirmedStage === "design" ? "整理修改范围和验收命令，再确认实施。" : "形成方案后调用 delivery_approval 提交确认；若上一轮模型请求中断，复用当前正文继续，不要开发。";
 				if (approvals.pending) next = "处理当前审阅；可以确认、提出意见或暂停。";
 				if (executing.length) { stage = `正在执行：${executing.map((task) => task.name).join("；")}`; next = "用 /delivery-tasks 查看实时输出，等待任务结束。"; }
 				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，再继续下一步。"; }
 				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "用 /delivery-status details 定位原执行，核实结果后再继续；不自动解锁。"; }
-				ctx.ui.notify(`交付状态 · ${structuredMode ? "Structured" : "原生 Pi"}\n当前阶段：${stage}\n下一步：${next}\n工作区：${workspace.workspacePath}`
-					+ `\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。`
+				ctx.ui.notify(`交付状态\n当前阶段：${stage}\n下一步：${next}`
 					+ (running.length ? running.map((task) => `\n${task.status} · ${task.name}\n${task.action}`).join("") : "\n当前没有运行中的子任务。")
 					+ (writer.pending || developer.pending ? "\n文件操作尚在执行或收尾，请等待交回。" : "")
 					+ (lease && !writer.pending && !developer.pending ? "\n需要处理：现场有未交回的写入记录；核实原执行前暂停写入，不自动解锁。" : "")
 					+ "\n/delivery-tasks 查看任务详情；/delivery-status details 查看诊断。"
-					+ (args.trim() === "details" ? `\n\n${CAPABILITY_NOTICE}\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
+					+ (diagnostic ? `\n\n${CAPABILITY_NOTICE}\n工作区：${workspace.workspacePath}\n运行模式：${structured ? "Structured" : "原生 Pi"}\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
 						+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("") : ""), "info");
 			} catch (error) {
 				ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");

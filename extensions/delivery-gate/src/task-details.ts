@@ -254,7 +254,7 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[],
 		const tasks = taskDetails(ctx, live()).reverse();
 		if (!id) {
 			if (!tasks.length) { ctx.ui.notify("当前会话还没有交付子任务。", "info"); return; }
-			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `交付 ${task.batch} · ` : "独立调用 · "}${displayText(task.label)}${task.attempt ? `第${task.attempt}次` : ""} · ${displayText(task.status)} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
+			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `交付 ${task.batch} · ` : "独立调用 · "}${displayText(task.label)}${task.attempt ? `第${task.attempt}次` : ""} · ${displayText(task.status)}${task.agent ? ` · 模型：${displayText(task.agent.id)} · 推理：${displayText(task.agent.thinking)}` : ""} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
 			const controller = new AbortController();
 			close = () => controller.abort();
 			let selected: string | undefined;

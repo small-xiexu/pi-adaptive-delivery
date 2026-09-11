@@ -11,7 +11,7 @@ test("项目显式启用查找工具后，真实父子保留 read/grep/find/ls �
 	const fixture = await createPiFixture(source, "readonly-search");
 	const { rpc } = fixture;
 	t.after(() => rpc.stop());
-	await rpc.send("prompt", { message: "/delivery-status" });
+	await rpc.send("prompt", { message: "/delivery-status details" });
 	const status = rpc.records.find((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes("沿用 Pi 的工具"));
 	for (const name of ["read", "grep", "find", "ls"]) assert.ok(status?.message.includes(name));
 	assert.ok(!status?.message.includes("defaultTools"), "已经启用查找工具时不再提示配置");

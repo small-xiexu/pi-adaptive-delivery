@@ -113,7 +113,7 @@ test("状态查询展示确认阶段及下一步，查询不调用模型、不�
 	};
 	assert.match(await status(), /交付未启用/);
 	await h.session.prompt("/delivery-shape");
-	assert.match(await status(), /当前阶段：等待方案确认\n下一步：继续讨论/);
+	assert.match(await status(), /当前阶段：等待方案确认\n下一步：形成方案后调用 delivery_approval/);
 	await h.approve("design", []);
 	assert.match(await status(), /当前阶段：等待实施确认\n下一步：整理修改范围/);
 	await h.approve("implementation", ["src"]);
@@ -421,7 +421,7 @@ test("真实 Pi 独立审查在 Git replace 存在时仍收到真实修改差异
 for (const kind of ["source", "input", "approval"]) test(`独立审查 ${kind} 变化使旧验收失效，重新验收后才可继续`, { timeout: 60_000 }, async (t) => {
 	const h = await reviewHost(t);
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
-	if (kind === "approval") await h.approve("implementation", ["src"], h.inputs, h.commands);
+	if (kind === "approval") await h.approve("implementation", ["src"], h.inputs, h.commands, undefined, "APPROVED_IMPLEMENTATION_BODY_CHANGED");
 	else await writeFile(path.join(h.cwd, kind === "source" ? "src/value.js" : "inputs/test.js"), "changed candidate\n");
 	assert.equal((await h.call("delivery_review", { task: "不能沿用旧证据" })).isError, true);
 	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, 1);
