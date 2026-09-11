@@ -194,6 +194,11 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					{ name: "fetch_content", arguments: { url: "https://example.invalid/docs" } },
 					{ name: "plugin_echo", arguments: {} },
 					{ name: "web_search", arguments: { query: "blocked" } },
+				] : isChild() && !validationChild && taskText.includes("fixture-process-notes") ? [
+					{ name: "bash", arguments: { command: "rg -n 'ABSENT_FIXTURE_PATTERN' input.txt" } },
+					{ name: "bash", arguments: { command: "node -e 'require(\"node:assert/strict\").equal(1, 2)'" } },
+					...(developmentChild ? [{ name: "write", arguments: { path: "src/value.js", content: "export const value = 2;\n" } }] : []),
+					{ name: "read", arguments: { path: "input.txt" } },
 				] : undefined;
 				const finished = !planned && read && !readSkill && !recoverRead && (inheritedCalls ? step >= inheritedCalls.length : editRecovery ? step >= 3 : structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
 					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError

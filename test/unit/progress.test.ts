@@ -3,7 +3,71 @@ import test from "node:test";
 import { initTheme, ToolExecutionComponent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { createTaskProgress, taskRenderers, type TaskProgress } from "../../extensions/delivery-gate/src/progress.ts";
+import { createTaskProgress, taskRenderers, summarizeToolErrors, TOOL_ERROR_STATUS, type TaskProgress } from "../../extensions/delivery-gate/src/progress.ts";
+
+test("过程摘要关联原始调用和行号，同为退出 1 不自动解释为无匹配或已修复", () => {
+	const rows: any[] = [
+		{ type: "session", id: "child" },
+		{ type: "message", message: { role: "assistant", content: [
+			{ type: "thinking", thinking: "不得进入摘要" },
+			{ type: "toolCall", id: "search", name: "bash", arguments: { command: "rg missing input.txt" } },
+			{ type: "toolCall", id: "test", name: "bash", arguments: { command: "node failing-test.cjs" } },
+		] } },
+		{ type: "message", message: { role: "toolResult", toolCallId: "test", toolName: "bash", isError: true, content: [{ type: "text", text: "AssertionError: 1 !== 2\nCommand exited with code 1" }] } },
+		{ type: "message", message: { role: "toolResult", toolCallId: "search", toolName: "bash", isError: true, content: [{ type: "text", text: "\nCommand exited with code 1\nCONFIGURED_RESULT_HOOK" }] } },
+		{ type: "message", message: { role: "toolResult", toolCallId: "read", toolName: "read", isError: false, content: [{ type: "text", text: "后续正常读取" }] } },
+	];
+	const before = structuredClone(rows);
+	const note = summarizeToolErrors(rows)!;
+	assert.match(note.action, /2 次工具异常.*bash.*code 1/);
+	assert.match(note.text, /原记录第 3 行.*node failing-test.cjs.*AssertionError/s);
+	assert.match(note.text, /原记录第 4 行.*rg missing input.txt.*code 1/s);
+	assert.match(summarizeToolErrors([rows[3]])!.action, /code 1.*CONFIGURED_RESULT_HOOK/);
+	assert.doesNotMatch(note.text, /不得进入摘要|无匹配|已修复|不影响交付/);
+	assert.deepEqual(rows, before);
+	assert.equal(summarizeToolErrors([rows[4]]), undefined);
+});
+
+test("过程摘要有界、移除终端控制序列，缺少调用或正文时明确指向原记录", () => {
+	const rows: any[] = Array.from({ length: 20 }, (_, index) => ({ type: "message", message: {
+		role: "toolResult", toolCallId: String(index), toolName: "plugin", isError: true,
+		content: [{ type: "text", text: "\x1b]0;BAD_TITLE\x07\x1b[31m" + "输出".repeat(10_000) + "\nERROR_END" }],
+	} }));
+	rows[0].message.content = [];
+	const note = summarizeToolErrors(rows)!;
+	assert.match(note.action, /20 次工具异常/);
+	assert.match(note.text, /未取得文本返回/);
+	assert.match(note.text, /其余 17 次/);
+	assert.match(note.text, /ERROR_END/);
+	assert.ok(note.text.length < 4000);
+	assert.doesNotMatch(note.text, /\x1b|\x07|BAD_TITLE/);
+});
+
+test("正常结束的真实 Pi 卡片用中性标题并显示具体过程摘要，真正失败仍用错误色", () => {
+	initTheme("dark");
+	const colors: [string, string][] = [];
+	const renderers = taskRenderers("开发");
+	const tool: ToolDefinition = { name: "delivery_develop", label: "开发", description: "", parameters: Type.Object({}),
+		...renderers, renderResult(result, options, theme, context) {
+			return renderers.renderResult!.call(this, result, options, { fg: (color: string, value: string) => {
+				colors.push([color, value]); return theme.fg(color as any, value);
+			} } as any, context);
+		}, execute: async () => ({ content: [], details: {} }) };
+	const component = new ToolExecutionComponent(tool.name, "note", { task: "检索后开发" }, {}, tool, { requestRender() {} } as TUI, "/tmp");
+	const p = createTaskProgress("note", "开发", "检索后开发", () => {});
+	p.end(TOOL_ERROR_STATUS, "2 次工具异常 · bash：Command exited with code 1");
+	component.updateResult({ content: [{ type: "text", text: "原始过程记录" }], details: { progress: p.snapshot() }, isError: false }, false);
+	const lines = component.render(100).join("\n");
+	assert.match(lines, /已结束，曾有工具异常/);
+	assert.match(lines, /2 次工具异常.*code 1/);
+	assert.ok(colors.some(([color, value]) => color === "toolTitle" && value.startsWith(TOOL_ERROR_STATUS)));
+	assert.ok(!colors.some(([color, value]) => color === "warning" && value.startsWith(TOOL_ERROR_STATUS)));
+	colors.length = 0;
+	p.end("失败");
+	component.updateResult({ content: [{ type: "text", text: "固定验收失败" }], details: { progress: p.snapshot() }, isError: true }, false);
+	component.render(100);
+	assert.ok(colors.some(([color, value]) => color === "error" && value.startsWith("失败")));
+});
 
 test("两个调用及交错工具各自保留目标、真实终态，文本不包含思考事件", () => {
 	const updates: TaskProgress[] = [];

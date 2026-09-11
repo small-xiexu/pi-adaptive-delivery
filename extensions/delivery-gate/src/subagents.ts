@@ -6,7 +6,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { truncateHead, type BuildSystemPromptOptions, type ExtensionContext, type RpcCommand, type RpcExtensionUIResponse, type RpcSessionState, type SessionEntry, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
-import { createTaskProgress, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
+import { createTaskProgress, summarizeToolErrors, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 
 export const CHILD_ENV = "PI_ADAPTIVE_DELIVERY_CHILD";
 export const DELEGATE_TOOL = "delivery_readonly";
@@ -384,6 +384,7 @@ export async function delegateReadOnly(
 	const dialogs = createChildDialogs(rpc, ctx, operation, interrupt);
 	let state: RpcSessionState | undefined;
 	let text: string | null = null;
+	let toolNotes: ReturnType<typeof summarizeToolErrors>;
 	let problem: unknown;
 	let stopped = false;
 	let recordProblem: unknown;
@@ -418,6 +419,7 @@ export async function delegateReadOnly(
 		try {
 			const rows = parseReadOnlySession(await readFile(state.sessionFile, "utf8"), state.sessionId, rpc.process.pid!);
 			recordedClose = true;
+			toolNotes = summarizeToolErrors(rows);
 			// 最终正文只从已关闭进程的原生记录取得，不把 RPC 内存读回当成落盘证明。
 			const last = rows.findLast((row) => row.type === "message" && row.message?.role === "assistant")?.message;
 			if (last?.stopReason !== "stop") throw new Error("子任务没有正常完成的持久模型终态");
@@ -429,7 +431,7 @@ export async function delegateReadOnly(
 	if (operation.aborted) problem ??= operation.reason;
 	record({ ...reference(), phase: "ended", status: !rpc.exit || rpc.openTools.size ? "unknown" : operation.aborted ? "cancelled" : problem ? "failed" : "completed",
 		exit: rpc.exit, toolErrors: rpc.toolError, error: problem ? String(problem) : undefined });
-	progress.end(!rpc.exit || rpc.openTools.size || !stopped ? "收尾未知" : operation.aborted ? "已取消" : problem ? "失败" : rpc.toolError ? TOOL_ERROR_STATUS : "执行结束，结果待核实");
+	progress.end(!rpc.exit || rpc.openTools.size || !stopped ? "收尾未知" : operation.aborted ? "已取消" : problem ? "失败" : rpc.toolError ? TOOL_ERROR_STATUS : "执行结束，结果待核实", !problem ? toolNotes?.action : undefined);
 	if (problem) throw new Error(`只读委派未成功：${String(problem)}`
 		+ (state?.sessionFile ? `\n原始子 Session：${state.sessionFile}` : "\n子 Session 引用尚未取得。")
 		+ `\n进程收尾：${stopped && rpc.exit?.code === 0 && rpc.exit.signal === null && !rpc.failure ? "已正常关闭" : "未核实正常关闭"}；工具终态：${rpc.openTools.size ? "仍有未确认执行" : "无在途工具"}。`
@@ -437,6 +439,6 @@ export async function delegateReadOnly(
 		+ `\n父 Session ID：${input.parentSessionId}\n本次工具调用：${input.id}`
 		+ "\n此结果仍为失败；先读取已有原始证据，不据此自动重试或放宽权限。", { cause: problem });
 	const output = truncateHead(text!);
-	return { text: `${rpc.toolError ? `${TOOL_ERROR_GUIDANCE}\n\n` : ""}${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}`,
+	return { text: `${rpc.toolError ? `${TOOL_ERROR_GUIDANCE}\n${toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}\n\n` : ""}${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}`,
 		sessionId: state!.sessionId, sessionFile: state!.sessionFile!, pid: rpc.process.pid!, toolErrors: rpc.toolError };
 }

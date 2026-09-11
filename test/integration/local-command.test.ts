@@ -8,6 +8,7 @@ import { CombinedAutocompleteProvider, type TUI } from "@earendil-works/pi-tui";
 import { createDevelopmentHost } from "../support/development-host.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 import type { TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
+import { TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 
 async function developmentHost(t: TestContext, scenario: string, script: string, commands: string[] = [], withPlanning = true) {
 	const h = await createDevelopmentHost(t, `local-${scenario}`, undefined, undefined, false);
@@ -31,6 +32,34 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 	});
 	return { ...h, children, autocomplete };
 }
+
+test("真实检索无匹配与断言失败均保留具体原记录，正常结束后父可继续验收和独立审查", { timeout: 60_000 }, async (t) => {
+	const h = await developmentHost(t, "normal", `require("node:assert/strict").equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");`, ["node inputs/command.cjs"]);
+	for (const name of ["delivery_readonly", "delivery_develop", "delivery_review"]) {
+		if (name === "delivery_review") assert.equal((await h.call("delivery_validate", {})).isError, false);
+		const result = await h.call(name, { task: "fixture-process-notes：执行检索和断言取证，保留过程记录。" });
+		assert.equal(result.isError, false, JSON.stringify(result));
+		const details = result.details as any;
+		assert.equal(details.progress.status, TOOL_ERROR_STATUS);
+		assert.match(details.progress.action, /2 次工具异常.*bash.*code 1/);
+		const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+		assert.match(text, /rg -n 'ABSENT_FIXTURE_PATTERN' input.txt/);
+		assert.match(text, /AssertionError/);
+		assert.doesNotMatch(text, /搜索无匹配，已核对|错误已修复，不影响交付/);
+		const file = details.sessionFile ?? details.childSessionFile ?? details.reviewSessionFile;
+		const rows = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+		const failed = rows.flatMap((row, index) => row.message?.role === "toolResult" && row.message.isError ? [{ line: index + 1, message: row.message }] : []);
+		assert.equal(failed.length, 2);
+		for (const failure of failed) {
+			assert.equal(failure.message.toolName, "bash");
+			assert.match(JSON.stringify(failure.message.content), /Command exited with code 1/);
+			assert.ok(text.includes(`原记录第 ${failure.line} 行`));
+		}
+		assert.equal(await h.readLease(), undefined);
+		assert.throws(() => process.kill(details.pid, 0), { code: "ESRCH" });
+	}
+	assert.equal(h.choices.length, 3, "过程核对不增加批准或重复开发");
+});
 
 test("首次进入后补全可选子任务，运行中命令和卡片可看详情，Esc 不停止任务，结束后 ID 可查", { timeout: 40_000 }, async (t) => {
 	const h = await developmentHost(t, "details", `require("node:fs").writeFileSync("src/ready.txt", "ready");
@@ -127,7 +156,7 @@ assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export co
 console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	const result = await h.call("delivery_develop", { task: "先读取不存在的目标，然后创建、编辑并执行一次本机自检。" });
 	assert.equal(result.isError, false, "正常收尾返回结果，原始工具错误仍保留");
-	assert.equal((result.details as any).progress.status, "已结束，有工具错误待核对");
+	assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
 	const [rows] = await h.children();
 	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
 	assert.deepEqual(tools.map((tool: any) => [tool.toolName, tool.isError]), [["read", true], ["write", false], ["edit", false], ["bash", false], ["read", false]]);
@@ -137,7 +166,7 @@ console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	assert.equal(rows.find((row: any) => row.customType === "delivery-child-exit").data.development.clean, true);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-	assert.match(text, /过程中有工具错误/);
+	assert.match(text, /过程记录.*工具异常/);
 	const childFile = (result.details as any).childSessionFile;
 	assert.ok(childFile && text.includes(childFile), "返回原始证据路径供父核对");
 	const native = await h.call("read", { path: childFile });
@@ -184,7 +213,7 @@ for (const kind of ["failure", "hook-deny", "hook-error"]) test(`正式本机命
 	const h = await developmentHost(t, kind, script);
 	const outcome = await h.call("delivery_develop", { task: "验证本机错误与配置检查" });
 	assert.equal(outcome.isError, false);
-	assert.equal((outcome.details as any).progress.status, "已结束，有工具错误待核对");
+	assert.equal((outcome.details as any).progress.status, TOOL_ERROR_STATUS);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	const result = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
@@ -211,7 +240,7 @@ for (const kind of ["cancel", "timeout"]) test(`正式父子本机 ${kind} 等�
 	if (kind === "cancel") await h.session.abort();
 	const result = await run;
 	assert.equal(result.isError, kind === "cancel");
-	if (kind === "timeout") assert.match(JSON.stringify(result.content), /有工具错误/);
+	if (kind === "timeout") assert.match(JSON.stringify(result.content), /工具异常/);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	assert.ok(rows.some((row: any) => row.customType === "delivery-child-exit" && row.data.development.clean));
@@ -253,6 +282,20 @@ test("正式固定验收运行完整原清单，绑定稳定候选和真实子�
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: `固定验收通过，候选 ${proof.after.digest}；独立审查待实施。\n` })).isError, false);
 	assert.equal(h.choices.length, 3);
+});
+
+test("固定验收退出 1 仍判为失败，不能因展示优化继续审查", { timeout: 40_000 }, async (t) => {
+	const h = await developmentHost(t, "normal", 'require("node:assert/strict").equal(1, 2);', ["node inputs/command.cjs"]);
+	await mkdir(path.join(h.cwd, "src"), { recursive: true });
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 2;\n");
+	const result = await h.call("delivery_validate", {});
+	assert.equal(result.isError, true);
+	const [rows] = await h.children();
+	const failure = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
+	assert.equal(failure.message.isError, true);
+	assert.match(JSON.stringify(failure.message.content), /AssertionError.*code 1/);
+	assert.equal((await h.call("delivery_review", { task: "没有通过验收，不得启动审查" })).isError, true);
+	assert.equal(await h.readLease(), undefined);
 });
 
 test("无规划文档的原生 Pi 完成开发、真实本机验收与独立审查", { timeout: 60_000 }, async (t) => {

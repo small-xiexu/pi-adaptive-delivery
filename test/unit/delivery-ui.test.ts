@@ -262,7 +262,7 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	const progress = createTaskProgress("a", "审查", "核对代码", () => {});
 	assert.equal(progress.snapshot().agent, undefined, "READY 前不能展示未经核实的选择");
 	progress.agent(agent);
-	progress.end(TOOL_ERROR_STATUS);
+	progress.end(TOOL_ERROR_STATUS, "2 次工具异常 · bash：Command exited with code 1");
 	const tool: ToolDefinition = { name: "delivery_review", label: "审查", description: "", parameters: Type.Object({}),
 		...taskRenderers("审查"), execute: async () => ({ content: [], details: {} }) };
 	const card = new ToolExecutionComponent(tool.name, "a", { task: "核对代码" }, {}, tool, tui, root);
@@ -274,14 +274,17 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	sm.appendCustomEntry("delivery-development", { id: "a", agent, childSessionFile: path.join(root, "child.jsonl") });
 	assert.deepEqual(taskDetails({ sessionManager: sm }, [])[0]!.agent, agent);
 	sm.appendMessage({ role: "toolResult", toolCallId: "a", toolName: tool.name, isError: false,
-		content: [{ type: "text", text: "原生结果" }], details: { progress: progress.snapshot() }, timestamp: Date.now() });
+		content: [{ type: "text", text: "过程记录：原记录第 3 行，rg missing input.txt 返回 code 1" }], details: { progress: progress.snapshot() }, timestamp: Date.now() });
 	progress.agent({ ...agent, thinking: "low", reason: "过时进度" });
 	const reopened = SessionManager.open(sm.getSessionFile()!);
 	const task = taskDetails({ sessionManager: reopened }, [progress.snapshot()])[0]!;
 	assert.deepEqual(task.agent, agent);
 	assert.equal(task.status, TOOL_ERROR_STATUS, "重开后保留过程错误提示，不还原为失败或无问题");
 	const panel = new TaskDetailsPanel(task, tui, plainTheme, () => {});
+	panel.update({ task, entries: [{ id: "result", name: "子任务说明", output: "已完成检查" }] });
 	assert.match(panel.render(100).join("\n"), /fixture-reasoner.*high/);
+	assert.match(panel.render(100).join("\n"), /2 次工具异常.*code 1/);
+	assert.match(panel.render(100).join("\n"), /原记录第 3 行，rg missing input.txt/);
 	panel.handleInput("\r");
 	assert.match(panel.render(100).join("\n"), /fixture-provider\/fixture-reasoner.*high/);
 	assert.match(panel.render(100).join("\n"), /代码审查需要检查权限边界/);

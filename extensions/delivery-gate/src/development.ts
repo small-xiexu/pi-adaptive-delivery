@@ -8,7 +8,7 @@ import type { installApprovals } from "./approvals.ts";
 import { current, nativeEntries, snapshot, type SessionBinding } from "./parent-writer.ts";
 import { CHILD_EXIT, DELEGATION_ENTRY, createChildDialogs, delegateReadOnly, parseReadOnlySession, readyChild, startChild, type ChildRpc, type ChildTask } from "./subagents.ts";
 import { createLocalOperations, type ExecutionReference } from "./local-execution.ts";
-import { createTaskProgress, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
+import { createTaskProgress, summarizeToolErrors, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 import { createStructuredCommands, type ExecInput } from "./structured.ts";
 import { captureCandidate, type CandidateSnapshot, type CandidateScope } from "./candidate.ts";
 import { prepareReview } from "./review.ts";
@@ -204,7 +204,7 @@ async function childTerminal(state: DevelopmentRun) {
 		|| exit.data.development.historyDigest !== digest(rows.slice(0, rows.indexOf(exit)))
 		|| rows.slice(rows.indexOf(exit) + 1).some((row) => row.type === "message")) throw new Error("子 writer 的持久收尾记录不符");
 	const last = rows.findLast((row) => row.type === "message" && row.message?.role === "assistant")?.message;
-	return { digest: digest(rows), last, incompleteCommand: exit.data.development.structured?.incomplete === true, validation: exit.data.development.validation as ValidationProof | undefined };
+	return { digest: digest(rows), last, toolNotes: summarizeToolErrors(rows), incompleteCommand: exit.data.development.structured?.incomplete === true, validation: exit.data.development.validation as ValidationProof | undefined };
 }
 
 async function readonlyTerminal(state: DevelopmentRun) {
@@ -393,8 +393,8 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				}
 				if (validationCommands) state.validation = snapshot(terminal.validation!);
 				const text = terminal.last.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
-				progress.end(validationCommands ? "固定验收通过，待交接核验" : state.rpc!.toolError ? TOOL_ERROR_STATUS : "开发结束，待核实与交接核验");
-				const result = { content: [{ type: "text" as const, text: `${state.rpc!.toolError ? `${TOOL_ERROR_GUIDANCE}\n\n` : ""}${validationCommands ? "固定验收已通过，结论只属于本次候选，不代替独立审查" : "开发子任务已结束，仍须核对实际文件与验证结果"}：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}` }],
+				progress.end(validationCommands ? "固定验收通过，待交接核验" : state.rpc!.toolError ? TOOL_ERROR_STATUS : "开发结束，待核实与交接核验", terminal.toolNotes?.action);
+				const result = { content: [{ type: "text" as const, text: `${state.rpc!.toolError ? `${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}\n\n` : ""}${validationCommands ? "固定验收已通过，结论只属于本次候选，不代替独立审查" : "开发子任务已结束，仍须核对实际文件与验证结果"}：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}` }],
 					details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, progress: progress.snapshot(),
 						...(validationCommands ? { validation: terminal.validation } : {}) } };
 				state.result = snapshot({ ...result, isError: false });

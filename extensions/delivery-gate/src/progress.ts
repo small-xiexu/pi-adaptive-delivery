@@ -1,5 +1,5 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Container, MouseRegion, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { SessionEntry, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Container, MouseRegion, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 export interface TaskProgress {
 	id: string;
@@ -15,12 +15,46 @@ export interface TaskProgress {
 	pending?: { id: string; name: string; callId?: string; args?: unknown; output: string }[];
 }
 export type ProgressUpdate = (message: string, progress: TaskProgress) => void;
-export const TOOL_ERROR_STATUS = "已结束，有工具错误待核对";
-export const TOOL_ERROR_GUIDANCE = "过程中有工具错误。请核对原始错误、后续操作及最终产物，再决定是否返工或继续验证；此结果不证明错误已修复或任务已验收。";
+export const TOOL_ERROR_STATUS = "已结束，曾有工具异常";
+export const TOOL_ERROR_GUIDANCE = "以下为过程中工具异常的原始摘要，不是整项任务失败的判定。请结合调用、原始返回、后续操作及最终产物说明具体原因和交付影响，再决定是否返工或继续验证；此结果不证明错误已修复或任务已验收。";
 const short = (text: string, limit = 300) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, limit);
 const tail = (text: string) => text.length > 4000 ? `[预览已省略，详情查看完整内容]\n${text.slice(-4000)}` : text;
 const streamingTail = (text: string) => text.length > 64_000 ? `[在途输出仅保留最近片段，完成后可查看原始结果]\n${text.slice(-64_000)}` : text;
-const outputText = (result: any) => (result?.content ?? []).filter((part: any) => part.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n");
+const outputText = (result: any): string => (result?.content ?? []).filter((part: any) => part.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n");
+
+// 只投影已读取的原生记录，不解析 Shell 语义，也不保存另一份错误或修复状态。
+export function summarizeToolErrors(rows: readonly SessionEntry[]) {
+	const calls = new Map<string, Record<string, unknown>>();
+	const notes: string[] = [];
+	let count = 0;
+	let first = "";
+	const excerpt = (text: string, limit = 400) => {
+		const value = short(stripTerminalSequences(text), Infinity).replace(/\s+/g, " ").trim();
+		return value.length <= limit ? value : `${value.slice(0, limit / 2)} …[已截断]… ${value.slice(-limit / 2)}`;
+	};
+	for (const [index, row] of rows.entries()) {
+		if (row.type !== "message") continue;
+		const message = row.message;
+		if (message.role === "assistant") {
+			for (const part of message.content) if (part.type === "toolCall") calls.set(part.id, part.arguments);
+		} else if (message.role === "toolResult") {
+			const args = calls.get(message.toolCallId);
+			calls.delete(message.toolCallId);
+			if (!message.isError) continue;
+			count++;
+			if (notes.length >= 3) continue;
+			const name = excerpt(message.toolName, 60);
+			const output = outputText(message).trim();
+			const reason = output || "未取得文本返回，请查看原记录";
+			const target = args?.command ?? args?.cmd ?? args?.path ?? args?.file_path ?? args?.pattern;
+			first ||= `${name}：${excerpt(reason, 140)}`;
+			notes.push(`- ${name} · 原记录第 ${index + 1} 行${typeof target === "string" ? `\n  调用：${excerpt(target)}` : ""}\n  返回：${excerpt(reason)}`);
+		}
+	}
+	if (!count) return undefined;
+	return { action: `${count} 次工具异常 · ${first}`, text: `过程记录（${count} 次工具异常）：\n${notes.join("\n")}`
+		+ (count > notes.length ? `\n其余 ${count - notes.length} 次见原始子 Session。` : "") };
+}
 
 // 每个调用独立的展示缓存；证据与交接仍只使用原生 Session。
 export function createTaskProgress(id: string, label: string, task: string, update: ProgressUpdate) {
@@ -50,9 +84,10 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 			if (sessionFile) view.sessionFile = sessionFile;
 			emit();
 		},
-		end(status: string) {
+		end(status: string, detail?: string) {
 			view.status = status; view.endedAt = Date.now();
 			pending.clear();
+			if (detail) action(detail);
 			if (view.action.startsWith("正在执行：")) view.action = view.action.replace("正在执行：", "最后操作：");
 			emit();
 		},
@@ -126,7 +161,7 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 				invalidate() {},
 				render(width: number) {
 					const hint = open ? " /delivery-tasks" : "";
-					const title = truncateToWidth(theme.fg(context.isError ? "error" : status === TOOL_ERROR_STATUS ? "warning" : "toolTitle", heading), Math.max(1, width - hint.length));
+					const title = truncateToWidth(theme.fg(context.isError ? "error" : "toolTitle", heading), Math.max(1, width - hint.length));
 					const lines = [truncateToWidth(title + theme.fg("muted", hint), width), truncateToWidth(theme.fg("muted", detail), width)];
 					if (expanded) {
 						if (open) lines.push(...new Text("/delivery-tasks 查看详情 · 全屏模式可点击卡片 · Esc 关闭详情", 0, 0).render(width));

@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { displayText } from "./ui.ts";
-import type { TaskProgress } from "./progress.ts";
+import { TOOL_ERROR_STATUS, type TaskProgress } from "./progress.ts";
 import { DELEGATE_TOOL, DELEGATION_ENTRY } from "./subagents.ts";
 import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
 
@@ -188,7 +188,7 @@ export class TaskDetailsPanel {
 		else {
 			body = entries.map((entry) => `${truncateToWidth(`${short(entry.name)} · ${entryStatus(entry)}${entry.callId ? ` · ${this.summary(entry)}` : ""}`, width)}\n`
 				+ (entry.output || (entry.live ? "等待输出…" : entry.callId ? "尚未取得工具返回。" : ""))).join("\n\n") || "等待子任务输出…";
-			if (task.result && (!entries.length || ["失败", "已取消", "收尾未知"].includes(task.status))) body += `\n\n任务返回\n${task.result}`;
+			if (task.result && (!entries.length || ["失败", "已取消", "收尾未知", TOOL_ERROR_STATUS].includes(task.status))) body += `\n\n任务返回\n${task.result}`;
 			if (notice) body += `\n\n${notice}`;
 			if (!this.following) this.frozen = body;
 		}
@@ -206,7 +206,7 @@ export class TaskDetailsPanel {
 		const task = this.record.task;
 		const context = !this.full ? [th.fg("muted", `任务：${short(task.task)}`),
 			...(task.agent ? [th.fg("muted", `模型：${short(task.agent.id)} · ${short(task.agent.thinking)} · Enter 查看选择理由`)] : []),
-			...(task.result === undefined ? [th.fg("muted", short(task.progress?.action ?? "等待进度更新"))] : []),
+			...(task.result === undefined || task.status === TOOL_ERROR_STATUS ? [th.fg("muted", short(task.progress?.action ?? "等待进度更新"))] : []),
 			th.fg("accent", this.following ? "实时输出 · 跟随最新" : "实时输出 · 暂停跟随 · End 查看最新")] : [];
 		context.splice(Math.max(0, Math.floor(this.tui.terminal.rows * 0.85) - 10));
 		this.pageSize = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 7 - footer.length - context.length);
