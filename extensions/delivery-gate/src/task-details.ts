@@ -15,9 +15,14 @@ export interface TaskDetail {
 	task: string;
 	status: string;
 	result?: string;
+	resultFailed?: boolean;
 	sessionFile?: string;
 	progress?: TaskProgress;
 	agent?: TaskProgress["agent"];
+	approvalId?: string;
+	designApprovalId?: string;
+	batch?: number;
+	attempt?: number;
 }
 
 // 当前分支的原生调用、结果和既有委派引用；不保存第二份任务列表。
@@ -33,19 +38,32 @@ export function taskDetails(ctx: Pick<ExtensionContext, "sessionManager">, live:
 			const progress = (entry.message.details as { progress?: TaskProgress } | undefined)?.progress;
 			task.status = progress?.endedAt ? progress.status === ABNORMAL_STATUS ? ABNORMAL_STATUS : COMPLETED_STATUS : entry.message.isError ? ABNORMAL_STATUS : COMPLETED_STATUS;
 			task.result = text(entry.message);
+			task.resultFailed = Boolean(entry.message.isError);
 			task.progress = progress;
 			if (progress?.agent) task.agent = progress.agent;
 			if (progress?.sessionFile) task.sessionFile = progress.sessionFile;
 		} else if (entry.type === "custom" && [DELEGATION_ENTRY, "delivery-development"].includes(entry.customType)) {
-			const data = entry.data as { id: string; sessionFile?: string; childSessionFile?: string; agent?: TaskProgress["agent"] };
+			const data = entry.data as { id: string; sessionFile?: string; childSessionFile?: string; agent?: TaskProgress["agent"]; approvalId?: string; designApprovalId?: string };
 			const task = tasks.get(data.id);
 			if (task && (data.childSessionFile || data.sessionFile)) task.sessionFile = data.childSessionFile ?? data.sessionFile;
 			if (task && data.agent) task.agent = data.agent;
+			if (task && data.approvalId) task.approvalId = data.approvalId;
+			if (task && data.designApprovalId) task.designApprovalId = data.designApprovalId;
 		}
 	}
 	for (const progress of live) {
 		const task = tasks.get(progress.id);
 		if (task && task.result === undefined) Object.assign(task, { status: progress.status, progress, agent: progress.agent ?? task.agent, sessionFile: progress.sessionFile ?? task.sessionFile });
+	}
+	const batches = new Map<string, number>();
+	const attempts = new Map<string, number>();
+	for (const task of tasks.values()) {
+		if (!task.designApprovalId) continue;
+		if (!batches.has(task.designApprovalId)) batches.set(task.designApprovalId, batches.size + 1);
+		const key = `${task.designApprovalId}:${task.label}`;
+		task.batch = batches.get(task.designApprovalId);
+		task.attempt = (attempts.get(key) ?? 0) + 1;
+		attempts.set(key, task.attempt);
 	}
 	return [...tasks.values()];
 }
@@ -188,7 +206,7 @@ export class TaskDetailsPanel {
 		else {
 			body = entries.map((entry) => `${truncateToWidth(`${short(entry.name)} · ${entryStatus(entry)}${entry.callId ? ` · ${this.summary(entry)}` : ""}`, width)}\n`
 				+ (entry.output || (entry.live ? "等待输出…" : entry.callId ? "尚未取得工具返回。" : ""))).join("\n\n") || "等待子任务输出…";
-			if (task.result && (!entries.length || task.status === ABNORMAL_STATUS)) body += `\n\n任务返回\n${task.result}`;
+			if (task.result && (!entries.length || task.resultFailed || task.status === ABNORMAL_STATUS)) body += `\n\n任务返回\n${task.result}`;
 			if (notice) body += `\n\n${notice}`;
 			if (!this.following) this.frozen = body;
 		}
@@ -204,7 +222,8 @@ export class TaskDetailsPanel {
 		const rule = (left: string, right: string) => th.bg("customMessageBg", th.fg("border", left + "─".repeat(width - 2) + right));
 		const footer = width >= 72 ? ["↑↓ / PgUp/PgDn 滚动 · End 最新 · Esc 关闭"] : ["↑↓ 滚动 · End 最新", "Esc 关闭"];
 		const task = this.record.task;
-		const context = !this.full ? [th.fg("muted", `任务：${short(task.task)}`),
+		const context = !this.full ? [th.fg("muted", `${task.batch ? `交付 ${task.batch} · ` : "独立调用 · "}${clean(task.label)}${task.attempt ? `第${task.attempt}次` : ""}`),
+			th.fg("muted", `任务：${short(task.task)}`),
 			...(task.agent ? [th.fg("muted", `模型：${short(task.agent.id)} · ${short(task.agent.thinking)} · Enter 查看选择理由`)] : []),
 			...(task.result === undefined ? [th.fg("muted", short(task.progress?.action ?? "等待进度更新"))] : [])] : [];
 		context.splice(Math.max(0, Math.floor(this.tui.terminal.rows * 0.85) - 10));
@@ -218,7 +237,7 @@ export class TaskDetailsPanel {
 		if (this.total > this.pageSize) position += ` · ${this.offset + 1}–${Math.min(this.total, this.offset + this.pageSize)} / ${this.total} 行`;
 		while (page.length < this.pageSize) page.push("");
 		const status = [RUNNING_STATUS, COMPLETED_STATUS, ABNORMAL_STATUS].includes(task.status) ? task.status : RUNNING_STATUS;
-		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)} · ${clean(status)}`)), row(""), rule("├", "┤"),
+		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)}${task.attempt ? `第${task.attempt}次` : ""} · ${clean(status)}`)), row(""), rule("├", "┤"),
 			...context.map(row), ...page.map(row), rule("├", "┤"), row(th.fg("muted", position)), ...footer.map((line) => row(th.fg("muted", line))), rule("╰", "╯")];
 	}
 }
@@ -235,11 +254,11 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[],
 		const tasks = taskDetails(ctx, live()).reverse();
 		if (!id) {
 			if (!tasks.length) { ctx.ui.notify("当前会话还没有交付子任务。", "info"); return; }
-			const choices = tasks.map((task, index) => `${index + 1}. ${displayText(task.label)} · ${displayText(task.status)} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
+			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `交付 ${task.batch} · ` : "独立调用 · "}${displayText(task.label)}${task.attempt ? `第${task.attempt}次` : ""} · ${displayText(task.status)} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
 			const controller = new AbortController();
 			close = () => controller.abort();
 			let selected: string | undefined;
-			try { selected = await ctx.ui.select("子任务详情", choices, { signal: controller.signal }); }
+			try { selected = await ctx.ui.select(`子任务详情 · 累计 ${tasks.length} 次调用 · 当前运行 ${tasks.filter((task) => task.status === RUNNING_STATUS && task.result === undefined).length} 个`, choices, { signal: controller.signal }); }
 			finally { close = undefined; }
 			if (controller.signal.aborted) return;
 			if (selected === undefined) return;

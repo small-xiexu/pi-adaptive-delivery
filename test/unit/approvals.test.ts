@@ -33,7 +33,7 @@ async function host(persist = true) {
 	};
 	const approvals = installApprovals(pi as ExtensionAPI);
 	assert.equal(tool.name, APPROVAL_TOOL);
-	const run = (request: { stage: string; body: string; documentStrategy: string; technicalPlanPath?: string; implementationPlanPath?: string; paths: string[]; validationCommands: string[]; inputs?: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
+	const run = (request: { stage: string; body: string; documentStrategy: string; technicalPlanPath?: string; implementationPlanPath?: string; paths: string[]; validationCommands: string[]; inputs?: string[]; validationRevisionOf?: string } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
 	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages, approvals,
@@ -105,6 +105,35 @@ test("无规划文档的简单任务保留两次确认与持久正文，实施�
 	assert.deepEqual(rows.filter((row) => row.customType === PROPOSAL_ENTRY).map((row) => row.data.body), [design.body, implementation.body]);
 	assert.equal(rows.filter((row) => row.customType === APPROVAL_ENTRY).length, 2);
 	assert.equal(h.displayed.length, 2);
+});
+
+test("实施确认支持意见，意见不授予权限也不启动开发", async () => {
+	const h = await host();
+	await h.run();
+	h.ctx.ui.custom = approvalUI(async () => undefined, () => "先修正验收命令，再开始开发");
+	const feedback = await h.run(implementation);
+	assert.equal(feedback.details.approved, false);
+	assert.equal(feedback.details.feedback, "先修正验收命令，再开始开发");
+	assert.equal(h.approvals.confirmedStage, "design");
+	assert.equal(h.entries(APPROVAL_ENTRY).length, 1);
+});
+
+test("固定验收命令机械修订使用轻量确认，相同提案不重复弹窗", async () => {
+	const h = await host();
+	await h.run();
+	const firstImplementation = await h.run(implementation);
+	const revision = { ...implementation, body: "修正原命令的 Python 语法错误，验收范围保持不变。", validationCommands: ["node --test src/index.test.js"], validationRevisionOf: firstImplementation.details.approvalId };
+	const revised = await h.run(revision);
+	assert.equal(revised.details.approved, true);
+	const grant = await h.readImplementation();
+	assert.deepEqual(grant.validationCommands, revision.validationCommands);
+	const proposal = (h.entries(PROPOSAL_ENTRY).at(-1) as any).data as any;
+	assert.equal(proposal.previousApprovalId, firstImplementation.details.approvalId);
+	assert.match(proposal.changeSummary, /固定验收命令/);
+	const approvals = h.entries(APPROVAL_ENTRY).length;
+	const duplicate = await h.run({ ...implementation, body: proposal.body, validationCommands: revision.validationCommands });
+	assert.equal(duplicate.details.approvalId, revised.details.approvalId);
+	assert.equal(h.entries(APPROVAL_ENTRY).length, approvals);
 });
 
 test("无规划文档方案的反馈与暂停恢复直接修订会话正文，不生成批准", async () => {
@@ -233,7 +262,8 @@ test("方案路径须为 worktree 内确切 Markdown，命令及验收输入只�
 	const h = await host();
 	for (const request of [{ ...design, paths: ["src"] }, { ...design, paths: ["../outside.md"] },
 		{ ...design, paths: [" "] }, { ...design, body: " " }, { ...design, validationCommands: ["echo x"] },
-		{ ...design, inputs: ["src"] }, { ...design, technicalPlanPath: "other.md" }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
+		{ ...design, inputs: ["src"] }, { ...design, technicalPlanPath: "other.md" },
+		{ ...design, paths: [], technicalPlanPath: undefined, implementationPlanPath: undefined }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
 	assert.equal(h.displayed.length, 0);
 });
 
@@ -258,7 +288,7 @@ for (const stage of ["design", "implementation"]) test(`重新请求 ${stage} �
 	const h = await host(); await h.run(); await h.run(implementation);
 	const grant = await h.readImplementation();
 	h.ctx.ui.select = async () => { assert.equal(grant.signal.aborted, true); return undefined; };
-	await h.run(stage === "design" ? design : implementation);
+	await h.run(stage === "design" ? design : { ...implementation, body: "扩大停止条件说明后暂不批准。" });
 	await assert.rejects(h.readImplementation(), /本轮没有/);
 });
 
@@ -282,7 +312,7 @@ test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，�
 		const panel = await factory(...args);
 		assert.ok(panel.body.includes(body), "正文已展示且不截掉长提案的后半部分");
 		assert.match(panel.body, /文档策略：复用现有文档/);
-		assert.match(panel.body, /允许修改（文件或目录）：\n• src\n• test/);
+		assert.match(panel.body, /允许修改（文件或目录）：• src • test/);
 		assert.ok(panel.detail.includes(body)); assert.ok(panel.detail.includes(design.body));
 		assert.match(panel.detail, /额外验收输入：\n• package.json/);
 		assert.match(panel.body, /验收时依次运行：\n1. node --check src\/index.js/);

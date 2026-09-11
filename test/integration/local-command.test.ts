@@ -6,7 +6,7 @@ import test, { type TestContext } from "node:test";
 import { ToolExecutionComponent, type CustomEntry } from "@earendil-works/pi-coding-agent";
 import { CombinedAutocompleteProvider, type TUI } from "@earendil-works/pi-tui";
 import { createDevelopmentHost } from "../support/development-host.ts";
-import { plainTheme } from "../support/delivery-ui.ts";
+import { approvalUI, plainTheme } from "../support/delivery-ui.ts";
 import type { TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 
@@ -32,6 +32,36 @@ async function developmentHost(t: TestContext, scenario: string, script: string,
 	});
 	return { ...h, children, autocomplete };
 }
+
+test("真实 Pi 中固定命令修订只确认命令，相同实施提案不重复弹窗", { timeout: 40_000 }, async (t) => {
+	const h = await developmentHost(t, "approval-revision", "console.log('fixture');", [], true);
+	await h.prepare();
+	const initial = h.sm.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "delivery-approval") as CustomEntry<{ id: string }>;
+	assert.ok(initial);
+	const choicesBeforeRevision = h.choices.length;
+	const command = "node -e \"console.log('REVISION_OK')\"";
+	const revised = await h.approve("implementation", ["src", "plan.md"], [], [command], initial.data!.id, "修正固定命令语法，验收范围保持不变。");
+	assert.equal(revised.isError, false, JSON.stringify(revised));
+	assert.equal(h.choices.length, choicesBeforeRevision + 1);
+	const current = h.sm.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "delivery-approval") as CustomEntry<{ id: string }>;
+	assert.notEqual(current.data!.id, initial.data!.id);
+	const proposal = h.sm.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "delivery-approval-proposal") as CustomEntry<{ previousApprovalId?: string; validationRevisionReason?: string }>;
+	assert.equal(proposal.data!.previousApprovalId, initial.data!.id);
+	assert.equal(proposal.data!.validationRevisionReason, "修正固定命令语法，验收范围保持不变。");
+	const duplicate = await h.approve("implementation", ["src", "plan.md"], [], [command]);
+	assert.equal(duplicate.isError, false, JSON.stringify(duplicate));
+	assert.equal(h.choices.length, choicesBeforeRevision + 1, "相同有效提案不应重新弹窗");
+});
+
+test("真实 Pi 中实施意见会暂停开发并返回父会话", { timeout: 40_000 }, async (t) => {
+	const h = await developmentHost(t, "implementation-feedback", "console.log('fixture');", [], true);
+	await h.prepare();
+	h.setCustom(approvalUI(async () => undefined, () => "补充失败后的停止条件，再开始开发。"));
+	const result = await h.approve("implementation", ["src", "plan.md"], [], [], undefined, "调整实施步骤");
+	assert.equal(result.isError, false, JSON.stringify(result));
+	assert.equal((result.details as any).approved, false);
+	assert.match(result.content.map((part: any) => part.text ?? "").join("\n"), /补充失败后的停止条件/);
+});
 
 test("真实检索无匹配与断言失败均保留具体原记录，正常结束后父可继续验收和独立审查", { timeout: 60_000 }, async (t) => {
 	const h = await developmentHost(t, "normal", `require("node:assert/strict").equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export const value = 2;\\n");`, ["node inputs/command.cjs"]);
@@ -290,6 +320,10 @@ test("固定验收退出 1 仍判为失败，不能因展示优化继续审查",
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 2;\n");
 	const result = await h.call("delivery_validate", {});
 	assert.equal(result.isError, true);
+	assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
+	assert.ok((result.details as any).progress.endedAt);
+	const parentResult = h.sm.getEntries().findLast((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === result.toolCallId);
+	assert.equal(parentResult?.type === "message" && parentResult.message.role === "toolResult" ? parentResult.message.details.progress.status : undefined, COMPLETED_STATUS);
 	const [rows] = await h.children();
 	const failure = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");
 	assert.equal(failure.message.isError, true);

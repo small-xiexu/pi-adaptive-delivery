@@ -26,14 +26,25 @@ const noticeLines = (theme: Theme, width: number, notice: string) => notice ? [
 	...wrapped(notice, width, "  │ ").map((line) => theme.fg("muted", line)),
 ] : [];
 
-export type DesignReviewResult = { feedback: string } | "确认方案" | undefined;
+export type DesignReviewResult = { feedback: string } | string | undefined;
+export interface ApprovalReviewOptions {
+	title?: string;
+	acceptLabel?: string;
+	feedbackLabel?: string;
+	pauseLabel?: string;
+	subtitle?: string;
+}
 
 // 先阅读并选择操作，需要修改时再输入意见；发送意见不等于批准。
 export class DesignReviewPanel {
-	readonly title = "方案审阅";
-	readonly choices = ["确认方案", "提出修改意见", "稍后再看"];
+	readonly title: string;
+	readonly choices: string[];
 	private readonly editor: Editor;
 	private readonly select: SelectList;
+	private readonly acceptLabel: string;
+	private readonly feedbackLabel: string;
+	private readonly pauseLabel: string;
+	private readonly subtitle: string;
 	private editing = false;
 	private hasFocus = false;
 	private expanded = false;
@@ -45,7 +56,14 @@ export class DesignReviewPanel {
 	private editorHeight = 0;
 	private optionsRow = 0;
 	constructor(readonly body: string, readonly detail: string, private readonly tui: TUI,
-		private readonly theme: Theme, private readonly done: (result: DesignReviewResult) => void, readonly notice = "") {
+		private readonly theme: Theme, private readonly done: (result: DesignReviewResult) => void, readonly notice = "",
+		options: ApprovalReviewOptions = {}) {
+		this.title = options.title ?? "方案审阅";
+		this.acceptLabel = options.acceptLabel ?? "确认方案";
+		this.feedbackLabel = options.feedbackLabel ?? "提出修改意见";
+		this.pauseLabel = options.pauseLabel ?? "稍后再看";
+		this.subtitle = options.subtitle ?? "请先阅读，再选择下一步";
+		this.choices = [this.acceptLabel, this.feedbackLabel, this.pauseLabel];
 		const selectTheme = {
 			selectedPrefix: (text: string) => theme.fg("accent", text), selectedText: (text: string) => theme.fg("accent", text),
 			description: (text: string) => theme.fg("muted", text), scrollInfo: (text: string) => text, noMatch: (text: string) => text,
@@ -55,8 +73,8 @@ export class DesignReviewPanel {
 		this.select = new SelectList(this.choices.map((label) => ({ value: label, label })), this.choices.length, selectTheme);
 		this.select.setSelectedIndex(2);
 		this.select.onSelect = ({ value }) => {
-			if (value === "提出修改意见") { this.editing = true; this.focused = this.hasFocus; this.tui.requestRender(); }
-			else this.done(value === "确认方案" ? value : undefined);
+			if (value === this.feedbackLabel) { this.editing = true; this.focused = this.hasFocus; this.tui.requestRender(); }
+			else this.done(value === this.acceptLabel ? value : undefined);
 		};
 	}
 	get focused() { return this.hasFocus; }
@@ -100,9 +118,9 @@ export class DesignReviewPanel {
 		const editor = this.editing ? this.editor.render(width) : [];
 		const options = this.editing ? [] : this.select.render(width);
 		const notice = this.notice && !this.editing ? noticeLines(this.theme, width, this.notice) : [];
-		const header = panelHeader(this.theme, width, this.title, this.editing ? "提出修改意见" : "请先阅读，再选择下一步");
+		const header = panelHeader(this.theme, width, this.title, this.editing ? "提出修改意见" : this.subtitle);
 		const footer = panelFooter(this.theme, width,
-			this.editing ? "Enter 发送意见 · Shift+Enter 换行 · Esc 返回方案" : "↑↓ 选择 · Enter 确定 · Esc 稍后再看",
+			this.editing ? "Enter 发送意见 · Shift+Enter 换行 · Esc 返回确认内容" : `↑↓ 选择 · Enter 确定 · Esc ${this.pauseLabel}`,
 			`Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页`);
 		const reserved = header.length + editor.length + options.length + notice.length + footer.length + (this.editing ? 2 : 3);
 		this.fits = reserved + 1 < this.tui.terminal.rows;

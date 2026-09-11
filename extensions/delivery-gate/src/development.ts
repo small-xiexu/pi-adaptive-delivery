@@ -240,6 +240,16 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 	let stopped = false;
 	let finishing: Promise<void> | undefined;
 	let shutdownSettled: (() => void) | undefined;
+	pi.on("tool_result", (event) => {
+		const state = active;
+		if (!state?.finished || !state.result?.isError || event.toolCallId !== state.id || event.toolName !== state.name) return;
+		if (!isDeepStrictEqual({ content: event.content, details: event.details, isError: event.isError }, state.result)) return;
+		const progress = state.progress?.snapshot();
+		if (!progress?.endedAt) return;
+		const details = { progress };
+		state.result = snapshot({ ...state.result, details });
+		return { details };
+	});
 	async function execute(name: string, input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext,
 		update: ProgressUpdate): Promise<AgentToolResult<unknown>> {
 		if (active || stopped) throw new Error("开发 writer 尚未完成交接或已关闭，未启动新任务");
@@ -310,7 +320,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						+ `差异基线：${artifact.baseHead ?? "无 HEAD，空基线"}；before/after 为原始 Git blob/当前文件副本。差异覆盖全部可写候选和 Git 常规列出的输入，忽略的只读依赖按原路径核对。\n重点：${input.task}` }, running,
 						(data) => {
 							if (data.phase === "started") state.readonlyStarted = true;
-							const reference = { ...data, reviewDirectory: artifact.directory };
+							const reference = { ...data, approvalId: grant.approvalId, designApprovalId: grant.designApprovalId, reviewDirectory: artifact.directory };
 							state.readonlyReference = snapshot(reference);
 							pi.appendEntry(DELEGATION_ENTRY, reference);
 						}, update, ctx, progress);

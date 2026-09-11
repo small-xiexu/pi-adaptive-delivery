@@ -7,7 +7,7 @@ import { Text } from "@earendil-works/pi-tui";
 import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
-import { DeliveryPanel, DesignReviewPanel, displayText, type DesignReviewResult } from "./ui.ts";
+import { DesignReviewPanel, displayText, type DesignReviewResult } from "./ui.ts";
 
 export const APPROVAL_TOOL = "delivery_approval";
 export const PROPOSAL_ENTRY = "delivery-approval-proposal";
@@ -22,6 +22,7 @@ const parameters = Type.Object({
 	implementationPlanPath: Type.Optional(Type.String({ minLength: 1, description: "design 中实施计划 Markdown 的相对路径；必须同时出现在 design.paths 中。无对应文件时省略。implementation 沿用已确认 design 的值。" })),
 	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
 	inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "implementation 中纳入候选指纹的额外源码、配置或测试输入，按 cwd 解析，必须在 worktree 内且不含凭据。不包含整个工作区、规划文档、Git 或执行记录；这是验收范围，不是 Shell 隔离。" })),
+	validationRevisionOf: Type.Optional(Type.String({ minLength: 1, description: "仅当只修订固定验收命令时填写当前实施批准 ID；body 只说明修订原因，原实施正文、路径和额外输入沿用并单独展示。" })),
 }, { additionalProperties: false });
 
 type Request = Static<typeof parameters>;
@@ -39,6 +40,10 @@ interface Proposal {
 	validationCommands: string[];
 	designApprovalId?: string;
 	inputs: string[];
+	planningPaths: string[];
+	previousApprovalId?: string;
+	changeSummary?: string;
+	validationRevisionReason?: string;
 }
 interface Approval {
 	id: string;
@@ -66,15 +71,19 @@ type DocumentPlan = Pick<Proposal, "documentStrategy" | "technicalPlanPath" | "i
 
 function documentSummary(proposal: Proposal): string {
 	const relative = (file?: string) => file ? path.relative(proposal.cwd, file) || "." : "无";
+	const planningPaths = proposal.planningPaths;
 	const labeled = new Set([proposal.technicalPlanPath, proposal.implementationPlanPath].filter(Boolean));
-	const extra = proposal.stage === "design" ? proposal.paths.filter((file) => !labeled.has(file)) : [];
+	const extra = planningPaths.filter((file) => !labeled.has(file));
+	const scope = proposal.stage === "implementation" ? `\n允许修改（文件或目录）：${proposal.paths.map((file) => `• ${relative(file)}`).join(" ") || "无"}` : "";
 	return `文档策略：${documentStrategyLabels[proposal.documentStrategy]}\n技术方案：${relative(proposal.technicalPlanPath)}\n实施计划：${relative(proposal.implementationPlanPath)}`
+		+ scope
 		+ (extra.length ? `\n其他规划文档：\n${extra.map((file) => `• ${relative(file)}`).join("\n")}` : "");
 }
 
 function resolveDocumentPlan(request: Request, cwd: string, expected?: Proposal): DocumentPlan {
 	if (request.stage === "implementation") {
 		if (!expected || request.documentStrategy !== expected.documentStrategy) throw new Error("实施文档策略必须沿用已确认方案");
+		if (expected.documentStrategy !== "none" && !expected.paths.length) throw new Error("已确认的落盘方案缺少规划 Markdown 路径，不能请求实施确认");
 		for (const [name, value] of [["technicalPlanPath", request.technicalPlanPath], ["implementationPlanPath", request.implementationPlanPath]] as const) {
 			if (value !== undefined && path.resolve(cwd, value) !== expected[name]) throw new Error("实施规划路径必须沿用已确认方案");
 		}
@@ -88,6 +97,9 @@ function resolveDocumentPlan(request: Request, cwd: string, expected?: Proposal)
 		technicalPlanPath: request.technicalPlanPath ? path.resolve(cwd, request.technicalPlanPath) : undefined,
 		implementationPlanPath: request.implementationPlanPath ? path.resolve(cwd, request.implementationPlanPath) : undefined,
 	};
+	if (request.documentStrategy !== "none" && !plan.technicalPlanPath && !plan.implementationPlanPath) {
+		throw new Error("落盘任务须明确技术方案或实施计划的实际路径；单份合并文档可使用同一路径");
+	}
 	for (const value of [plan.technicalPlanPath, plan.implementationPlanPath].filter((item): item is string => Boolean(item))) {
 		if (!resolvedPaths.includes(value)) throw new Error("技术方案和实施计划路径必须同时列在规划 paths 中");
 	}
@@ -97,16 +109,28 @@ function resolveDocumentPlan(request: Request, cwd: string, expected?: Proposal)
 function presentation(proposal: Proposal, expanded = false): string {
 	const relative = (file: string) => path.relative(proposal.cwd, file) || ".";
 	const files = (paths: string[]) => paths.map((file) => `• ${relative(file)}`).join("\n") || "无";
-	let content = `${documentSummary(proposal)}\n\n${proposal.body}`;
-	if (proposal.stage === "implementation") {
-		content += `\n\n允许修改（文件或目录）：\n${files(proposal.paths)}`
-			+ `\n\n验收时依次运行：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n") || "未提供固定命令，不能完成交付验收。"}`;
+	const revision = proposal.validationRevisionReason;
+	let content = revision ? `修订原因：${revision}\n\n${proposal.changeSummary}\n\n沿用原实施正文、文档与额外输入。\n允许修改：${proposal.paths.map(relative).join("、")}\nCtrl+O 查看完整实施内容。`
+		: `${proposal.changeSummary ? `相对上次的变化：\n${proposal.changeSummary}\n\n` : ""}${documentSummary(proposal)}\n\n${proposal.body}`;
+	if (revision && expanded) content += `\n\n${documentSummary(proposal)}\n\n原实施正文：\n${proposal.body}`;
+	if (proposal.stage === "implementation" && (!revision || expanded)) {
+		content += `\n\n验收时依次运行：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n") || "未提供固定命令，不能完成交付验收。"}`;
 		if (!expanded && proposal.inputs.length) content += `\n\n另有 ${proposal.inputs.length} 项文件纳入验收核对，Ctrl+O 查看清单。`;
 	}
 	if (expanded) content += (proposal.stage === "design" ? `\n\n维护的规划文档：\n${proposal.paths.length ? files(proposal.paths) : "方案保存在会话中，无须规划文档。"}`
 		: `\n\n额外验收输入：\n${files(proposal.inputs)}\n\n运行环境：本机，父子沿用 Pi 已启用的工具与权限检查。修改范围是任务约定及候选验收范围，普通文件、Shell、联网和插件工具不由交付包额外拦截。`)
 		+ `\n\n${permissions[proposal.stage]}\n\n工作目录：${proposal.cwd}\n提案记录：${proposal.id}${proposal.designApprovalId ? `\n方案批准引用：${proposal.designApprovalId}` : ""}`;
 	return content;
+}
+
+function changeSummary(previous: Proposal, next: Proposal): string {
+	const lines: string[] = [];
+	const relative = (file: string) => path.relative(next.cwd, file) || ".";
+	if (previous.body !== next.body) lines.push(`实施说明已更新，原文：\n${previous.body}\n新说明见本次实施正文。`);
+	if (!isDeepStrictEqual(previous.paths, next.paths)) lines.push(`允许修改范围：\n- 原：${previous.paths.map(relative).join(", ") || "无"}\n+ 新：${next.paths.map(relative).join(", ") || "无"}`);
+	if (!isDeepStrictEqual(previous.inputs, next.inputs)) lines.push(`额外验收输入：\n- 原：${previous.inputs.map(relative).join(", ") || "无"}\n+ 新：${next.inputs.map(relative).join(", ") || "无"}`);
+	if (!isDeepStrictEqual(previous.validationCommands, next.validationCommands)) lines.push(`固定验收命令：\n- 原：\n${previous.validationCommands.map((value, index) => `${index + 1}. ${value}`).join("\n") || "无"}\n+ 新：\n${next.validationCommands.map((value, index) => `${index + 1}. ${value}`).join("\n") || "无"}`);
+	return lines.join("\n\n") || "没有检测到批准内容变化。";
 }
 
 // 只读取 Pi 的原生文件。内存条目即使可见，也不能证明 appendEntry 已经落盘。
@@ -133,6 +157,8 @@ export function installApprovals(pi: ExtensionAPI) {
 	// 只记住本次运行亲自完成的确认；与原生条目不共享可变对象，也不从历史恢复。
 	let design: Confirmed | undefined;
 	let implementation: Confirmed | undefined;
+	// 仅保留上一份已确认实施作为命令修订的对照来源，不代表仍有写入权限。
+	let implementationBasis: Confirmed | undefined;
 	let pending: AbortController | undefined;
 	const invalidateImplementation = () => {
 		const previous = implementation;
@@ -143,6 +169,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		design?.controller.abort(new Error("方案确认已失效"));
 		design = undefined;
 		invalidateImplementation();
+		implementationBasis = undefined;
 	};
 	const invalidate = () => {
 		invalidateDesign();
@@ -190,7 +217,6 @@ export function installApprovals(pi: ExtensionAPI) {
 			if (pending) throw new Error("已有批准请求等待处理，不并发显示第二个请求");
 			if (request.stage !== "design" && request.stage !== "implementation") throw new Error("只接受方案或实施确认；Markdown 编辑无需单独授权");
 			if (request.stage === "design") invalidateDesign();
-			if (request.stage === "implementation") invalidateImplementation();
 			const controller = new AbortController();
 			pending = controller;
 			const operation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
@@ -212,6 +238,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				if (request.stage === "design" && paths.some((value) => path.extname(value).toLowerCase() !== ".md")) throw new Error("规划文档只接受确切 Markdown 路径");
 				if (request.stage !== "implementation" && request.validationCommands.length) throw new Error("本阶段不授予命令执行权限");
 				if (request.stage !== "implementation" && inputs.length) throw new Error("只有实施阶段可声明额外验收输入");
+				if (request.stage !== "implementation" && request.validationRevisionOf) throw new Error("只有实施阶段可以修订固定验收命令");
 				const expectedDesign = request.stage === "implementation" ? design : undefined;
 				let approvedDesign: Proposal | undefined;
 				if (request.stage === "implementation") {
@@ -221,13 +248,56 @@ export function installApprovals(pi: ExtensionAPI) {
 					if (!isDeepStrictEqual(entry.data, expectedDesign.approval) || !isDeepStrictEqual(body.data, expectedDesign.proposal)) throw new Error("方案批准记录已变化");
 					approvedDesign = expectedDesign.proposal;
 				}
+				const revisionBase = request.validationRevisionOf ? implementationBasis : undefined;
+				if (request.validationRevisionOf && (!revisionBase || revisionBase.approval.id !== request.validationRevisionOf)) {
+					throw new Error("验收命令修订必须引用当前仍可核实的实施批准");
+				}
+				const verifyRevisionBase = async () => {
+					if (!revisionBase) return;
+					if (!expectedDesign || revisionBase.proposal.designApprovalId !== expectedDesign.approval.id
+						|| revisionBase.approval.sessionId !== sessionId || revisionBase.approval.workspaceKey !== workspace.key
+						|| revisionBase.sessionFile !== sessionFile) throw new Error("验收命令修订来源不属于当前方案、会话或工作区");
+					const [savedApproval, savedProposal] = await persisted<Approval | Proposal>(ctx,
+						[APPROVAL_ENTRY, revisionBase.approval.id], [PROPOSAL_ENTRY, revisionBase.proposal.id]);
+					if (!isDeepStrictEqual(savedApproval.data, revisionBase.approval) || !isDeepStrictEqual(savedProposal.data, revisionBase.proposal)) throw new Error("验收命令修订的原实施批准记录已变化");
+				};
+				await verifyRevisionBase();
 				const documentPlan = resolveDocumentPlan(request, workspace.cwdPath, approvedDesign ?? expectedDesign?.proposal);
 				const proposal: Proposal = { id: randomUUID(), sessionId, workspaceKey: workspace.key, cwd: workspace.cwdPath,
-					stage: request.stage, body: request.body, documentStrategy: documentPlan.documentStrategy,
+					stage: request.stage, body: revisionBase?.proposal.body ?? request.body, documentStrategy: documentPlan.documentStrategy,
 					...(documentPlan.technicalPlanPath ? { technicalPlanPath: documentPlan.technicalPlanPath } : {}),
 					...(documentPlan.implementationPlanPath ? { implementationPlanPath: documentPlan.implementationPlanPath } : {}),
 					paths, inputs, validationCommands: [...request.validationCommands],
-					...(approvedDesign ? { designApprovalId: expectedDesign!.approval.id } : {}) };
+					planningPaths: approvedDesign?.paths ?? (request.stage === "design" ? paths : []),
+					...(approvedDesign ? { designApprovalId: expectedDesign!.approval.id } : {}),
+					...(revisionBase ? { previousApprovalId: revisionBase.approval.id } : {}) };
+				if (revisionBase) {
+					const changedBoundaries = [
+						...(!isDeepStrictEqual(paths, revisionBase.proposal.paths) ? ["修改范围"] : []),
+						...(!isDeepStrictEqual(inputs, revisionBase.proposal.inputs) ? ["额外验收输入"] : []),
+						...(documentPlan.documentStrategy !== revisionBase.proposal.documentStrategy ? ["文档策略"] : []),
+						...(documentPlan.technicalPlanPath !== revisionBase.proposal.technicalPlanPath ? ["技术方案路径"] : []),
+						...(documentPlan.implementationPlanPath !== revisionBase.proposal.implementationPlanPath ? ["实施计划路径"] : []),
+					];
+					if (changedBoundaries.length) throw new Error(`验收命令修订只能改变固定命令，不能同时改变：${changedBoundaries.join("、")}`);
+					if (isDeepStrictEqual(proposal.validationCommands, revisionBase.proposal.validationCommands)) throw new Error("固定验收命令没有变化，不需要重新确认");
+					proposal.validationRevisionReason = request.body.trim();
+					proposal.changeSummary = changeSummary(revisionBase.proposal, proposal);
+				} else if (implementation) {
+					const same = implementation.proposal.body === proposal.body
+						&& isDeepStrictEqual(implementation.proposal.paths, proposal.paths)
+						&& isDeepStrictEqual(implementation.proposal.inputs, proposal.inputs)
+						&& isDeepStrictEqual(implementation.proposal.validationCommands, proposal.validationCommands)
+						&& implementation.proposal.documentStrategy === proposal.documentStrategy
+						&& implementation.proposal.technicalPlanPath === proposal.technicalPlanPath
+						&& implementation.proposal.implementationPlanPath === proposal.implementationPlanPath;
+					if (same) {
+						const { expected } = await readCurrent(ctx, operation);
+						return { content: [{ type: "text", text: "当前实施提案已经确认，继续使用现有实施授权；不重复弹出确认。" }], details: { approved: true, approvalId: expected.approval.id, proposalId: expected.proposal.id, sessionFile: expected.sessionFile } };
+					}
+					proposal.previousApprovalId = implementation.approval.id;
+					proposal.changeSummary = changeSummary(implementation.proposal, proposal);
+				}
 				const current = () => {
 					operation.throwIfAborted();
 					if (expectedDesign && design !== expectedDesign) throw new Error("本次实施所依赖的方案确认已失效");
@@ -236,19 +306,21 @@ export function installApprovals(pi: ExtensionAPI) {
 					}
 				};
 				current();
+				if (request.stage === "implementation" && implementation) invalidateImplementation();
 				pi.appendEntry(PROPOSAL_ENTRY, structuredClone(proposal));
 				const [displayed] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]);
 				if (!isDeepStrictEqual(displayed.data, proposal)) throw new Error("展示正文与持久记录不一致");
 				current();
-				const accept = actions[request.stage];
+				const accept = request.validationRevisionOf ? "确认修订" : actions[request.stage];
 				const choice = await ctx.ui.custom<string | DesignReviewResult>((tui, theme, _keys, done) => {
 					const cancel = () => done(undefined);
 					operation.addEventListener("abort", cancel, { once: true });
 					if (operation.aborted) cancel();
 					const panel = request.stage === "design" ? new DesignReviewPanel(presentation(proposal), presentation(proposal, true), tui, theme, done, permissions.design)
-						: new DeliveryPanel(titles[request.stage], presentation(proposal),
-						presentation(proposal, true) + (approvedDesign ? `\n\n已确认的方案原文：\n${presentation(approvedDesign, true)}` : ""),
-						[accept, "暂不批准"], tui, theme, done, 1, permissions.implementation);
+						: new DesignReviewPanel(presentation(proposal),
+							presentation(proposal, true) + (approvedDesign ? `\n\n已确认的方案原文：\n${presentation(approvedDesign, true)}` : ""),
+							tui, theme, done, permissions.implementation, { title: proposal.validationRevisionReason ? "验收命令修订" : proposal.previousApprovalId ? "实施变更确认" : titles.implementation,
+								acceptLabel: accept, pauseLabel: "暂不批准", subtitle: proposal.previousApprovalId ? "请核对本次变化后再确认" : "请核对实施范围和验收命令" });
 					return Object.assign(panel, { dispose: () => operation.removeEventListener("abort", cancel) });
 				});
 				current();
@@ -258,6 +330,13 @@ export function installApprovals(pi: ExtensionAPI) {
 					current();
 					return { content: [{ type: "text", text: `用户对本次方案的修改意见：\n${choice.feedback}\n\n尚未确认方案。${proposal.paths.length ? "先读最新方案并修订同一份文件，Markdown 编辑无需额外授权" : "结合会话中的方案正文、最新意见和现场直接修订说明，无须补建规划文件"}；需澄清时一次只问一个关键问题。说明修改与未采纳原因，再发起新的 design 审阅提案，继续等待意见或明确批准。不要进入实施计划或开发。` }],
 						details: { approved: false, proposalId: proposal.id, feedback: choice.feedback } };
+				}
+				if (request.stage === "implementation" && typeof choice === "object" && choice.feedback.trim()) {
+					const [saved] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]);
+					if (!isDeepStrictEqual(saved.data, proposal)) throw new Error("反馈对应的实施正文已变化");
+					current();
+					return { content: [{ type: "text", text: `用户对本次实施的修改意见：\n${choice.feedback}\n\n尚未确认实施，不启动开发或验收。请结合原方案、当前现场和意见修订实施步骤、命令说明或停止条件，再发起新的 implementation 提案；同范围代码返工与原命令复验无需重新申请完整实施确认。` }],
+						details: { approved: false, proposalId: proposal.id, feedback: choice.feedback, validationRevisionOf: request.validationRevisionOf } };
 				}
 				if (choice !== accept) return { content: [{ type: "text", text: request.stage === "design"
 					? "方案审阅已暂停，方案正文与已发送意见保留。用户可输入继续看方案、直接提出意见，或用 /delivery-resume 恢复；现在停止推进，不自动重问。"
@@ -269,6 +348,7 @@ export function installApprovals(pi: ExtensionAPI) {
 					const [savedDesign, savedBody] = await persisted<Approval | Proposal>(ctx, [APPROVAL_ENTRY, proposal.designApprovalId!], [PROPOSAL_ENTRY, approvedDesign.id]);
 					if (!isDeepStrictEqual(savedDesign.data, expectedDesign!.approval) || !isDeepStrictEqual(savedBody.data, approvedDesign)) throw new Error("方案批准记录已变化");
 				}
+				await verifyRevisionBase();
 				current();
 				const approval: Approval = { id: randomUUID(), proposalId: proposal.id, sessionId, workspaceKey: workspace.key,
 					source: { mode: "tui", interaction: "custom", toolCallId } };
@@ -278,9 +358,12 @@ export function installApprovals(pi: ExtensionAPI) {
 				current();
 				const live = { approval, proposal, sessionFile: sessionFile!, controller: new AbortController() };
 				if (proposal.stage === "design") design = live;
-				if (proposal.stage === "implementation") implementation = live;
-				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。${request.stage === "implementation" ? "用户未要求暂停且没有未决问题时，继续在本轮已批准范围和 writer 交接下委派本机开发，无须额外的“继续”。固定验收使用本次命令清单；独立审查仍需当前候选的可信验收。" : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验收说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案或实施计划文件"}，实施仍须独立确认。`}` }],
+				if (proposal.stage === "implementation") { implementation = live; implementationBasis = live; }
+				return { content: [{ type: "text", text: `${request.validationRevisionOf ? "验收命令修订" : titles[request.stage]}已记录。${request.stage === "implementation" ? "用户未要求暂停且没有未决问题时，继续在本轮已批准范围和 writer 交接下委派本机开发，无须额外的“继续”。固定验收使用本次命令清单；独立审查仍需当前候选的可信验收。" : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验收说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案或实施计划文件"}，实施仍须独立确认。`}` }],
 					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
+			} catch (error) {
+				if (request.stage === "implementation") invalidateImplementation();
+				throw error;
 			} finally {
 				pending = undefined;
 			}

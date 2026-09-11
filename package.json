@@ -3,7 +3,14 @@
   "version": "0.1.0",
   "description": "Adaptive, approval-gated delivery orchestration for Pi coding tasks",
   "type": "module",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/small-xiexu/pi-adaptive-delivery.git"
+  },
+  "homepage": "https://github.com/small-xiexu/pi-adaptive-delivery",
+  "bugs": {
+    "url": "https://github.com/small-xiexu/pi-adaptive-delivery/issues"
+  },
   "engines": {
     "node": ">=22.19.0"
   },

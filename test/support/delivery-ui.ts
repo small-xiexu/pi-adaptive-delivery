@@ -15,7 +15,7 @@ export function approvalUI(select: ExtensionUIContext["select"], feedback?: () =
 			const review = panel.title === "方案审阅";
 			assert.equal(panel.choices.at(-1), review ? "稍后再看" : "暂不批准");
 			panel.render(100);
-			const text = review ? feedback?.() : undefined;
+			const text = feedback?.();
 			if (text !== undefined) {
 				panel.handleInput("\x1b[A");
 				panel.handleInput("\r");

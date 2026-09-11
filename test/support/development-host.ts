@@ -65,11 +65,12 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session.messages));
 		return row.message;
 	};
-	const approve = (stage: string, paths: string[], inputs: string[] = [], validationCommands: string[] = []) => {
+	const approve = (stage: string, paths: string[], inputs: string[] = [], validationCommands: string[] = [], validationRevisionOf?: string, body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
 		const latest = sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "design") as any;
 		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
-		return call("delivery_approval", { stage, body: `APPROVED_${stage.toUpperCase()}_BODY`, documentStrategy,
-			...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}), paths, inputs, validationCommands });
+		return call("delivery_approval", { stage, body, documentStrategy,
+			...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}),
+			...(validationRevisionOf ? { validationRevisionOf } : {}), paths, inputs, validationCommands });
 	};
 	const prepare = async () => {
 		for (const [stage, paths] of [["design", ["plan.md"]], ["implementation", ["src", "plan.md"]]] as const) {
