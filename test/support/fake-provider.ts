@@ -232,7 +232,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					: developmentStep === 2 && localChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-local-timeout" ? 1 : scenario === "development-local-details" ? 20 : 10 } : { path: target }
 					: toolName === "delivery_document_write" ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
 					: toolName === "delivery_document_edit" ? { path: "plan.md", edits: [{ oldText: "原文", newText: "禁止" }] }
-					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", paths: ["plan.md"], validationCommands: [] }
+					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", documentStrategy: "reuse", technicalPlanPath: "plan.md", implementationPlanPath: "plan.md", paths: ["plan.md"], validationCommands: [] }
 					: toolName === "delivery_readonly" ? { task: scenario === "task-command" ? "/fixture-dangerous" : "读取 input.txt，提供独立证据。" }
 					: write ? { path: "forbidden.txt", content: "unexpected" } : { path: reviewChild ? step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile
 						: readSkill ? path.join(process.env.PI_CODING_AGENT_DIR!, "skills", "environment-proof", "SKILL.md")

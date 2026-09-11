@@ -8,7 +8,7 @@ import { createBashTool, type ExtensionAPI } from "@earendil-works/pi-coding-age
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createDevelopmentHost as host } from "../support/development-host.ts";
 import { FixtureRpc, testEnvironment } from "../support/pi-fixture.ts";
-import { TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
+import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 
 test("真实子 edit 匹配不唯一后补充上下文修正，返回过程错误提示而非整项失败", { timeout: 40_000 }, async (t) => {
 	const h = await host(t, "edit-recovery");
@@ -17,8 +17,8 @@ test("真实子 edit 匹配不唯一后补充上下文修正，返回过程错�
 	await writeFile(path.join(h.cwd, "src/value.js"), "first = 1\nsecond = 1\n");
 	const result = await h.call("delivery_develop", { task: "修正两处值，匹配不唯一时读取文件并补足上下文" });
 	assert.equal(result.isError, false, JSON.stringify(result));
-	assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
-	assert.match(JSON.stringify(result.content), /不证明错误已修复或任务已验收/);
+	assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
+	assert.match(JSON.stringify(result.content), /不单独改变子 Agent 状态/);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "first = 2\nsecond = 2\n");
 	const rows = (await readFile((result.details as any).childSessionFile, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 	const tools = rows.filter((row) => row.message?.role === "toolResult").map((row) => row.message);
@@ -67,7 +67,7 @@ test("正式开发入口：父确认后子 Pi 创建、编辑与读回，收尾�
 		assert.ok(progress.some((view) => view.action === `正在执行：${tool} src/value.js`));
 		assert.ok(progress.some((view) => view.action === `已完成：${tool} src/value.js`));
 	}
-	assert.match(progress.at(-1).status, /开发结束/);
+	assert.equal(progress.at(-1).status, "已完成");
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const events = await h.audit();
@@ -278,7 +278,7 @@ test("握手失败后子退出异常保留父 writer，不因任务尚未发送�
 	const result = await h.call("delivery_develop", { task: "只核验启动异常", agent: { thinking: "high", reason: "核对未发任务的异常关闭" } });
 	assert.equal(result.isError, true);
 	assert.match(JSON.stringify(result.content), /子收尾核验：未取得证明/);
-	assert.equal(progress.at(-1).status, "收尾未知");
+	assert.equal(progress.at(-1).status, "异常退出");
 	assert.equal((await h.readLease())?.owner.kind, "parent");
 	assert.ok(h.notices.some((notice) => notice.includes("开发 writer 未交回")));
 	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
@@ -408,8 +408,8 @@ test("真实 Pi 独立审查在 Git replace 存在时仍收到真实修改差异
 	assert.ok(progress.filter((view) => view.id === review.toolCallId).every((view) => view.name.startsWith("审查")));
 	assert.ok(progress.some((view) => view.id === validation.toolCallId && view.action === "正在执行：bash node inputs/command.cjs"));
 	assert.ok(progress.some((view) => view.id === review.toolCallId && view.action === "已完成：read src/value.js"));
-	assert.match(progress.findLast((view) => view.id === validation.toolCallId).status, /固定验收通过/);
-	assert.match(progress.at(-1).status, /审查结束/);
+	assert.equal(progress.findLast((view) => view.id === validation.toolCallId).status, "已完成");
+	assert.equal(progress.at(-1).status, "已完成");
 	const diffFile = (review.details as any).diffFile;
 	assert.match(await readFile(diffFile, "utf8"), /-export const value = 1;\n\+export const value = 2;/);
 	const events = await h.audit();
@@ -469,7 +469,7 @@ for (const kind of ["tool-replaced", "hook-deny", "hook-error", "write"]) test(`
 	assert.equal((await h.call("delivery_validate", {})).isError, false);
 	const result = await h.call("delivery_review", { task: kind === "write" ? "fixture-read-then-write" : "检查实际能力失败" });
 	assert.equal(result.isError, kind === "tool-replaced", JSON.stringify(result));
-	if (kind === "hook-deny" || kind === "hook-error") assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
+	if (kind === "hook-deny" || kind === "hook-error") assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
 	const children = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(children.length, 2);
 	assert.throws(() => process.kill(children[1].pid, 0), { code: "ESRCH" });
@@ -850,7 +850,7 @@ test("开发部分写入不回滚，正常收尾后原授权内可重新委派�
 	await h.prepare();
 	const partial = await h.call("delivery_develop", { task: "注入部分写入" });
 	assert.equal(partial.isError, false);
-	assert.equal((partial.details as any).progress.status, TOOL_ERROR_STATUS);
+	assert.equal((partial.details as any).progress.status, COMPLETED_STATUS);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "部分写入");
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	await writeFile(path.join(h.agentDir, "development-fault-used"), "disable fixture fault");
@@ -910,7 +910,7 @@ for (const scenario of ["hook-deny", "hook-error"]) {
 		await h.prepare();
 		const result = await h.call("delivery_develop", { task: "执行文件检查" });
 		assert.equal(result.isError, false);
-		assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
+		assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
 		await assert.rejects(access(path.join(h.cwd, "src/value.js")), { code: "ENOENT" });
 		assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	});
@@ -993,7 +993,7 @@ test("真实子 Pi 的本机命令失败保留错误与执行引用，不把模�
 	await h.prepare();
 	const result = await h.call("delivery_develop", { task: "夹具尝试未批准的命令" });
 	assert.equal(result.isError, false);
-	assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
+	assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const reference = h.sm.getEntries().find((entry) => entry.type === "custom" && entry.customType === "delivery-development");
 	assert.ok(reference?.type === "custom");
@@ -1014,7 +1014,7 @@ for (const name of ["edit", "write"]) test(`父 ${name} 仅在内存被覆盖而
 	assert.match(JSON.stringify(result.content), /父子工具定义或来源未对齐/);
 	assert.match(JSON.stringify(result.content), new RegExp(`定义或来源不同：${name}`));
 	assert.match(JSON.stringify(result.content), /子收尾核验：已取得证明/);
-	assert.equal(progress.at(-1).status, "启动失败");
+	assert.equal(progress.at(-1).status, "已完成");
 	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
 	for (const child of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined);

@@ -8,7 +8,7 @@ import type { installApprovals } from "./approvals.ts";
 import { current, nativeEntries, snapshot, type SessionBinding } from "./parent-writer.ts";
 import { CHILD_EXIT, DELEGATION_ENTRY, createChildDialogs, delegateReadOnly, parseReadOnlySession, readyChild, startChild, type ChildRpc, type ChildTask } from "./subagents.ts";
 import { createLocalOperations, type ExecutionReference } from "./local-execution.ts";
-import { createTaskProgress, summarizeToolErrors, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
+import { ABNORMAL_STATUS, COMPLETED_STATUS, createTaskProgress, summarizeToolErrors, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 import { createStructuredCommands, type ExecInput } from "./structured.ts";
 import { captureCandidate, type CandidateSnapshot, type CandidateScope } from "./candidate.ts";
 import { prepareReview } from "./review.ts";
@@ -359,7 +359,6 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						+ `本机开发，工作目录 ${input.cwd}，使用本机已有工具链与当前用户权限。正常联网检索和查阅资料可直接使用原工具；安装依赖、外部写入或后台服务仍须遵守用户授权。额外验收输入 ${JSON.stringify(grant.inputs)}。\n`
 						+ `\n已批准开发路径：${JSON.stringify(grant.paths)}\n固定验收命令：${JSON.stringify(grant.validationCommands)}\n`
 						+ `\n已批准方案：\n${grant.designBody}\n\n已批准实施计划：\n${grant.implementationBody}\n\n本次任务：\n${input.task}` }, childSignal)]);
-					if (validationCommands && rpc.toolError) throw new Error("固定验收存在工具失败，请核对原生记录");
 				}
 			} catch (error) { state.problem = error; }
 			progress.phase(executionSignal.aborted ? "正在取消" : "核对收尾中");
@@ -380,7 +379,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.problem) throw state.problem;
 				if (state.review) {
 					const review = state.review;
-					progress.end(review.result.toolErrors ? TOOL_ERROR_STATUS : "审查结束，待父裁决与交接核验");
+					progress.end(COMPLETED_STATUS);
 					const result = { content: [{ type: "text" as const, text: `独立审查已结束，发现仍由父会话裁决，不等于审查通过：\n${review.result.text}\n候选：${review.candidate.digest}\n审查原始记录：${review.result.sessionFile}\n审查制品：${review.artifact.directory}\n实际差异：${review.artifact.diffFile}` }],
 						details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
 					state.result = snapshot({ ...result, isError: false });
@@ -393,14 +392,14 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				}
 				if (validationCommands) state.validation = snapshot(terminal.validation!);
 				const text = terminal.last.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
-				progress.end(validationCommands ? "固定验收通过，待交接核验" : state.rpc!.toolError ? TOOL_ERROR_STATUS : "开发结束，待核实与交接核验", terminal.toolNotes?.action);
+				progress.end(COMPLETED_STATUS);
 				const result = { content: [{ type: "text" as const, text: `${state.rpc!.toolError ? `${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}\n\n` : ""}${validationCommands ? "固定验收已通过，结论只属于本次候选，不代替独立审查" : "开发子任务已结束，仍须核对实际文件与验证结果"}：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}` }],
 					details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, progress: progress.snapshot(),
 						...(validationCommands ? { validation: terminal.validation } : {}) } };
 				state.result = snapshot({ ...result, isError: false });
 				return result;
 			} catch (error) {
-				progress.end((state.rpc || state.readonlyReference?.pid) && !state.childTerminal && !state.readonlyTerminal ? "收尾未知" : executionSignal.aborted ? "已取消" : !state.taskSent && !state.readonlyStarted ? "启动失败" : "失败");
+				progress.end(state.childTerminal || state.readonlyTerminal ? COMPLETED_STATUS : ABNORMAL_STATUS);
 				const childSession = state.child?.sessionFile ?? state.readonlyReference?.sessionFile;
 				const text = (error instanceof Error ? error.message : String(error))
 					+ (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。")

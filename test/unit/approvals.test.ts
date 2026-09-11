@@ -8,8 +8,8 @@ import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-age
 import { APPROVAL_ENTRY, APPROVAL_TOOL, PROPOSAL_ENTRY, installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
 
-const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", paths: ["docs/方案.md", "docs/计划.md"], validationCommands: [] };
-const implementation = { stage: "implementation", body: "计划正文\n先实现，再验证；越界则停止。", paths: ["src", "test"], validationCommands: ["node --check src/index.js"] };
+const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", implementationPlanPath: "docs/计划.md", paths: ["docs/方案.md", "docs/计划.md"], validationCommands: [] };
+const implementation = { stage: "implementation", body: "计划正文\n先实现，再验证；越界则停止。", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", implementationPlanPath: "docs/计划.md", paths: ["src", "test"], validationCommands: ["node --check src/index.js"] };
 
 async function host(persist = true) {
 	const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "approval-unit-")));
@@ -33,7 +33,7 @@ async function host(persist = true) {
 	};
 	const approvals = installApprovals(pi as ExtensionAPI);
 	assert.equal(tool.name, APPROVAL_TOOL);
-	const run = (request: { stage: string; body: string; paths: string[]; validationCommands: string[]; inputs?: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
+	const run = (request: { stage: string; body: string; documentStrategy: string; technicalPlanPath?: string; implementationPlanPath?: string; paths: string[]; validationCommands: string[]; inputs?: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
 	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages, approvals,
@@ -57,6 +57,7 @@ test("仅方案与实施两次确认，规划文档冻结为保护路径，文�
 	assert.equal(grant.approvalId, second.details.approvalId);
 	assert.equal(grant.designBody, design.body);
 	assert.equal(grant.implementationBody, implementation.body);
+	assert.equal(grant.documentStrategy, "reuse");
 	assert.deepEqual(grant.planningPaths, design.paths.map((file) => path.join(h.cwd, file)));
 	const changed = await h.readImplementation();
 	changed.planningPaths.push("/other.md"); changed.paths.push("/outside"); changed.validationCommands.push("unexpected");
@@ -88,13 +89,14 @@ test("状态展示只读取本次确认，导航、重载与取消新提案均�
 test("无规划文档的简单任务保留两次确认与持久正文，实施路径仍须非空", async () => {
 	const h = await host(), files = await readdir(h.cwd);
 	await assert.rejects(h.run(implementation), /尚无可信方案确认/);
-	const first = await h.run({ ...design, paths: [] });
+	const first = await h.run({ ...design, documentStrategy: "none", technicalPlanPath: undefined, implementationPlanPath: undefined, paths: [] });
 	await assert.rejects(h.readImplementation(), /本轮没有/);
 	await assert.rejects(h.run({ ...implementation, paths: [] }), /实施须列明开发路径/);
-	const second = await h.run(implementation), grant = await h.readImplementation();
+	const second = await h.run({ ...implementation, documentStrategy: "none", technicalPlanPath: undefined, implementationPlanPath: undefined }), grant = await h.readImplementation();
 	assert.equal(grant.designApprovalId, first.details.approvalId);
 	assert.equal(grant.approvalId, second.details.approvalId);
 	assert.deepEqual(grant.planningPaths, []);
+	assert.equal(grant.documentStrategy, "none");
 	assert.deepEqual(grant.paths, implementation.paths.map((file) => path.join(h.cwd, file)));
 	assert.equal(grant.designBody, design.body);
 	assert.equal(grant.implementationBody, implementation.body);
@@ -106,7 +108,7 @@ test("无规划文档的简单任务保留两次确认与持久正文，实施�
 });
 
 test("无规划文档方案的反馈与暂停恢复直接修订会话正文，不生成批准", async () => {
-	const h = await host(), request = { ...design, paths: [] };
+	const h = await host(), request = { ...design, documentStrategy: "none", technicalPlanPath: undefined, implementationPlanPath: undefined, paths: [] };
 	h.ctx.ui.custom = approvalUI(async () => undefined, () => "保持原接口，只修参数值");
 	const feedback = await h.run(request);
 	assert.equal(feedback.details.approved, false);
@@ -127,7 +129,7 @@ test("无规划文档方案的反馈与暂停恢复直接修订会话正文，�
 
 for (const change of ["reload", "tamper"]) test(`无规划文档批准 ${change} 后仍关闭旧权限`, async () => {
 	const h = await host();
-	await h.run({ ...design, paths: [] }); await h.run(implementation);
+	await h.run({ ...design, documentStrategy: "none", technicalPlanPath: undefined, implementationPlanPath: undefined, paths: [] }); await h.run({ ...implementation, documentStrategy: "none", technicalPlanPath: undefined, implementationPlanPath: undefined });
 	const grant = await h.readImplementation();
 	if (change === "reload") await h.event("session_start");
 	else {
@@ -154,11 +156,12 @@ test("方案意见继续模型、不生成批准，新提案撤销旧实施引�
 	await assert.rejects(h.readImplementation(), /本轮没有/);
 	await assert.rejects(h.run(implementation), /尚无可信方案确认/);
 	h.ctx.ui.custom = approvalUI(async (_title, choices) => choices[0]);
-	const revised = await h.run({ ...design, body: "最新方案", paths: ["new-plan.md"] });
+	const revised = await h.run({ ...design, body: "最新方案", documentStrategy: "new", technicalPlanPath: undefined, implementationPlanPath: "new-plan.md", paths: ["new-plan.md"] });
 	assert.notEqual(revised.details.proposalId, feedback.details.proposalId);
-	await h.run(implementation);
+	await h.run({ ...implementation, documentStrategy: "new", technicalPlanPath: undefined, implementationPlanPath: "new-plan.md" });
 	assert.equal((await h.readImplementation()).designBody, "最新方案");
 	assert.deepEqual((await h.readImplementation()).planningPaths, [path.join(h.cwd, "new-plan.md")]);
+	assert.equal((await h.readImplementation()).documentStrategy, "new");
 });
 
 for (const boundary of ["cancel", "reload", "tamper"]) test(`方案意见返回期间 ${boundary} 不接受迟到或错配意见`, async () => {
@@ -230,7 +233,7 @@ test("方案路径须为 worktree 内确切 Markdown，命令及验收输入只�
 	const h = await host();
 	for (const request of [{ ...design, paths: ["src"] }, { ...design, paths: ["../outside.md"] },
 		{ ...design, paths: [" "] }, { ...design, body: " " }, { ...design, validationCommands: ["echo x"] },
-		{ ...design, inputs: ["src"] }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
+		{ ...design, inputs: ["src"] }, { ...design, technicalPlanPath: "other.md" }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
 	assert.equal(h.displayed.length, 0);
 });
 
@@ -277,7 +280,8 @@ test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，�
 	const body = "计划修改四个文件。\n" + "步骤与停止条件。\n".repeat(100) + "最后一项决策";
 	h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
 		const panel = await factory(...args);
-		assert.ok(panel.body.startsWith(body), "正文先展示且不截掉长提案的后半部分");
+		assert.ok(panel.body.includes(body), "正文已展示且不截掉长提案的后半部分");
+		assert.match(panel.body, /文档策略：复用现有文档/);
 		assert.match(panel.body, /允许修改（文件或目录）：\n• src\n• test/);
 		assert.ok(panel.detail.includes(body)); assert.ok(panel.detail.includes(design.body));
 		assert.match(panel.detail, /额外验收输入：\n• package.json/);
@@ -298,7 +302,7 @@ test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，�
 	assert.equal((await h.readImplementation()).inputs.length, 1);
 });
 
-test("小修复首屏先显示改法与实际命令，文档和记录引用收进详情，两阶段按键一致", async () => {
+test("确认首屏显示文档策略、路径与改法，两阶段按键一致", async () => {
 	const h = await host();
 	const bodies = { design: "非法日期显示“时间格式异常”；空值和正常日期沿用原行为。", implementation: "修改日期格式函数，补充非法日期测试。" };
 	for (const stage of ["design", "implementation"] as const) {
@@ -306,16 +310,16 @@ test("小修复首屏先显示改法与实际命令，文档和记录引用收�
 			const panel = await factory(...args);
 			const screen = panel.render(100).join("\n");
 			const bodyLine = screen.split("\n").findIndex((line: string) => line.includes(bodies[stage]));
-			assert.ok(bodyLine >= 1 && bodyLine <= 5, "正文应在面板顶部内容区显示");
+			assert.ok(bodyLine >= 1 && bodyLine <= 9, "正文应在面板顶部内容区显示");
 			assert.match(screen, /↑↓ 选择 · Enter 确定/);
 			assert.match(screen, /Ctrl\+O 查看详情/);
 			assert.doesNotMatch(screen, /父会话|提案记录|项路径|你希望怎么改/);
 			if (stage === "design") {
-				assert.doesNotMatch(screen, /docs\/方案.md/);
+				assert.match(screen, /docs\/方案.md/);
 				assert.match(panel.detail, /docs\/方案.md/);
 			} else {
 				assert.match(screen, /• src/);
-				assert.match(screen, /node --check src\/index.js/);
+				assert.match(panel.body, /node --check src\/index.js/);
 			}
 			return panel;
 		}, options);

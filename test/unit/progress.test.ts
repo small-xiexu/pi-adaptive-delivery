@@ -3,7 +3,7 @@ import test from "node:test";
 import { initTheme, ToolExecutionComponent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { createTaskProgress, taskRenderers, summarizeToolErrors, TOOL_ERROR_STATUS, type TaskProgress } from "../../extensions/delivery-gate/src/progress.ts";
+import { ABNORMAL_STATUS, COMPLETED_STATUS, createTaskProgress, taskRenderers, summarizeToolErrors, RUNNING_STATUS, type TaskProgress } from "../../extensions/delivery-gate/src/progress.ts";
 
 test("过程摘要关联原始调用和行号，同为退出 1 不自动解释为无匹配或已修复", () => {
 	const rows: any[] = [
@@ -43,7 +43,7 @@ test("过程摘要有界、移除终端控制序列，缺少调用或正文时�
 	assert.doesNotMatch(note.text, /\x1b|\x07|BAD_TITLE/);
 });
 
-test("正常结束的真实 Pi 卡片用中性标题并显示具体过程摘要，真正失败仍用错误色", () => {
+test("正常结束的真实 Pi 卡片只显示已完成，过程摘要不改变主状态，真正异常仍用错误色", () => {
 	initTheme("dark");
 	const colors: [string, string][] = [];
 	const renderers = taskRenderers("开发");
@@ -55,18 +55,20 @@ test("正常结束的真实 Pi 卡片用中性标题并显示具体过程摘要�
 		}, execute: async () => ({ content: [], details: {} }) };
 	const component = new ToolExecutionComponent(tool.name, "note", { task: "检索后开发" }, {}, tool, { requestRender() {} } as TUI, "/tmp");
 	const p = createTaskProgress("note", "开发", "检索后开发", () => {});
-	p.end(TOOL_ERROR_STATUS, "2 次工具异常 · bash：Command exited with code 1");
+	p.event({ type: "tool_execution_start", toolCallId: "call", toolName: "bash", args: { command: "node test.js" } });
+	p.event({ type: "tool_execution_end", toolCallId: "call", toolName: "bash", isError: true, result: { content: [{ type: "text", text: "Command exited with code 1" }] } });
+	p.end(COMPLETED_STATUS);
 	component.updateResult({ content: [{ type: "text", text: "原始过程记录" }], details: { progress: p.snapshot() }, isError: false }, false);
 	const lines = component.render(100).join("\n");
-	assert.match(lines, /已结束，曾有工具异常/);
-	assert.match(lines, /2 次工具异常.*code 1/);
-	assert.ok(colors.some(([color, value]) => color === "toolTitle" && value.startsWith(TOOL_ERROR_STATUS)));
-	assert.ok(!colors.some(([color, value]) => color === "warning" && value.startsWith(TOOL_ERROR_STATUS)));
+	assert.match(lines, /已完成/);
+	assert.doesNotMatch(lines, /工具异常|工具失败/);
+	assert.ok(colors.some(([color, value]) => color === "toolTitle" && value.startsWith(COMPLETED_STATUS)));
+	assert.ok(!colors.some(([color, value]) => color === "warning" && value.includes("工具异常")));
 	colors.length = 0;
-	p.end("失败");
+	p.end(ABNORMAL_STATUS);
 	component.updateResult({ content: [{ type: "text", text: "固定验收失败" }], details: { progress: p.snapshot() }, isError: true }, false);
 	component.render(100);
-	assert.ok(colors.some(([color, value]) => color === "error" && value.startsWith("失败")));
+	assert.ok(colors.some(([color, value]) => color === "error" && value.startsWith(ABNORMAL_STATUS)));
 });
 
 test("两个调用及交错工具各自保留目标、真实终态，文本不包含思考事件", () => {
@@ -79,7 +81,8 @@ test("两个调用及交错工具各自保留目标、真实终态，文本不�
 	a.event({ type: "tool_execution_end", toolCallId: "2", toolName: "read", isError: false });
 	assert.match(a.snapshot().action, /正在执行.*a.ts/);
 	a.event({ type: "tool_execution_end", toolCallId: "1", toolName: "read", isError: true });
-	assert.match(a.snapshot().action, /工具失败.*a.ts/);
+	assert.match(a.snapshot().action, /已返回.*a.ts/);
+	assert.equal(a.snapshot().status, RUNNING_STATUS);
 	assert.ok(!a.snapshot().action.includes("正在执行"));
 	assert.match(b.snapshot().action, /正在执行.*b.ts/);
 	const before = a.snapshot();
@@ -89,10 +92,10 @@ test("两个调用及交错工具各自保留目标、真实终态，文本不�
 	assert.equal(a.snapshot().action, "正在整理任务说明");
 	assert.equal(a.snapshot().output, "已找到调用点");
 	a.event({ type: "extension_ui_request", method: "input", title: "选择业务范围" });
-	assert.equal(a.snapshot().status, "等待用户回答");
+	assert.equal(a.snapshot().status, RUNNING_STATUS);
 	a.event({ type: "agent_settled" });
-	assert.equal(a.snapshot().status, "核对收尾中");
-	a.end("已取消");
+	assert.equal(a.snapshot().status, RUNNING_STATUS);
+	a.end(ABNORMAL_STATUS);
 	assert.ok(a.snapshot().endedAt);
 	assert.ok(updates.every((view) => view.id === "a" && !JSON.stringify(view).includes("b.ts")));
 	updates[0]!.recent.push("污染");
@@ -109,11 +112,11 @@ test("进度大量输出有界，通知错误不影响状态和真实结束", ()
 		p.event({ type: "tool_execution_end", toolCallId: String(i), toolName: "bash", isError: false });
 	}
 	assert.equal(p.snapshot().recent.length, 16);
-	p.end("收尾未知");
-	assert.equal(p.snapshot().status, "收尾未知");
+	p.end(ABNORMAL_STATUS);
+	assert.equal(p.snapshot().status, ABNORMAL_STATUS);
 });
 
-for (const status of ["启动失败", "收尾未知"]) test(`真实 Pi 卡片保留 ${status}，原生失败结果不覆盖已核实的展示状态`, () => {
+test("真实 Pi 卡片保留异常退出，原生失败结果不覆盖已核实的展示状态", () => {
 	initTheme("dark");
 	const tool: ToolDefinition = { name: "delivery_develop", label: "开发", description: "", parameters: Type.Object({ task: Type.String() }),
 		...taskRenderers("开发"), execute: async () => ({ content: [], details: {} }) };
@@ -122,10 +125,10 @@ for (const status of ["启动失败", "收尾未知"]) test(`真实 Pi 卡片保
 		component.updateResult({ content: [{ type: "text", text: message }], details: { progress: view }, isError: false }, true);
 	});
 	component.markExecutionStarted();
-	progress.end(status);
+	progress.end(ABNORMAL_STATUS);
 	component.render(100);
 	component.updateResult({ content: [{ type: "text", text: "本次执行失败" }], details: {}, isError: true }, false);
-	assert.match(component.render(100).join("\n"), new RegExp(status));
+	assert.match(component.render(100).join("\n"), new RegExp(ABNORMAL_STATUS));
 });
 
 test("在途输出按调用关联，累计工具更新不重复追加，结束和取消清除临时正文", () => {
@@ -141,7 +144,7 @@ test("在途输出按调用关联，累计工具更新不重复追加，结束�
 	assert.ok(p.snapshot().pending![1]!.output.endsWith("TAIL"));
 	p.event({ type: "tool_execution_end", toolCallId: "one", toolName: "read", isError: false });
 	assert.deepEqual(p.snapshot().pending?.map((entry) => entry.callId), ["two"]);
-	p.end("已取消");
+	p.end(ABNORMAL_STATUS);
 	assert.deepEqual(p.snapshot().pending, []);
 });
 
@@ -156,7 +159,7 @@ test("Structured 工具返回 session_id 时仍显示真实命令，最终退出
 	assert.equal(p.snapshot().action, "已完成：exec_command node test.js");
 	p.event({ type: "tool_execution_start", toolCallId: "patch", toolName: "apply_patch", args: { input: "*** Begin Patch\n*** Update File: src/a.ts\n" } });
 	assert.match(p.snapshot().action, /apply_patch src\/a.ts/);
-	p.end("已取消");
+	p.end(ABNORMAL_STATUS);
 	assert.ok(!p.snapshot().action.includes("正在执行"));
 });
 
@@ -175,7 +178,7 @@ test("真实 Pi 工具组件折叠为两行、展开有界，错误终态与恢�
 		// Pi 卡片自带边距，内容仍只有两行。
 		assert.equal(rows.filter((row) => row.replace(/\x1b\[[0-9;]*m/g, "").trim()).length, 2);
 		assert.ok(rows.every((row) => visibleWidth(row) <= width));
-		assert.match(rows.join(""), /执行中/, "窄屏不能把真实状态截断到长任务名称之后");
+		assert.match(rows.join(""), /运行中/, "窄屏不能把真实状态截断到长任务名称之后");
 		assert.ok(!rows.join("").includes("耗时"));
 	}
 	progress.phase("运行中", "最近操作", "/tmp/child.jsonl");
@@ -186,9 +189,9 @@ test("真实 Pi 工具组件折叠为两行、展开有界，错误终态与恢�
 	assert.match(expanded, /child.jsonl/);
 	assert.ok(expanded.length < 20_000);
 	component.setExpanded(false);
-	progress.end("已取消");
+	progress.end(ABNORMAL_STATUS);
 	component.updateResult({ content: [{ type: "text", text: "取消；原始子 Session：/tmp/child.jsonl" }], details: {}, isError: true });
-	assert.match(component.render(80).join(""), /已取消/);
+	assert.match(component.render(80).join(""), /异常退出/);
 	const restored = new ToolExecutionComponent(tool.name, "old", { task: "历史任务" }, {}, tool, { requestRender() {} } as TUI, "/tmp");
 	restored.updateResult({ content: [{ type: "text", text: "子任务失败" }], details: {}, isError: true });
 	assert.match(restored.render(80).join(""), /失败/);

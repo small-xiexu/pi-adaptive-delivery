@@ -38,7 +38,7 @@ export default function(pi) {
 	const development = await h.call("delivery_develop", { task: "fixture-inherited-tools：开发阶段也可查资料" });
 	for (const result of [analysis, development]) {
 		assert.equal(result.isError, false, JSON.stringify(result));
-		assert.equal((result.details as any).progress.status, "已结束，曾有工具异常");
+		assert.equal((result.details as any).progress.status, "已完成");
 		const file = (result.details as any).sessionFile ?? (result.details as any).childSessionFile;
 		const entries = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 		const tools = entries.filter((row) => row.message?.role === "toolResult").map((row) => row.message);

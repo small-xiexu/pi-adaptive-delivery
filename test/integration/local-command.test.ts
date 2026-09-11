@@ -8,7 +8,7 @@ import { CombinedAutocompleteProvider, type TUI } from "@earendil-works/pi-tui";
 import { createDevelopmentHost } from "../support/development-host.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 import type { TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
-import { TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
+import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 
 async function developmentHost(t: TestContext, scenario: string, script: string, commands: string[] = [], withPlanning = true) {
 	const h = await createDevelopmentHost(t, `local-${scenario}`, undefined, undefined, false);
@@ -40,8 +40,8 @@ test("真实检索无匹配与断言失败均保留具体原记录，正常结�
 		const result = await h.call(name, { task: "fixture-process-notes：执行检索和断言取证，保留过程记录。" });
 		assert.equal(result.isError, false, JSON.stringify(result));
 		const details = result.details as any;
-		assert.equal(details.progress.status, TOOL_ERROR_STATUS);
-		assert.match(details.progress.action, /2 次工具异常.*bash.*code 1/);
+		assert.equal(details.progress.status, COMPLETED_STATUS);
+		assert.doesNotMatch(details.progress.action, /工具异常|工具失败/);
 		const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
 		assert.match(text, /rg -n 'ABSENT_FIXTURE_PATTERN' input.txt/);
 		assert.match(text, /AssertionError/);
@@ -125,7 +125,7 @@ setTimeout(() => console.log("DETAIL_COMMAND_FINISHED"), 10_000);`);
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.equal(await h.readLease(), undefined);
 	const finished = h.session.prompt(`/delivery-tasks ${ref.data!.id}`);
-	await until(() => Boolean(panel?.render(100).join("\n").includes("开发结束")));
+	await until(() => Boolean(panel?.render(100).join("\n").includes("已完成")));
 	panel!.handleInput("\x1b[F");
 	assert.ok(panel!.render(100).join("\n").includes("DETAIL_COMMAND_FINISHED"));
 	panel!.handleInput("\x1b");
@@ -156,7 +156,7 @@ assert.equal(require("node:fs").readFileSync("src/value.js", "utf8"), "export co
 console.log("READ_RECOVERY_SELF_CHECK_OK");`, ["node inputs/command.cjs"]);
 	const result = await h.call("delivery_develop", { task: "先读取不存在的目标，然后创建、编辑并执行一次本机自检。" });
 	assert.equal(result.isError, false, "正常收尾返回结果，原始工具错误仍保留");
-	assert.equal((result.details as any).progress.status, TOOL_ERROR_STATUS);
+	assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
 	const [rows] = await h.children();
 	const tools = rows.filter((row: any) => row.message?.role === "toolResult").map((row: any) => row.message);
 	assert.deepEqual(tools.map((tool: any) => [tool.toolName, tool.isError]), [["read", true], ["write", false], ["edit", false], ["bash", false], ["read", false]]);
@@ -213,7 +213,7 @@ for (const kind of ["failure", "hook-deny", "hook-error"]) test(`正式本机命
 	const h = await developmentHost(t, kind, script);
 	const outcome = await h.call("delivery_develop", { task: "验证本机错误与配置检查" });
 	assert.equal(outcome.isError, false);
-	assert.equal((outcome.details as any).progress.status, TOOL_ERROR_STATUS);
+	assert.equal((outcome.details as any).progress.status, COMPLETED_STATUS);
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
 	const [rows] = await h.children();
 	const result = rows.find((row: any) => row.message?.role === "toolResult" && row.message.toolName === "bash");

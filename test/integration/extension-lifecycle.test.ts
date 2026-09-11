@@ -74,11 +74,11 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		if (success) {
 			assert.ok(progress.some((row) => row.action === "正在执行：read input.txt"));
 			assert.ok(progress.some((row) => row.action === "已完成：read input.txt"));
-			assert.equal(progress.at(-1).status, "执行结束，结果待核实");
+			assert.equal(progress.at(-1).status, "已完成");
 		}
-		if (scenario === "cancel") assert.equal(progress.at(-1).status, "已取消");
+		if (scenario === "cancel") assert.equal(progress.at(-1).status, "异常退出");
 		assert.equal(tool.isError, !success && !toolErrors, JSON.stringify(tool.result));
-		if (toolErrors) assert.equal(tool.result.details.progress.status, "已结束，曾有工具异常");
+		if (toolErrors) assert.equal(tool.result.details.progress.status, "已完成");
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.type === "custom" && entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
 		if (scenario === "missing-pi") {
@@ -98,7 +98,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 			const text = tool.result.content[0].text;
 			assert.ok(text.includes(ended.sessionFile));
 			assert.match(text, /过程记录.*工具异常/);
-			assert.match(text, /不证明错误已修复或任务已验收/);
+			assert.match(text, /不单独改变子 Agent 状态/);
 			assert.equal(ended.toolErrors, true);
 			assert.match(await readFile(ended.sessionFile, "utf8"), /"stopReason":"stop"/);
 			if (scenario === "readonly-recover") {
@@ -182,7 +182,7 @@ test("真实子 Pi 不注册批准工具，子模型请求不能扩大权限", {
 	assert.equal(ended.toolErrors, true);
 	const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_readonly");
 	assert.equal(result?.isError, false);
-	assert.equal(result.result.details.progress.status, "已结束，曾有工具异常");
+	assert.equal(result.result.details.progress.status, "已完成");
 	assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
 	const child = (await audit(agentDir)).find((row) => row.child && row.phase === "start");
 	assert.ok(!child.tools.includes("delivery_approval"));

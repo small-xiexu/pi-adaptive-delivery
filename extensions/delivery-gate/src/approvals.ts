@@ -16,7 +16,10 @@ export const APPROVAL_ENTRY = "delivery-approval";
 const parameters = Type.Object({
 	stage: StringEnum(["design", "implementation"] as const),
 	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用大白话分行说明，不复制全文台账。design 先说明本次要改成什么、范围、关键设计、风险和验收方向；有规划文档时在正文后补充修改摘要，路径由界面详情列出。简单任务直接说明，无须新建文档。implementation 先说明具体步骤、依赖、环境与停止条件；可写范围和固定验收命令由界面按参数列出，无须重复抄写，但须区分计划文件与实际可写目录。工具提供原方案查看入口，不重述相同方案，不以路径或摘要 ID 代替决策内容。" }),
+	documentStrategy: StringEnum(["none", "reuse", "new"] as const, { description: "本次规划文档策略：none=不落盘，reuse=复用现有文档，new=新建需求文档。implementation 与已确认的 design 使用相同策略。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "design 列明本任务由父维护的确切规划 Markdown 路径，随确认保护；简单任务没有规划文档时传 []，不得为填参数创建占位文档或遗漏已有需维护的方案/台账。implementation 必须列明允许子修改的文件或目录，不能传空数组。路径按 cwd 解析，不是 glob。" }),
+	technicalPlanPath: Type.Optional(Type.String({ minLength: 1, description: "design 中技术方案 Markdown 的相对路径；必须同时出现在 design.paths 中。无对应文件时省略。implementation 沿用已确认 design 的值。" })),
+	implementationPlanPath: Type.Optional(Type.String({ minLength: 1, description: "design 中实施计划 Markdown 的相对路径；必须同时出现在 design.paths 中。无对应文件时省略。implementation 沿用已确认 design 的值。" })),
 	validationCommands: Type.Array(Type.String({ minLength: 1 }), { description: "implementation 的固定本地验收命令；其他阶段为空。本工具不执行命令。" }),
 	inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "implementation 中纳入候选指纹的额外源码、配置或测试输入，按 cwd 解析，必须在 worktree 内且不含凭据。不包含整个工作区、规划文档、Git 或执行记录；这是验收范围，不是 Shell 隔离。" })),
 }, { additionalProperties: false });
@@ -29,6 +32,9 @@ interface Proposal {
 	cwd: string;
 	stage: Request["stage"];
 	body: string;
+	documentStrategy: "none" | "reuse" | "new";
+	technicalPlanPath?: string;
+	implementationPlanPath?: string;
 	paths: string[];
 	validationCommands: string[];
 	designApprovalId?: string;
@@ -55,10 +61,43 @@ const permissions = {
 	implementation: "确认后在本机开发、验收和返工；Shell 使用你的权限，不受文件路径隔离。\n提交、推送、PR、发布、部署、生产及其他外部写入需另行授权。",
 };
 
+const documentStrategyLabels = { none: "不落盘", reuse: "复用现有文档", new: "新建需求文档" } as const;
+type DocumentPlan = Pick<Proposal, "documentStrategy" | "technicalPlanPath" | "implementationPlanPath">;
+
+function documentSummary(proposal: Proposal): string {
+	const relative = (file?: string) => file ? path.relative(proposal.cwd, file) || "." : "无";
+	const labeled = new Set([proposal.technicalPlanPath, proposal.implementationPlanPath].filter(Boolean));
+	const extra = proposal.stage === "design" ? proposal.paths.filter((file) => !labeled.has(file)) : [];
+	return `文档策略：${documentStrategyLabels[proposal.documentStrategy]}\n技术方案：${relative(proposal.technicalPlanPath)}\n实施计划：${relative(proposal.implementationPlanPath)}`
+		+ (extra.length ? `\n其他规划文档：\n${extra.map((file) => `• ${relative(file)}`).join("\n")}` : "");
+}
+
+function resolveDocumentPlan(request: Request, cwd: string, expected?: Proposal): DocumentPlan {
+	if (request.stage === "implementation") {
+		if (!expected || request.documentStrategy !== expected.documentStrategy) throw new Error("实施文档策略必须沿用已确认方案");
+		for (const [name, value] of [["technicalPlanPath", request.technicalPlanPath], ["implementationPlanPath", request.implementationPlanPath]] as const) {
+			if (value !== undefined && path.resolve(cwd, value) !== expected[name]) throw new Error("实施规划路径必须沿用已确认方案");
+		}
+		return { documentStrategy: expected.documentStrategy, technicalPlanPath: expected.technicalPlanPath, implementationPlanPath: expected.implementationPlanPath };
+	}
+	const resolvedPaths = request.paths.map((value) => path.resolve(cwd, value));
+	if (request.documentStrategy === "none" && resolvedPaths.length) throw new Error("不落盘任务的规划路径必须为空");
+	if (request.documentStrategy !== "none" && !resolvedPaths.length) throw new Error("落盘任务必须列明规划 Markdown 路径");
+	const plan = {
+		documentStrategy: request.documentStrategy,
+		technicalPlanPath: request.technicalPlanPath ? path.resolve(cwd, request.technicalPlanPath) : undefined,
+		implementationPlanPath: request.implementationPlanPath ? path.resolve(cwd, request.implementationPlanPath) : undefined,
+	};
+	for (const value of [plan.technicalPlanPath, plan.implementationPlanPath].filter((item): item is string => Boolean(item))) {
+		if (!resolvedPaths.includes(value)) throw new Error("技术方案和实施计划路径必须同时列在规划 paths 中");
+	}
+	return plan;
+}
+
 function presentation(proposal: Proposal, expanded = false): string {
 	const relative = (file: string) => path.relative(proposal.cwd, file) || ".";
 	const files = (paths: string[]) => paths.map((file) => `• ${relative(file)}`).join("\n") || "无";
-	let content = proposal.body;
+	let content = `${documentSummary(proposal)}\n\n${proposal.body}`;
 	if (proposal.stage === "implementation") {
 		content += `\n\n允许修改（文件或目录）：\n${files(proposal.paths)}`
 			+ `\n\n验收时依次运行：\n${proposal.validationCommands.map((command, index) => `${index + 1}. ${command}`).join("\n") || "未提供固定命令，不能完成交付验收。"}`;
@@ -182,8 +221,12 @@ export function installApprovals(pi: ExtensionAPI) {
 					if (!isDeepStrictEqual(entry.data, expectedDesign.approval) || !isDeepStrictEqual(body.data, expectedDesign.proposal)) throw new Error("方案批准记录已变化");
 					approvedDesign = expectedDesign.proposal;
 				}
+				const documentPlan = resolveDocumentPlan(request, workspace.cwdPath, approvedDesign ?? expectedDesign?.proposal);
 				const proposal: Proposal = { id: randomUUID(), sessionId, workspaceKey: workspace.key, cwd: workspace.cwdPath,
-					stage: request.stage, body: request.body, paths, inputs, validationCommands: [...request.validationCommands],
+					stage: request.stage, body: request.body, documentStrategy: documentPlan.documentStrategy,
+					...(documentPlan.technicalPlanPath ? { technicalPlanPath: documentPlan.technicalPlanPath } : {}),
+					...(documentPlan.implementationPlanPath ? { implementationPlanPath: documentPlan.implementationPlanPath } : {}),
+					paths, inputs, validationCommands: [...request.validationCommands],
 					...(approvedDesign ? { designApprovalId: expectedDesign!.approval.id } : {}) };
 				const current = () => {
 					operation.throwIfAborted();
@@ -287,6 +330,9 @@ export function installApprovals(pi: ExtensionAPI) {
 			const { expected, expectedDesign, workspace } = await readCurrent(ctx, signal);
 			return { approvalId: expected.approval.id, proposalId: expected.proposal.id, designApprovalId: expectedDesign!.approval.id,
 				designBody: expectedDesign!.proposal.body, implementationBody: expected.proposal.body,
+				documentStrategy: expectedDesign!.proposal.documentStrategy,
+				technicalPlanPath: expectedDesign!.proposal.technicalPlanPath,
+				implementationPlanPath: expectedDesign!.proposal.implementationPlanPath,
 				planningPaths: [...expectedDesign!.proposal.paths],
 				sessionId: expected.approval.sessionId, workspace, paths: [...expected.proposal.paths],
 				validationCommands: [...expected.proposal.validationCommands], inputs: [...expected.proposal.inputs], signal: expected.controller.signal };

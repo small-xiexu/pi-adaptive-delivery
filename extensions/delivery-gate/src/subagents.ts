@@ -6,7 +6,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { truncateHead, type BuildSystemPromptOptions, type ExtensionContext, type RpcCommand, type RpcExtensionUIResponse, type RpcSessionState, type SessionEntry, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { resolveWorkspaceIdentity } from "./workspace.ts";
-import { createTaskProgress, summarizeToolErrors, TOOL_ERROR_STATUS, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
+import { ABNORMAL_STATUS, COMPLETED_STATUS, createTaskProgress, summarizeToolErrors, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 
 export const CHILD_ENV = "PI_ADAPTIVE_DELIVERY_CHILD";
 export const DELEGATE_TOOL = "delivery_readonly";
@@ -431,7 +431,7 @@ export async function delegateReadOnly(
 	if (operation.aborted) problem ??= operation.reason;
 	record({ ...reference(), phase: "ended", status: !rpc.exit || rpc.openTools.size ? "unknown" : operation.aborted ? "cancelled" : problem ? "failed" : "completed",
 		exit: rpc.exit, toolErrors: rpc.toolError, error: problem ? String(problem) : undefined });
-	progress.end(!rpc.exit || rpc.openTools.size || !stopped ? "收尾未知" : operation.aborted ? "已取消" : problem ? "失败" : rpc.toolError ? TOOL_ERROR_STATUS : "执行结束，结果待核实", !problem ? toolNotes?.action : undefined);
+	progress.end(!rpc.exit || rpc.openTools.size || !stopped || operation.aborted || problem ? ABNORMAL_STATUS : COMPLETED_STATUS);
 	if (problem) throw new Error(`只读委派未成功：${String(problem)}`
 		+ (state?.sessionFile ? `\n原始子 Session：${state.sessionFile}` : "\n子 Session 引用尚未取得。")
 		+ `\n进程收尾：${stopped && rpc.exit?.code === 0 && rpc.exit.signal === null && !rpc.failure ? "已正常关闭" : "未核实正常关闭"}；工具终态：${rpc.openTools.size ? "仍有未确认执行" : "无在途工具"}。`

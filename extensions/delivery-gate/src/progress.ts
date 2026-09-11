@@ -15,8 +15,10 @@ export interface TaskProgress {
 	pending?: { id: string; name: string; callId?: string; args?: unknown; output: string }[];
 }
 export type ProgressUpdate = (message: string, progress: TaskProgress) => void;
-export const TOOL_ERROR_STATUS = "已结束，曾有工具异常";
-export const TOOL_ERROR_GUIDANCE = "以下为过程中工具异常的原始摘要，不是整项任务失败的判定。请结合调用、原始返回、后续操作及最终产物说明具体原因和交付影响，再决定是否返工或继续验证；此结果不证明错误已修复或任务已验收。";
+export const RUNNING_STATUS = "运行中";
+export const COMPLETED_STATUS = "已完成";
+export const ABNORMAL_STATUS = "异常退出";
+export const TOOL_ERROR_GUIDANCE = "以下为过程中工具调用的原始异常摘要。它不单独改变子 Agent 状态；请交给父 Pi 结合调用、原始返回、后续操作和最终产物判断是否继续。";
 const short = (text: string, limit = 300) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, limit);
 const tail = (text: string) => text.length > 4000 ? `[预览已省略，详情查看完整内容]\n${text.slice(-4000)}` : text;
 const streamingTail = (text: string) => text.length > 64_000 ? `[在途输出仅保留最近片段，完成后可查看原始结果]\n${text.slice(-64_000)}` : text;
@@ -58,7 +60,7 @@ export function summarizeToolErrors(rows: readonly SessionEntry[]) {
 
 // 每个调用独立的展示缓存；证据与交接仍只使用原生 Session。
 export function createTaskProgress(id: string, label: string, task: string, update: ProgressUpdate) {
-	const view: TaskProgress = { id, name: short(`${label} · ${task}`, 160), status: "准备中", action: "核对任务环境", recent: [], output: "", startedAt: Date.now() };
+	const view: TaskProgress = { id, name: short(`${label} · ${task}`, 160), status: RUNNING_STATUS, action: "核对任务环境", recent: [], output: "", startedAt: Date.now() };
 	const open = new Map<string, string>();
 	const pending = new Map<string, NonNullable<TaskProgress["pending"]>[number]>();
 	const commands = new Map<number, string>();
@@ -78,13 +80,13 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 	return {
 		snapshot,
 		agent(agent: NonNullable<TaskProgress["agent"]>) { view.agent = { ...agent }; emit(); },
-		phase(status: string, detail?: string, sessionFile?: string) {
-			view.status = status;
+		phase(_status: string, detail?: string, sessionFile?: string) {
+			view.status = RUNNING_STATUS;
 			if (detail) action(detail);
 			if (sessionFile) view.sessionFile = sessionFile;
 			emit();
 		},
-		end(status: string, detail?: string) {
+		end(status: typeof COMPLETED_STATUS | typeof ABNORMAL_STATUS, detail?: string) {
 			view.status = status; view.endedAt = Date.now();
 			pending.clear();
 			if (detail) action(detail);
@@ -101,7 +103,7 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 				open.set(event.toolCallId, detail);
 				pending.set(`call:${event.toolCallId}`, { id: `call:${event.toolCallId}`, callId: event.toolCallId, name: event.toolName, args, output: "" });
 				view.output = "";
-				view.status = "执行中";
+				view.status = RUNNING_STATUS;
 				action(`正在执行：${detail}`);
 			} else if (event.type === "tool_execution_end") {
 				const detail = open.get(event.toolCallId) ?? event.toolName;
@@ -112,8 +114,8 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 				if (running) commands.set(session, detail);
 				if (!event.isError && Number.isInteger(event.result?.details?.exit_code)) commands.delete(polls.get(event.toolCallId)!);
 				polls.delete(event.toolCallId);
-				action(`${event.isError ? "工具失败" : running ? "正在执行" : "已完成"}：${detail}`);
-				view.status = event.isError ? "工具失败，子任务仍在运行" : running ? "执行中" : "运行中";
+				action(`${event.isError ? "已返回" : running ? "正在执行" : "已完成"}：${detail}`);
+				view.status = RUNNING_STATUS;
 				if (open.size) view.action = `正在执行：${[...open.values()].at(-1)}`;
 				else if (!event.isError && commands.size) view.action = `正在执行：${[...commands.values()].at(-1)}`;
 				view.output = tail(outputText(event.result));
@@ -136,10 +138,10 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 				text = tail(outputText(event.message));
 				if (text) { view.output = text; if (!open.size && !commands.size) view.action = "已更新任务说明"; }
 			} else if (event.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(event.method)) {
-				view.status = "等待用户回答";
+				view.status = RUNNING_STATUS;
 				action(event.title ?? event.message ?? "子任务请求交互");
 			} else if (event.type === "agent_settled") {
-				view.status = "核对收尾中";
+				view.status = RUNNING_STATUS;
 			} else return;
 			emit();
 		},
@@ -154,14 +156,15 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			if (progress) context.state.progress = progress;
 			const latest = (progress ?? context.state.progress) as TaskProgress | undefined;
 			const body = outputText(result);
-			const status = isPartial ? latest?.status ?? "准备中" : context.isError ? (latest && ["已取消", "收尾未知", "启动失败"].includes(latest.status) ? latest.status : "失败") : latest?.status ?? "执行结束，结果待核实";
-			const heading = `${status === "执行结束，结果待核实" ? "已结束，待核对" : status} · ${label} · ${short((context.args as { task?: string })?.task ?? "固定候选验收", 64)}`;
+			const status = latest?.endedAt ? (latest.status === ABNORMAL_STATUS ? ABNORMAL_STATUS : COMPLETED_STATUS)
+				: isPartial ? RUNNING_STATUS : context.isError ? ABNORMAL_STATUS : COMPLETED_STATUS;
+			const heading = `${status} · ${label} · ${short((context.args as { task?: string })?.task ?? "固定候选验收", 64)}`;
 			const detail = (latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking} · ` : "") + (latest?.action ?? (isPartial ? "核对任务环境" : short(body)));
 			const component = {
 				invalidate() {},
 				render(width: number) {
 					const hint = open ? " /delivery-tasks" : "";
-					const title = truncateToWidth(theme.fg(context.isError ? "error" : "toolTitle", heading), Math.max(1, width - hint.length));
+					const title = truncateToWidth(theme.fg(status === ABNORMAL_STATUS ? "error" : "toolTitle", heading), Math.max(1, width - hint.length));
 					const lines = [truncateToWidth(title + theme.fg("muted", hint), width), truncateToWidth(theme.fg("muted", detail), width)];
 					if (expanded) {
 						if (open) lines.push(...new Text("/delivery-tasks 查看详情 · 全屏模式可点击卡片 · Esc 关闭详情", 0, 0).render(width));

@@ -68,7 +68,7 @@ for (const scenario of ["normal", "rules-missing", "instructions-missing", "skil
 		assert.ok(result);
 		const toolErrors = scenario === "hook-deny" || scenario === "hook-error";
 		assert.equal(result.isError, scenario !== "normal" && !toolErrors, JSON.stringify(result.result));
-		if (toolErrors) assert.equal(result.result.details.progress.status, "已结束，曾有工具异常");
+		if (toolErrors) assert.equal(result.result.details.progress.status, "已完成");
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
 		assert.ok(ended?.pid);

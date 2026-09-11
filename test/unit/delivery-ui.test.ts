@@ -7,7 +7,7 @@ import { initTheme, SessionManager, ToolExecutionComponent, type ToolDefinition 
 import { CURSOR_MARKER, TuiAltScreen, TuiMainScreen, visibleWidth, type Terminal, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DeliveryPanel, DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
-import { createTaskProgress, taskRenderers, TOOL_ERROR_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
+import { COMPLETED_STATUS, createTaskProgress, RUNNING_STATUS, taskRenderers } from "../../extensions/delivery-gate/src/progress.ts";
 import { installTaskDetails, taskDetails, createTaskRecordReader, TaskDetailsPanel } from "../../extensions/delivery-gate/src/task-details.ts";
 import { plainTheme } from "../support/delivery-ui.ts";
 
@@ -247,10 +247,10 @@ test("详情复用原生分支与长 Session，保留完整调用/结果、末�
 	await writeFile(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n{\"type\":");
 	const before = await readFile(file, "utf8");
 	const progress = createTaskProgress("a", "只读", task, () => {});
-	progress.phase("工具失败，子任务仍在运行", "正在取证", file);
+	progress.phase(RUNNING_STATUS, "正在取证", file);
 	const tasks = taskDetails({ sessionManager: sm }, [progress.snapshot()]);
 	assert.equal(tasks.length, 2);
-	assert.equal(tasks[0]!.status, "工具失败，子任务仍在运行");
+	assert.equal(tasks[0]!.status, RUNNING_STATUS);
 	const record = await readTaskRecord(tasks[0]!);
 	assert.equal(record.task.task, task);
 	assert.equal(record.entries[0]!.callId, "read");
@@ -261,7 +261,7 @@ test("详情复用原生分支与长 Session，保留完整调用/结果、末�
 	assert.ok(!JSON.stringify(record).includes("不得显示的推理") && !JSON.stringify(record).includes("另一个任务"));
 	assert.equal(await readFile(file, "utf8"), before);
 	sm.appendMessage({ role: "toolResult", toolCallId: "a", toolName: "delivery_readonly", isError: true, content: [{ type: "text", text: "最终失败" }], timestamp: Date.now() });
-	assert.equal(taskDetails({ sessionManager: sm }, [progress.snapshot()])[0]!.status, "失败", "旧进度不能覆盖原生最终结果");
+	assert.equal(taskDetails({ sessionManager: sm }, [progress.snapshot()])[0]!.status, "异常退出", "旧进度不能覆盖原生最终结果");
 });
 
 test("卡片只显示已核实模型，原生记录重开后保留选择理由且不被旧进度覆盖", async () => {
@@ -272,7 +272,7 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	const progress = createTaskProgress("a", "审查", "核对代码", () => {});
 	assert.equal(progress.snapshot().agent, undefined, "READY 前不能展示未经核实的选择");
 	progress.agent(agent);
-	progress.end(TOOL_ERROR_STATUS, "2 次工具异常 · bash：Command exited with code 1");
+	progress.end(COMPLETED_STATUS);
 	const tool: ToolDefinition = { name: "delivery_review", label: "审查", description: "", parameters: Type.Object({}),
 		...taskRenderers("审查"), execute: async () => ({ content: [], details: {} }) };
 	const card = new ToolExecutionComponent(tool.name, "a", { task: "核对代码" }, {}, tool, tui, root);
@@ -289,12 +289,11 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	const reopened = SessionManager.open(sm.getSessionFile()!);
 	const task = taskDetails({ sessionManager: reopened }, [progress.snapshot()])[0]!;
 	assert.deepEqual(task.agent, agent);
-	assert.equal(task.status, TOOL_ERROR_STATUS, "重开后保留过程错误提示，不还原为失败或无问题");
+	assert.equal(task.status, COMPLETED_STATUS, "重开后保留已完成主状态，不把过程错误提升为失败");
 	const panel = new TaskDetailsPanel(task, tui, plainTheme, () => {});
 	panel.update({ task, entries: [{ id: "result", name: "子任务说明", output: "已完成检查" }] });
 	assert.match(panel.render(100).join("\n"), /fixture-reasoner.*high/);
-	assert.match(panel.render(100).join("\n"), /2 次工具异常.*code 1/);
-	assert.match(panel.render(100).join("\n"), /原记录第 3 行，rg missing input.txt/);
+	assert.doesNotMatch(panel.render(100).join("\n"), /已结束，曾有工具异常|暂停跟随/);
 	panel.handleInput("\r");
 	assert.match(panel.render(100).join("\n"), /fixture-provider\/fixture-reasoner.*high/);
 	assert.match(panel.render(100).join("\n"), /代码审查需要检查权限边界/);
@@ -347,7 +346,7 @@ test("缺失原记录与父最终失败原因直接显示，鼠标不打开已�
 	const panel = new TaskDetailsPanel(task, tui, plainTheme, () => {});
 	panel.update(await readTaskRecord(task));
 	assert.match(panel.render(80).join("\n"), /原始记录读取失败/);
-	panel.update({ task: { ...task, status: "失败", result: "持久关闭记录未核实" }, entries: [{ id: "call:a", callId: "a", line: 1, name: "read", args: { path: "file.ts" } }] });
+	panel.update({ task: { ...task, status: "异常退出", result: "持久关闭记录未核实" }, entries: [{ id: "call:a", callId: "a", line: 1, name: "read", args: { path: "file.ts" } }] });
 	panel.render(80);
 	panel.handleMouse({ ...mouse("click", 3), x: 12 });
 	assert.match(panel.render(80).join("\n"), /read · 待返回/);
@@ -376,7 +375,7 @@ test("执行中的连续输出跟随最新行，上翻暂停，最终结果替�
 	assert.match(render(), /执行测试/);
 	panel.handleInput("\x1b[5~");
 	const paused = render();
-	assert.match(paused, /暂停跟随/);
+	assert.doesNotMatch(paused, /暂停跟随/);
 	const next = first + "\n" + "后续输出\n".repeat(20_000) + "SECOND_LATEST";
 	progress.event({ type: "tool_execution_update", toolCallId: "bash-a", partialResult: { content: [{ type: "text", text: next }] } });
 	await refresh();
