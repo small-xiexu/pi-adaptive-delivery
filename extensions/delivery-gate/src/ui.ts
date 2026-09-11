@@ -3,6 +3,29 @@ import { Editor, matchesKey, SelectList, Text, truncateToWidth, type TUI, type T
 
 export const displayText = (text: string) => text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 
+const rule = (theme: Theme, width: number) => theme.fg("borderMuted", "─".repeat(Math.max(1, width)));
+
+const wrapped = (text: string, width: number, prefix = "  ") => {
+	const available = Math.max(1, width - prefix.length);
+	return new Text(displayText(text), 0, 0).render(available).map((line) => truncateToWidth(prefix + line, width, ""));
+};
+
+const panelHeader = (theme: Theme, width: number, title: string, subtitle: string) => [
+	...wrapped(title, width).map((line) => theme.fg("accent", line)),
+	...wrapped(subtitle, width).map((line) => theme.fg("muted", line)),
+	rule(theme, width),
+];
+
+const panelFooter = (theme: Theme, width: number, first: string, second: string) => [
+	rule(theme, width),
+	...wrapped([first, second].filter(Boolean).join("\n"), width).map((line) => theme.fg("muted", line)),
+];
+
+const noticeLines = (theme: Theme, width: number, notice: string) => notice ? [
+	...wrapped("说明", width).map((line) => theme.fg("muted", line)),
+	...wrapped(notice, width, "  │ ").map((line) => theme.fg("muted", line)),
+] : [];
+
 export type DesignReviewResult = { feedback: string } | "确认方案" | undefined;
 
 // 先阅读并选择操作，需要修改时再输入意见；发送意见不等于批准。
@@ -73,12 +96,15 @@ export class DesignReviewPanel {
 		return { handled: true };
 	}
 	render(width: number) {
-		const body = new Text(displayText(this.expanded ? this.detail : this.body), 0, 0).render(width);
+		const body = wrapped(this.expanded ? this.detail : this.body, width);
 		const editor = this.editing ? this.editor.render(width) : [];
 		const options = this.editing ? [] : this.select.render(width);
-		const notice = this.notice && !this.editing ? new Text(displayText(this.notice), 0, 0).render(width) : [];
-		const footer = new Text(`${this.editing ? "Enter 发送意见 · Shift+Enter 换行 · Esc 返回方案" : "↑↓ 选择 · Enter 确定 · Esc 稍后再看"}\nCtrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页`, 0, 0).render(width);
-		const reserved = editor.length + options.length + notice.length + footer.length + (this.editing ? 3 : 2);
+		const notice = this.notice && !this.editing ? noticeLines(this.theme, width, this.notice) : [];
+		const header = panelHeader(this.theme, width, this.title, this.editing ? "提出修改意见" : "请先阅读，再选择下一步");
+		const footer = panelFooter(this.theme, width,
+			this.editing ? "Enter 发送意见 · Shift+Enter 换行 · Esc 返回方案" : "↑↓ 选择 · Enter 确定 · Esc 稍后再看",
+			`Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页`);
+		const reserved = header.length + editor.length + options.length + notice.length + footer.length + (this.editing ? 2 : 3);
 		this.fits = reserved + 1 < this.tui.terminal.rows;
 		if (!this.fits) return [truncateToWidth("请放大终端 · Esc 稍后再看", width)];
 		this.pageSize = Math.max(1, Math.min(body.length,
@@ -86,15 +112,18 @@ export class DesignReviewPanel {
 		this.total = body.length;
 		this.scroll(0);
 		const position = body.length > this.pageSize ? `${this.offset + 1}–${Math.min(body.length, this.offset + this.pageSize)} / ${body.length} 行` : "";
-		const lines = [truncateToWidth(this.theme.fg("accent", `─ ${this.title} `) + this.theme.fg("border", "─".repeat(width)), width, ""),
-			...body.slice(this.offset, this.offset + this.pageSize), this.theme.fg("muted", position),
-			...notice.map((line) => this.theme.fg("muted", line))].map((line) => truncateToWidth(line, width, ""));
+		const lines = [...header, ...body.slice(this.offset, this.offset + this.pageSize),
+			truncateToWidth(this.theme.fg("dim", position), width, ""), ...notice];
 		if (this.editing) lines.push(this.theme.fg("accent", "你希望怎么改？"));
 		this.editorRow = lines.length;
 		this.editorHeight = editor.length;
 		lines.push(...editor);
-		this.optionsRow = lines.length;
-		return [...lines, ...options, ...footer.map((line) => this.theme.fg("muted", line))];
+		if (!this.editing) {
+			lines.push(this.theme.fg("accent", "  操作"));
+			this.optionsRow = lines.length;
+			lines.push(...options);
+		}
+		return [...lines, ...footer];
 	}
 }
 
@@ -147,12 +176,14 @@ export class DeliveryPanel {
 		return { handled: true };
 	}
 	render(width: number) {
-		const body = new Text(displayText(this.expanded ? this.detail : this.body), 0, 0).render(width);
-		const footer = new Text(this.detail ? `↑↓ 选择 · Enter 确定 · Esc 取消\nCtrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页`
-			: "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭", 0, 0).render(width);
+		const body = wrapped(this.expanded ? this.detail : this.body, width);
+		const header = panelHeader(this.theme, width, this.title, this.detail ? "请核对实施范围和验收命令" : "查看信息 · Esc 关闭");
+		const footer = panelFooter(this.theme, width,
+			this.detail ? "↑↓ 选择 · Enter 确定 · Esc 暂不批准" : "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭",
+			this.detail ? `Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页` : "");
 		const options = this.select?.render(width) ?? [];
-		const notice = this.notice ? new Text(displayText(this.notice), 0, 0).render(width) : [];
-		const reserved = footer.length + options.length + notice.length + 2;
+		const notice = noticeLines(this.theme, width, this.notice);
+		const reserved = header.length + footer.length + options.length + notice.length + (this.select ? 3 : 1);
 		this.fits = reserved + 1 < this.tui.terminal.rows;
 		if (!this.fits) return [truncateToWidth("请放大终端 · Esc 取消", width)];
 		this.pageSize = Math.max(1, Math.min(body.length,
@@ -162,9 +193,12 @@ export class DeliveryPanel {
 		const page = body.slice(this.offset, this.offset + this.pageSize);
 		while (page.length < this.pageSize) page.push("");
 		const position = body.length > this.pageSize ? `${this.offset + 1}–${Math.min(body.length, this.offset + this.pageSize)} / ${body.length} 行 · 可滚动查看` : "";
-		const lines = [truncateToWidth(this.theme.fg("accent", `─ ${displayText(this.title)} `) + this.theme.fg("border", "─".repeat(width)), width, ""), ...page,
-			truncateToWidth(this.theme.fg("muted", position), width), ...notice.map((line) => this.theme.fg("muted", line))];
-		this.optionsRow = lines.length;
-		return [...lines, ...options, ...footer.map((line) => this.theme.fg("muted", line))];
+		const lines = [...header, ...page,
+			truncateToWidth(this.theme.fg("dim", position), width, ""), ...notice];
+		if (this.select) {
+			lines.push(this.theme.fg("accent", "  操作"));
+			this.optionsRow = lines.length;
+		}
+		return [...lines, ...options, ...footer];
 	}
 }

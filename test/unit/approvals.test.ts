@@ -305,7 +305,8 @@ test("小修复首屏先显示改法与实际命令，文档和记录引用收�
 		h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
 			const panel = await factory(...args);
 			const screen = panel.render(100).join("\n");
-			assert.ok(screen.split("\n")[1]!.startsWith(bodies[stage]), "首行正文不能被权限条款或文档路径占用");
+			const bodyLine = screen.split("\n").findIndex((line: string) => line.includes(bodies[stage]));
+			assert.ok(bodyLine >= 1 && bodyLine <= 5, "正文应在面板顶部内容区显示");
 			assert.match(screen, /↑↓ 选择 · Enter 确定/);
 			assert.match(screen, /Ctrl\+O 查看详情/);
 			assert.doesNotMatch(screen, /父会话|提案记录|项路径|你希望怎么改/);

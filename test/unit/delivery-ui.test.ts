@@ -40,6 +40,16 @@ test("方案先阅读，按需输入意见；空提交和查看详情不批准�
 	assert.deepEqual(results, [{ feedback: `先保留原接口\n${paste}` }]);
 });
 
+test("确认面板窄屏换行保留中文和长正文末尾", () => {
+	const panel = new DeliveryPanel("实施确认", "修改 src/features/日期格式化函数，并保留验收记录 END_OF_PLAN", "", [], tui, plainTheme, () => {});
+	for (const width of [20, 40, 80]) {
+		const lines = panel.render(width);
+		assert.ok(lines.every((line) => visibleWidth(line) <= width));
+		assert.match(lines.join("\n"), /日期格式化函数/);
+		assert.match(lines.join("\n"), /END_OF_PLAN/);
+	}
+});
+
 test("方案默认稍后再看，鼠标可打开意见，Esc 返回保留草稿且不批准", () => {
 	const results: unknown[] = [];
 	const panel = new DesignReviewPanel("方案", "详情", tui, plainTheme, (value) => results.push(value));
