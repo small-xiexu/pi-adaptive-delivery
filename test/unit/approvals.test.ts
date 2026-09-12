@@ -90,6 +90,15 @@ test("仅方案与实施两次确认，规划文档冻结为保护路径，文�
 	assert.deepEqual(h.displayed.map((row) => row.options.at(-1)), ["稍后再看", "暂不批准"]);
 });
 
+test("实施批准提前拒绝规划保护路径出现在范围或验收输入", async () => {
+	const h = await host();
+	await h.run();
+	await assert.rejects(h.run({ ...implementation, paths: ["src", "docs/方案.md"] }), /不能包含方案、实施计划/);
+	await assert.rejects(h.run({ ...implementation, inputs: ["docs/计划.md"] }), /不能包含方案、实施计划/);
+	const approved = await h.run(implementation);
+	assert.equal(approved.details.approved, true);
+});
+
 test("状态展示只读取本次确认，导航、重载与取消新提案均不恢复旧批准", async () => {
 	const h = await host();
 	await h.run();

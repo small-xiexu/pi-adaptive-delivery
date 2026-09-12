@@ -8,7 +8,7 @@ import { createBashTool, type ExtensionAPI } from "@earendil-works/pi-coding-age
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { createDevelopmentHost as host } from "../support/development-host.ts";
 import { FixtureRpc, testEnvironment } from "../support/pi-fixture.ts";
-import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
+import { ABNORMAL_STATUS, COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 
 test("真实子 edit 匹配不唯一后补充上下文修正，返回过程错误提示而非整项失败", { timeout: 40_000 }, async (t) => {
 	const h = await host(t, "edit-recovery");
@@ -290,6 +290,19 @@ test("握手失败后子退出异常保留父 writer，不因任务尚未发送�
 	assert.match(h.notices.at(-1)!, /暂不能退出交付/);
 	assert.equal((await h.call("delivery_document_write", { path: "plan.md", content: "未核实前不能写进度" })).isError, true);
 	await assert.rejects(access(path.join(h.cwd, "plan.md")), { code: "ENOENT" });
+});
+
+test("开发握手失败即使子进程正常关闭也显示异常退出", { timeout: 40_000 }, async (t) => {
+	const h = await host(t, "selection-mismatch");
+	const progress: any[] = [];
+	t.after(h.session.subscribe((event) => { if (event.type === "tool_execution_update" && event.toolName === "delivery_develop") progress.push(event.partialResult.details.progress); }));
+	await h.prepare();
+	await h.session.setModel(h.session.modelRuntime.getModel("adaptive-fixture", "fake-reasoner")!);
+	const result = await h.call("delivery_develop", { task: "只核验启动异常", agent: { thinking: "high", reason: "核对正常关闭但未发送任务" } });
+	assert.equal(result.isError, true);
+	assert.match(JSON.stringify(result), /未发送任务/);
+	assert.equal(progress.at(-1).status, ABNORMAL_STATUS);
+	assert.equal(await h.readLease(), undefined);
 });
 
 test("真实验收与审查子可分别选择级别，原批准与工具参数绑定保持", { timeout: 40_000 }, async (t) => {
@@ -1014,7 +1027,7 @@ for (const name of ["edit", "write"]) test(`父 ${name} 仅在内存被覆盖而
 	assert.match(JSON.stringify(result.content), /父子工具定义或来源未对齐/);
 	assert.match(JSON.stringify(result.content), new RegExp(`定义或来源不同：${name}`));
 	assert.match(JSON.stringify(result.content), /子收尾核验：已取得证明/);
-	assert.equal(progress.at(-1).status, "已完成");
+	assert.equal(progress.at(-1).status, ABNORMAL_STATUS);
 	assert.ok(!(await h.audit()).some((row) => row.child && row.phase === "model"));
 	for (const child of (await h.audit()).filter((row) => row.child && row.phase === "start")) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined);

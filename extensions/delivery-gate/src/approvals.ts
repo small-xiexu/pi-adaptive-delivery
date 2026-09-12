@@ -155,6 +155,11 @@ async function persisted<T>(ctx: ExtensionContext, ...references: [customType: s
 	});
 }
 
+function pathsOverlap(left: string, right: string): boolean {
+	const relative = path.relative(left, right);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 export function installApprovals(pi: ExtensionAPI) {
 	// 只记住本次运行亲自完成的确认；与原生条目不共享可变对象，也不从历史恢复。
 	let design: Confirmed | undefined;
@@ -266,6 +271,10 @@ export function installApprovals(pi: ExtensionAPI) {
 					const [entry, body] = await persisted<Approval | Proposal>(ctx, [APPROVAL_ENTRY, expectedDesign.approval.id], [PROPOSAL_ENTRY, expectedDesign.proposal.id]);
 					if (!isDeepStrictEqual(entry.data, expectedDesign.approval) || !isDeepStrictEqual(body.data, expectedDesign.proposal)) throw new Error("方案批准记录已变化");
 					approvedDesign = expectedDesign.proposal;
+					const protectedPlanningPaths = approvedDesign.paths;
+					if ([...paths, ...inputs].some((candidate) => protectedPlanningPaths.some((planning) => pathsOverlap(planning, candidate) || pathsOverlap(candidate, planning)))) {
+						throw new Error("实施路径或验收输入不能包含方案、实施计划等父维护规划文档路径");
+					}
 				}
 				const revisionBase = request.validationRevisionOf ? implementationBasis : undefined;
 				if (request.validationRevisionOf && (!revisionBase || revisionBase.approval.id !== request.validationRevisionOf)) {

@@ -11,15 +11,16 @@ function host(entries: any[] = []) {
 	let tools = ["read", "bash", "plugin"];
 	let starts = 0, reloads = 0;
 	let idle = true, queued = false, blocked = false;
+	let autocompleteProvider: CombinedAutocompleteProvider;
 	const pi: any = { on: (name: string, fn: Function) => handlers.set(name, fn), registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
 		getActiveTools: () => [...tools], getAllTools: () => ["read", "bash", "plugin"].map((name) => ({ name })), setActiveTools: (names: string[]) => { tools = names; },
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }), sendUserMessage: (...args: any[]) => messages.push(args), sendMessage: (...args: any[]) => messages.push(args) };
-	const ctx: any = { sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
-		ui: { notify: (text: string) => notices.push(text) }, reload: async () => { reloads++; } };
+	const ctx: any = { hasUI: true, sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
+		ui: { notify: (text: string) => notices.push(text), addAutocompleteProvider: (factory: any) => { autocompleteProvider = factory(autocompleteProvider); } }, reload: async () => { reloads++; } };
 	installActivation(pi, (current) => { assert.equal(current, ctx); starts++; return { initialize: async () => { tools = ["read"]; }, assertCanExit: async () => { if (blocked) throw new Error("未知 writer"); } }; });
-	const autocomplete = new CombinedAutocompleteProvider([...commands].map(([name, command]) => ({ name, description: command.description })), "/tmp");
+	autocompleteProvider = new CombinedAutocompleteProvider([...commands].map(([name, command]) => ({ name, description: command.description })), "/tmp");
 	return { pi, ctx, entries, notices, messages, handlers, command: (name: string, args = "") => commands.get(name).handler(args, ctx),
-		completions: async () => (await autocomplete.getSuggestions(["/delivery-"], 0, 10, { signal: new AbortController().signal }))?.items.map((item) => item.value),
+		completions: async () => (await autocompleteProvider.getSuggestions(["/delivery-"], 0, 10, { signal: new AbortController().signal }))?.items.map((item) => item.value),
 		starts: () => starts, reloads: () => reloads, setBusy: (value: boolean) => { idle = !value; }, setQueued: (value: boolean) => { queued = value; }, setBlocked: () => { blocked = true; } };
 }
 
@@ -38,9 +39,12 @@ test("普通启动和状态查询不安装运行逻辑、不改工具、不发�
 
 test("启动时建立的补全已包含任务与恢复入口，首次 shape 后仍可发现，无须重建", async () => {
 	const h = host();
+	await h.handlers.get("session_start")!({}, h.ctx);
 	const before = await h.completions();
 	assert.ok(before?.includes("delivery-tasks"));
 	assert.ok(before?.includes("delivery-resume"));
+	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-tasks"));
+	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-resume"));
 	await h.command("delivery-shape");
 	assert.deepEqual(await h.completions(), before);
 });

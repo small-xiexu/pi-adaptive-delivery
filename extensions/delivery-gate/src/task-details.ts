@@ -222,7 +222,7 @@ export class TaskDetailsPanel {
 		const rule = (left: string, right: string) => th.bg("customMessageBg", th.fg("border", left + "─".repeat(width - 2) + right));
 		const footer = width >= 72 ? ["↑↓ / PgUp/PgDn 滚动 · End 最新 · Esc 关闭"] : ["↑↓ 滚动 · End 最新", "Esc 关闭"];
 		const task = this.record.task;
-		const context = !this.full ? [th.fg("muted", `${task.batch ? `交付 ${task.batch} · ` : "独立调用 · "}${clean(task.label)}${task.attempt ? `第${task.attempt}次` : ""}`),
+		const context = !this.full ? [th.fg("muted", `${task.batch ? `实施批次 ${task.batch} · ` : "独立任务 · "}${clean(task.label)}${task.attempt ? ` · 第 ${task.attempt} 次` : ""}`),
 			th.fg("muted", `任务：${short(task.task)}`),
 			...(task.agent ? [th.fg("muted", `模型：${short(task.agent.id)} · ${short(task.agent.thinking)} · Enter 查看选择理由`)] : []),
 			...(task.result === undefined ? [th.fg("muted", short(task.progress?.action ?? "等待进度更新"))] : [])] : [];
@@ -237,7 +237,7 @@ export class TaskDetailsPanel {
 		if (this.total > this.pageSize) position += ` · ${this.offset + 1}–${Math.min(this.total, this.offset + this.pageSize)} / ${this.total} 行`;
 		while (page.length < this.pageSize) page.push("");
 		const status = [RUNNING_STATUS, COMPLETED_STATUS, ABNORMAL_STATUS].includes(task.status) ? task.status : RUNNING_STATUS;
-		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)}${task.attempt ? `第${task.attempt}次` : ""} · ${clean(status)}`)), row(""), rule("├", "┤"),
+		return [rule("╭", "╮"), row(th.bold(th.fg("accent", "子任务详情")) + th.fg("muted", `  · ${clean(task.label)}${task.attempt ? ` · 第 ${task.attempt} 次` : ""} · ${clean(status)}`)), row(""), rule("├", "┤"),
 			...context.map(row), ...page.map(row), rule("├", "┤"), row(th.fg("muted", position)), ...footer.map((line) => row(th.fg("muted", line))), rule("╰", "╯")];
 	}
 }
@@ -254,11 +254,11 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[],
 		const tasks = taskDetails(ctx, live()).reverse();
 		if (!id) {
 			if (!tasks.length) { ctx.ui.notify("当前会话还没有交付子任务。", "info"); return; }
-			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `交付 ${task.batch} · ` : "独立调用 · "}${displayText(task.label)}${task.attempt ? `第${task.attempt}次` : ""} · ${displayText(task.status)}${task.agent ? ` · 模型：${displayText(task.agent.id)} · 推理：${displayText(task.agent.thinking)}` : ""} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
+			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `实施批次 ${task.batch} · ` : "独立任务 · "}${displayText(task.label)}${task.attempt ? ` · 第 ${task.attempt} 次` : ""} · ${displayText(task.status)}${task.agent ? ` · 模型：${displayText(task.agent.id)} · 推理：${displayText(task.agent.thinking)}` : ""} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
 			const controller = new AbortController();
 			close = () => controller.abort();
 			let selected: string | undefined;
-			try { selected = await ctx.ui.select(`子任务详情 · 累计 ${tasks.length} 次调用 · 当前运行 ${tasks.filter((task) => task.status === RUNNING_STATUS && task.result === undefined).length} 个`, choices, { signal: controller.signal }); }
+			try { selected = await ctx.ui.select(`子任务详情 · 共 ${tasks.length} 个 · 运行中 ${tasks.filter((task) => task.status === RUNNING_STATUS && task.result === undefined).length} 个`, choices, { signal: controller.signal }); }
 			finally { close = undefined; }
 			if (controller.signal.aborted) return;
 			if (selected === undefined) return;

@@ -40,7 +40,7 @@ test("真实 Pi 中固定命令修订只确认命令，相同实施提案不重�
 	assert.ok(initial);
 	const choicesBeforeRevision = h.choices.length;
 	const command = "node -e \"console.log('REVISION_OK')\"";
-	const revised = await h.approve("implementation", ["src", "plan.md"], [], [command], initial.data!.id, "修正固定命令语法，验收范围保持不变。");
+	const revised = await h.approve("implementation", ["src"], [], [command], initial.data!.id, "修正固定命令语法，验收范围保持不变。");
 	assert.equal(revised.isError, false, JSON.stringify(revised));
 	assert.equal(h.choices.length, choicesBeforeRevision + 1);
 	const current = h.sm.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "delivery-approval") as CustomEntry<{ id: string }>;
@@ -48,7 +48,7 @@ test("真实 Pi 中固定命令修订只确认命令，相同实施提案不重�
 	const proposal = h.sm.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "delivery-approval-proposal") as CustomEntry<{ previousApprovalId?: string; validationRevisionReason?: string }>;
 	assert.equal(proposal.data!.previousApprovalId, initial.data!.id);
 	assert.equal(proposal.data!.validationRevisionReason, "修正固定命令语法，验收范围保持不变。");
-	const duplicate = await h.approve("implementation", ["src", "plan.md"], [], [command]);
+	const duplicate = await h.approve("implementation", ["src"], [], [command]);
 	assert.equal(duplicate.isError, false, JSON.stringify(duplicate));
 	assert.equal(h.choices.length, choicesBeforeRevision + 1, "相同有效提案不应重新弹窗");
 });
@@ -57,7 +57,7 @@ test("真实 Pi 中实施意见会暂停开发并返回父会话", { timeout: 40
 	const h = await developmentHost(t, "implementation-feedback", "console.log('fixture');", [], true);
 	await h.prepare();
 	h.setCustom(approvalUI(async () => undefined, () => "补充失败后的停止条件，再开始开发。"));
-	const result = await h.approve("implementation", ["src", "plan.md"], [], [], undefined, "调整实施步骤");
+	const result = await h.approve("implementation", ["src"], [], [], undefined, "调整实施步骤");
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.equal((result.details as any).approved, false);
 	assert.match(result.content.map((part: any) => part.text ?? "").join("\n"), /补充失败后的停止条件/);

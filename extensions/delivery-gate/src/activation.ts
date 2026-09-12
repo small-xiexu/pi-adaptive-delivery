@@ -1,9 +1,30 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { fileURLToPath } from "node:url";
 
 const ENTRY = "delivery-activation";
 type Activation = { enabled: boolean; tools?: string[] };
 type Runtime = { initialize(): Promise<void>; assertCanExit(ctx: ExtensionContext): Promise<void> };
+
+function prioritizeDeliveryShape(suggestions: AutocompleteSuggestions | null): AutocompleteSuggestions | null {
+	if (!suggestions) return suggestions;
+	const shapeIndex = suggestions.items.findIndex((item) => item.value === "delivery-shape");
+	const firstDeliveryIndex = suggestions.items.findIndex((item) => item.value.startsWith("delivery-"));
+	if (shapeIndex < 0 || firstDeliveryIndex < 0 || shapeIndex <= firstDeliveryIndex) return suggestions;
+	const items = [...suggestions.items];
+	const [shape] = items.splice(shapeIndex, 1);
+	items.splice(firstDeliveryIndex, 0, shape!);
+	return { ...suggestions, items };
+}
+
+function shapeFirstAutocomplete(current: AutocompleteProvider): AutocompleteProvider {
+	return {
+		triggerCharacters: current.triggerCharacters,
+		getSuggestions: async (...args: Parameters<AutocompleteProvider["getSuggestions"]>) => prioritizeDeliveryShape(await current.getSuggestions(...args)),
+		applyCompletion: (...args: Parameters<AutocompleteProvider["applyCompletion"]>) => current.applyCompletion(...args),
+		...(current.shouldTriggerFileCompletion ? { shouldTriggerFileCompletion: (...args: Parameters<NonNullable<AutocompleteProvider["shouldTriggerFileCompletion"]>>) => current.shouldTriggerFileCompletion!(...args) } : {}),
+	};
+}
 
 // 只保存用户选择的入口和原工具集合，不保存或恢复批准。
 export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContext) => Runtime): void {
@@ -11,11 +32,16 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 	let originalTools: string[] = [];
 	let restoreTools: string[] | undefined;
 	let changing = false;
+	let autocompleteInstalled = false;
 	const enter = async (ctx: ExtensionContext) => {
 		runtime ??= start(ctx);
 		await runtime.initialize();
 	};
 	pi.on("session_start", async (event, ctx) => {
+		if (ctx.hasUI && !autocompleteInstalled) {
+			ctx.ui.addAutocompleteProvider(shapeFirstAutocomplete);
+			autocompleteInstalled = true;
+		}
 		const entry = ctx.sessionManager.getEntries().findLast((row) => row.type === "custom" && row.customType === ENTRY);
 		if (entry?.type !== "custom") return;
 		const state = entry.data as Activation;

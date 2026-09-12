@@ -171,6 +171,7 @@ test("工具环境不一致明确列出缺少、新增和定义差异，并引�
 		assert.match(error.message, /子会话额外启用：bash/);
 		assert.match(error.message, /定义或来源不同：read/);
 		assert.match(error.message, /未发送任务/);
+		assert.match(error.message, /不得改用普通工具继续源码或测试写入/);
 		assert.match(error.message, /收尾.*\/delivery-exit/s);
 		assert.match(error.message, /\/reload.*保留.*工具/s);
 		assert.doesNotMatch(error.message, /digest|original|changed/);

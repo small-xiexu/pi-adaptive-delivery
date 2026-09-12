@@ -409,7 +409,9 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				state.result = snapshot({ ...result, isError: false });
 				return result;
 			} catch (error) {
-				progress.end(state.childTerminal || state.readonlyTerminal ? COMPLETED_STATUS : ABNORMAL_STATUS);
+				const completedChild = state.taskSent && Boolean(state.childTerminal);
+				const completedReadonly = state.readonlyStarted && Boolean(state.readonlyTerminal);
+				progress.end(completedChild || completedReadonly ? COMPLETED_STATUS : ABNORMAL_STATUS);
 				const childSession = state.child?.sessionFile ?? state.readonlyReference?.sessionFile;
 				const text = (error instanceof Error ? error.message : String(error))
 					+ (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。")

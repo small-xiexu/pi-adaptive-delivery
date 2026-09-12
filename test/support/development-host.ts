@@ -74,7 +74,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 			...(validationRevisionOf ? { validationRevisionOf } : {}), paths, inputs, validationCommands });
 	};
 	const prepare = async () => {
-		for (const [stage, paths] of [["design", ["plan.md"]], ["implementation", ["src", "plan.md"]]] as const) {
+		for (const [stage, paths] of [["design", ["plan.md"]], ["implementation", ["src"]]] as const) {
 			assert.equal((await approve(stage, [...paths])).isError, false);
 		}
 	};
