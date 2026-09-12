@@ -193,7 +193,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					const reviewTask = [
 						"独立验收和代码审查。对照原始目标、批准要求、当前代码和实际差异判断是否完成。",
 						"主动识别项目已有的测试、编译、lint 或其他适合本任务的检查并实际运行，记录命令和真实结果；没有运行不能声称通过。",
-						"沿用父 Pi 的全部普通工具和权限，按任务需要检查、修改并报告结果；不批准、不继续委派。",
+						"沿用父 Pi 的全部普通工具和权限；职责是独立检查、运行检查并报告问题，默认不修改源码。发现问题交回父 Pi，由父 Pi 决定直接修复或重新委派开发；不批准、不继续委派。",
 						`已批准方案：${grant.designBody}`,
 						`已批准实施说明：${grant.implementationBody}`,
 						`候选：${candidate.digest}`,

@@ -25,7 +25,7 @@ test("复杂开发由独立子 Agent 完成并核实 writer 收尾", { timeout: 
 	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 });
 
-test("审查子 Agent 主动运行检查并独立读取候选差异", { timeout: 60_000 }, async (t) => {
+test("审查子收到检查报告职责，同时继承普通写入工具", { timeout: 60_000 }, async (t) => {
 	const h = await host(t, "review-normal");
 	await mkdir(path.join(h.cwd, "src"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
@@ -39,15 +39,21 @@ test("审查子 Agent 主动运行检查并独立读取候选差异", { timeout:
 	assert.equal(await h.readLease(), undefined);
 	const sessions = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(sessions.length, 2);
+	const reviewRequest = (await h.audit()).find((row) => row.child && row.phase === "model" && JSON.stringify(row.messages).includes("独立验收和代码审查。"));
+	assert.ok(reviewRequest);
+	assert.match(JSON.stringify(reviewRequest.messages), /默认不修改源码/);
+	assert.match(JSON.stringify(reviewRequest.messages), /交回父 Pi/);
+	assert.ok(reviewRequest.tools.includes("write") && reviewRequest.tools.includes("edit") && reviewRequest.tools.includes("bash"));
 });
 
-test("审查在批准范围内修改后重新记录最终候选", { timeout: 60_000 }, async (t) => {
+test("审查替身违反职责执行写入时，普通工具仍可用并记录实际候选", { timeout: 60_000 }, async (t) => {
 	const h = await host(t, "review-modifies");
 	await mkdir(path.join(h.cwd, "src"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
 	await h.prepare();
 	assert.equal((await h.call("delivery_develop", { task: "把 src/value.js 的 value 修改为 2。" })).isError, false);
-	const reviewed = await h.call("delivery_review", { task: "独立检查实现，必要时修复批准范围内的问题。" });
+	// fake provider 刻意执行写入，验证代码层没有按审查角色裁剪权限。
+	const reviewed = await h.call("delivery_review", { task: "独立检查实现并报告问题，修复交给父 Pi。" });
 	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
 	assert.ok((reviewed.details as any).candidate.digest);
