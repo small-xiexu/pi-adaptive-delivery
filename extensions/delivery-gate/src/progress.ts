@@ -1,5 +1,5 @@
 import type { SessionEntry, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Container, MouseRegion, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, Container, MouseRegion, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 export interface TaskProgress {
 	id: string;
@@ -148,8 +148,9 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 	};
 }
 
-export function taskRenderers(label: string, open?: (id: string) => void): Pick<ToolDefinition, "renderCall" | "renderResult"> {
+export function taskRenderers(label: string, open?: (id: string) => void): Pick<ToolDefinition, "renderCall" | "renderResult" | "renderShell"> {
 	return {
+		renderShell: "self",
 		renderCall: () => new Container(),
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			const progress = (result.details as { progress?: TaskProgress } | undefined)?.progress;
@@ -176,10 +177,13 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 					return lines;
 				},
 			};
-			return open ? new MouseRegion(component, (event) => {
+			const background = status === ABNORMAL_STATUS ? "toolErrorBg" : status === RUNNING_STATUS ? "toolPendingBg" : "toolSuccessBg";
+			const frame = new Box(1, 1, (text) => theme.bg(background, text));
+			frame.addChild(component);
+			return open ? new MouseRegion(frame, (event) => {
 				if (event.type === "click" && event.button === "left") { open(context.toolCallId); return { handled: true }; }
 				return undefined;
-			}) : component;
+			}) : frame;
 		},
 	};
 }

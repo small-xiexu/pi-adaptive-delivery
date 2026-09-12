@@ -46,11 +46,14 @@ test("过程摘要有界、移除终端控制序列，缺少调用或正文时�
 test("正常结束的真实 Pi 卡片只显示已完成，过程摘要不改变主状态，真正异常仍用错误色", () => {
 	initTheme("dark");
 	const colors: [string, string][] = [];
+	const backgrounds: string[] = [];
 	const renderers = taskRenderers("开发");
 	const tool: ToolDefinition = { name: "delivery_develop", label: "开发", description: "", parameters: Type.Object({}),
 		...renderers, renderResult(result, options, theme, context) {
 			return renderers.renderResult!.call(this, result, options, { fg: (color: string, value: string) => {
 				colors.push([color, value]); return theme.fg(color as any, value);
+			}, bg: (color: string, value: string) => {
+				backgrounds.push(color); return theme.bg(color as any, value);
 			} } as any, context);
 		}, execute: async () => ({ content: [], details: {} }) };
 	const component = new ToolExecutionComponent(tool.name, "note", { task: "检索后开发" }, {}, tool, { requestRender() {} } as TUI, "/tmp");
@@ -64,6 +67,12 @@ test("正常结束的真实 Pi 卡片只显示已完成，过程摘要不改变�
 	assert.doesNotMatch(lines, /工具异常|工具失败/);
 	assert.ok(colors.some(([color, value]) => color === "toolTitle" && value.startsWith(COMPLETED_STATUS)));
 	assert.ok(!colors.some(([color, value]) => color === "warning" && value.includes("工具异常")));
+	colors.length = 0;
+	component.updateResult({ content: [{ type: "text", text: "固定验收未通过" }], details: { progress: p.snapshot() }, isError: true }, false);
+	component.render(100);
+	assert.ok(colors.some(([color, value]) => color === "toolTitle" && value.startsWith(COMPLETED_STATUS)));
+	assert.ok(!colors.some(([color, value]) => color === "error" && value.startsWith(ABNORMAL_STATUS)));
+	assert.ok(!backgrounds.includes("toolErrorBg"));
 	colors.length = 0;
 	p.end(ABNORMAL_STATUS);
 	component.updateResult({ content: [{ type: "text", text: "固定验收失败" }], details: { progress: p.snapshot() }, isError: true }, false);
