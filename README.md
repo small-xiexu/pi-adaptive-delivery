@@ -2,6 +2,8 @@
 
 **让 Pi 先和你商量清楚，再动手开发，最后拿出检查结果。**
 
+![Pi Adaptive Delivery 交付流程：方案确认 → 实施确认 → 开发 · 验收 · 审查](https://raw.githubusercontent.com/small-xiexu/pi-adaptive-delivery/main/docs/images/preview.png)
+
 这是一个 Pi 扩展包。你决定要做什么、允许改哪里，Pi 负责组织开发、检查，并按需要安排另一个 AI 审查代码。适合需要先讨论方案、明确修改范围，并查看实际检查结果的项目任务。
 
 **安装后默认不开启交付流程，日常照常使用 Pi。** 输入 `/delivery-shape 你的需求` 才进入；任务结束后用 `/delivery-exit` 退出。简单任务可以只在聊天中写清方案和步骤，不必专门创建技术方案和实施计划文件。
