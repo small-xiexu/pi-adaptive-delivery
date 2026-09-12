@@ -1,6 +1,6 @@
 {
   "name": "pi-adaptive-delivery",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Adaptive, approval-gated delivery orchestration for Pi coding tasks",
   "license": "MIT",
   "type": "module",
@@ -33,6 +33,7 @@
     "extensions": [
       "./extensions/delivery-gate/index.ts"
     ],
+    "image": "https://raw.githubusercontent.com/small-xiexu/pi-adaptive-delivery/main/docs/images/preview.png",
     "skills": [
       "./skills"
     ],
