@@ -39,7 +39,7 @@ test("交付元数据读取失败只拒绝交付入口，不阻断普通工具",
 	assert.equal(handlers.get("tool_call")!({ toolName: "delivery_document_write" }).block, true);
 });
 
-for (const name of ["delivery_git_status", "delivery_readonly", "delivery_approval", "delivery_document_edit", "delivery_document_write", "delivery_develop", "delivery_validate", "delivery_review"]) test(`自有 ${name} 仍核实入口来源`, () => {
+for (const name of ["delivery_git_status", "delivery_readonly", "delivery_approval", "delivery_document_edit", "delivery_document_write", "delivery_develop", "delivery_review"]) test(`自有 ${name} 仍核实入口来源`, () => {
 	const { tools, handlers } = host();
 	const own = tools.find((tool) => tool.name === name) ?? { name, sourceInfo: { source: "extension", path: "/owned/index.ts" } };
 	if (!tools.includes(own)) tools.push(own);

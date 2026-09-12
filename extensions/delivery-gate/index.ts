@@ -1,4 +1,4 @@
-import { createBashTool, createEditTool, createWriteTool, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createWriteTool, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -8,7 +8,7 @@ import { GIT_STATUS_TOOL, readGitStatus, getWriterStateRoot, resolveWorkspaceIde
 import { CHILD_ENV, CHILD_READY, CHILD_EXIT, CHILD_STOP, DELEGATE_TOOL, DELEGATION_ENTRY, delegateReadOnly, snapshotReadOnlyEnvironment } from "./src/subagents.ts";
 import { installApprovals } from "./src/approvals.ts";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./src/parent-writer.ts";
-import { CHILD_ARM, DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
+import { CHILD_ARM, DEVELOPMENT_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
 import { createTaskProgress, taskRenderers } from "./src/progress.ts";
 import { structuredPackage } from "./src/structured.ts";
 import { installTaskDetails } from "./src/task-details.ts";
@@ -26,7 +26,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	installStreamRetry(pi);
 	// 子进程启动前确定角色；该内部标记只去除协调权限，不提供批准能力。
 	const child = Boolean(process.env[CHILD_ENV]);
-	const childDevelopment = process.env[CHILD_ENV] === "development" ? createChildDevelopment(pi) : undefined;
+	const childDevelopment = process.env[CHILD_ENV] === "development" ? createChildDevelopment() : undefined;
 	let promptOptions: BuildSystemPromptOptions | undefined;
 	let structured: Awaited<ReturnType<typeof structuredPackage>>;
 	const readPaths = (ctx: ExtensionContext) => {
@@ -63,7 +63,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守批准范围，不修改父规划文档、不批准或继续委派。"
-					: child ? "\n本次子任务只分析和查阅资料，不修改文件或执行外部写入；这是任务要求，工具能力仍沿用父 Pi。" : "\n简单明确、可一次完成并验证的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和验收，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择推理级别，不另选模型。")
+					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n简单明确、可一次完成并检查的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和检查方式，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择推理级别，不另选模型。")
 				+ (!child && ctx.model ? `\n子任务固定继承父 Pi 当前模型 ${ctx.model.provider}/${ctx.model.id}；可选推理级别：${getSupportedThinkingLevels(ctx.model).join("、")}。省略 thinking 继承父当前级别；父切换模型后，新任务跟随，已启动的任务保持原模型。` : ""),
 		};
 	});
@@ -79,14 +79,6 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 			pi.registerCommand(CHILD_ARM, { description: "内部 writer 交接，不生成批准", handler: async (args, ctx) => {
 				const grant = JSON.parse(args);
 				await childDevelopment.arm(grant, ctx);
-				// 普通开发保留原实现；只有固定验收在任务发送前安装其命令执行器。
-				if (!grant.validation) return;
-				if (structured) {
-					const tool = structured.tools.find((tool) => tool.name === "exec_command")!;
-					pi.registerTool({ name: tool.name, label: "固定验收命令", description: tool.description, parameters: tool.parameters as any,
-						execute: (id, input, signal, update) => childDevelopment.executeStructured(id, input as import("./src/structured.ts").ExecInput, structured!.root, signal, update) });
-				} else pi.registerTool({ name: "bash", label: "固定验收命令", description: createBashTool(".").description, parameters: createBashTool(".").parameters,
-					execute: (id, input, signal, update) => childDevelopment.execute(id, input, signal, update) });
 			} });
 		}
 		pi.on("session_shutdown", async (_event, ctx) => {
@@ -113,26 +105,14 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	});
 	pi.registerTool({ name: REVIEW_TOOL, label: "独立候选审查",
 		...taskRenderers("审查", openTask),
-		description: "在本轮可信固定验收和当前候选一致时，沿只读子路径独立审查批准目标、当前代码、实际差异及原始验收记录。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径、实际差异及验收记录，无须重述全部需求，不以实现者总结代替证据" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
+		description: "沿独立子路径检查和审查批准目标、当前代码、实际差异，并主动运行项目测试、编译或 lint。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径及实际差异，无须重述全部需求，不以实现者总结代替证据" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始审查");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			return developer.review({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), parentSessionId: ctx.sessionManager.getSessionId(),
 				...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
 				(message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
-		},
-	});
-	pi.registerTool({ name: VALIDATION_TOOL, label: "固定候选验收",
-		...taskRenderers("验收", openTask),
-		description: "用独立标准 Pi 子会话在本机执行本轮已批准的固定验收命令，不修改或替换命令。明确源码及输入范围的前后候选必须一致，全部真实命令通过才报告本次验收通过；不代替独立审查，也不覆盖整台电脑的环境。缺少命令时明确未运行。",
-		parameters: Type.Object({ agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
-		execute: async (id, input, signal, update, ctx) => {
-			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始验收");
-			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
-			return developer.validate({ id, task: "执行本轮批准的固定候选验收，不编辑文件、不改变验收要求。", cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx),
-				parentSessionId: ctx.sessionManager.getSessionId(), ...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions),
-				projectTrusted: ctx.isProjectTrusted() }, signal, ctx, (message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
 		},
 	});
 	pi.registerTool({ name: DEVELOPMENT_TOOL, label: "开发文件委派",
@@ -207,8 +187,8 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const executing = running.filter((task) => !task.endedAt);
 				const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
 				let stage = approvals.confirmedStage === "implementation" ? "实施已确认" : approvals.confirmedStage === "design" ? "等待实施确认" : "等待方案确认";
-				let next = approvals.confirmedStage === "implementation" ? "核对已完成工作，按需继续开发、固定验收或独立审查。"
-					: approvals.confirmedStage === "design" ? "整理修改范围和验收命令，再确认实施。" : "形成方案后调用 delivery_approval 提交确认；若上一轮模型请求中断，复用当前正文继续，不要开发。";
+				let next = approvals.confirmedStage === "implementation" ? "核对已完成工作，按需继续开发或安排独立检查审查。"
+					: approvals.confirmedStage === "design" ? "整理修改范围和验证方式，再确认实施。" : "形成方案后调用 delivery_approval 提交确认；若上一轮模型请求中断，复用当前正文继续，不要开发。";
 				if (approvals.pending) next = "处理当前审阅；可以确认、提出意见或暂停。";
 				if (executing.length) next = "等待当前任务结束，再核对结果。";
 				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，再继续下一步。"; }

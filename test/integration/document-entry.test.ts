@@ -92,7 +92,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	const approve = (stage = "design", paths = ["plan.md"]) => {
 		const latest = sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "design") as any;
 		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
-		return call("delivery_approval", { stage, body: `待确认正文 ${stage}`, documentStrategy, ...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}), paths, validationCommands: [] });
+		return call("delivery_approval", { stage, body: `待确认正文 ${stage}`, documentStrategy, ...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}), paths });
 	};
 	t.diagnostic(JSON.stringify({ root, sdk: "0.85.1", ui: "simulated" }));
 	return { root, cwd, sm, session, api, notices, choices, call, approve, contexts, prompts, readLease: () => leases.read(workspace.key),
@@ -101,7 +101,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		setSelect: (callback: typeof select) => { select = callback; } };
 }
 
-const reviewCall = (body: string, paths = ["plan.md"]): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: { stage: "design", body, documentStrategy: paths.length ? "reuse" : "none", ...(paths.length ? { technicalPlanPath: "plan.md", implementationPlanPath: "plan.md" } : {}), paths, validationCommands: [] } });
+const reviewCall = (body: string, paths = ["plan.md"]): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: { stage: "design", body, documentStrategy: paths.length ? "reuse" : "none", ...(paths.length ? { technicalPlanPath: "plan.md", implementationPlanPath: "plan.md" } : {}), paths } });
 const editCall = (oldText: string, newText: string): ToolCall => ({ type: "toolCall", id: randomUUID(), name: documentEdit, arguments: { path: "plan.md", edits: [{ oldText, newText }] } });
 const readCall = (): ToolCall => ({ type: "toolCall", id: randomUUID(), name: "read", arguments: { path: "plan.md" } });
 
@@ -153,7 +153,7 @@ test("真实 Pi 在方案批准回合结束后自动触发实施准备回合", {
 test("真实 Pi 可沿自动衔接回合提交实施确认", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	h.setFollowups([[{ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: {
-		stage: "implementation", body: "自动衔接生成的实施步骤", documentStrategy: "none", paths: ["src"], inputs: [], validationCommands: [],
+		stage: "implementation", body: "自动衔接生成的实施步骤", documentStrategy: "none", paths: ["src"], inputs: [],
 	} }]]);
 	const result = await h.approve("design", []);
 	assert.equal(result.isError, false, JSON.stringify(result));

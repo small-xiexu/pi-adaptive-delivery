@@ -159,7 +159,7 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			const body = outputText(result);
 			const status = latest?.endedAt ? (latest.status === ABNORMAL_STATUS ? ABNORMAL_STATUS : COMPLETED_STATUS)
 				: isPartial ? RUNNING_STATUS : context.isError ? ABNORMAL_STATUS : COMPLETED_STATUS;
-			const heading = `${status} · ${label} · ${short((context.args as { task?: string })?.task ?? "固定候选验收", 64)}`;
+			const heading = `${status} · ${label} · ${short((context.args as { task?: string })?.task ?? "项目检查", 64)}`;
 			const detail = (latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking} · ` : "") + (latest?.action ?? (isPartial ? "核对任务环境" : short(body)));
 			const component = {
 				invalidate() {},

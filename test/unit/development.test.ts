@@ -21,7 +21,7 @@ async function host(separateGit = false, pristine = false) {
 	if (!pristine) sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "单元夹具，不是批准" }], api: "fake", provider: "fake", model: "fake",
 		stopReason: "stop", timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
 	const ctx: any = { cwd, mode: "rpc", sessionManager: sm };
-	const writer = createChildDevelopment({ appendEntry: (name, data) => { sm.appendCustomEntry(name, data); } });
+	const writer = createChildDevelopment();
 	const owner = await writer.ready("run", ctx);
 	const workspace = await resolveWorkspaceIdentity(cwd);
 	const stateRoot = await getWriterStateRoot(workspace);
@@ -37,15 +37,13 @@ async function host(separateGit = false, pristine = false) {
 	return { root, cwd, sm, ctx, writer, owner, grant, record, leaseFile, arm, workspace };
 }
 
-test("开发子会话核实交接身份与范围，普通开发不能调用固定验收执行器", async () => {
+test("开发子会话核实交接身份与范围", async () => {
 	const h = await host();
-	await assert.rejects(h.writer.execute("no-grant", { command: "touch src.js" }), /未取得/);
 	await assert.rejects(h.writer.arm(h.grant, h.ctx), /尚未真实交接/);
 	await writeFile(h.leaseFile, JSON.stringify(h.record));
 	await assert.rejects(h.writer.arm({ ...h.grant, owner: { ...h.owner, runId: "other" } }, h.ctx), /身份无效/);
 	await assert.rejects(h.writer.arm({ ...h.grant, protectedPaths: [] }, h.ctx), /身份无效/);
 	await h.writer.arm(h.grant, h.ctx);
-	await assert.rejects(h.writer.execute("development", { command: "touch src.js" }), /未取得固定验收/);
 	await assert.rejects(h.writer.arm(h.grant, h.ctx), /已接收交接/);
 	await assert.rejects(access(path.join(h.cwd, "src.js")), { code: "ENOENT" });
 });
@@ -60,19 +58,7 @@ test("开发使用原生文件工具，完整 Session 落盘后生成收尾记�
 	assert.equal(result.clean, true);
 	assert.deepEqual(result.owner, h.owner);
 	assert.ok("historyDigest" in result);
-	assert.match(result.historyDigest, /^[a-f0-9]{64}$/);
-	await assert.rejects(h.writer.execute("late", { command: "touch src.js" }), /未取得/);
-});
-
-test("子命令仍须核实真实工具调用，只有 writer 不能伪造调用", async () => {
-	const h = await host();
-	await writeFile(h.leaseFile, JSON.stringify(h.record));
-	const commands = ["touch forbidden"];
-	h.grant.paths = [path.join(h.cwd, "forbidden")];
-	const before = await captureCandidate({ workspace: h.workspace, readPaths: [], writePaths: h.grant.paths, protectedPaths: [...h.grant.protectedPaths, h.sm.getSessionFile()!] }, commands);
-	await h.writer.arm({ ...h.grant, validation: { commands, before } }, h.ctx);
-	await assert.rejects(h.writer.execute("forged-call", { command: commands[0]! }), /工具调用未核实/);
-	await assert.rejects(access(path.join(h.cwd, "forbidden")), { code: "ENOENT" });
+	assert.match(String(result.historyDigest), /^[a-f0-9]{64}$/);
 });
 
 test("子收尾拒绝仅内存存在的记录，不用 clean 标记掩盖持久化缺失", async () => {
@@ -140,32 +126,5 @@ for (const field of ["content", "isError"]) test(`失败结果的证据或错误
 	else entry.message.isError = false;
 	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 	await writeFile(h.sm.getSessionFile()!, rows.map((row) => JSON.stringify(row.id === entry.id ? entry : row)).join("\n") + "\n");
-	await assert.rejects(verifyRecordedResult(state, h.ctx), /父开发工具终态未唯一落盘或与实际结果不符/);
-});
-
-for (const kind of ["disk", "memory-and-disk"]) test(`审查终态依赖原验收的私有引用，${kind} 改写不能沿用通过`, async () => {
-	const h = await host();
-	const first = h.sm.getBranch()[0]!;
-	assert.ok(first.type === "message" && first.message.role === "assistant");
-	const template = first.message;
-	const record = (id: string, name: string): Parameters<typeof verifyRecordedResult>[0] => {
-		h.sm.appendMessage({ ...template, content: [{ type: "toolCall", id, name, arguments: {} }] });
-		const call = structuredClone(h.sm.getBranch().at(-1)!);
-		const result = { content: [{ type: "text" as const, text: "original result" }], details: {}, isError: false };
-		h.sm.appendMessage({ role: "toolResult", toolCallId: id, toolName: name, ...result, timestamp: Date.now() });
-		return { id, name, cwd: h.cwd, sessionId: h.sm.getSessionId(), sessionFile: h.sm.getSessionFile()!, lifetime: new AbortController(),
-			finished: true, attemptedLease: false, call, result: structuredClone(result) };
-	};
-	const validation = record("validation", "delivery_validate");
-	const review = { ...record("review", "delivery_review"), reviewValidation: validation };
-	await verifyRecordedResult(review, h.ctx);
-	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
-	rows.find((row) => row.message?.toolCallId === "validation").message.content = [{ type: "text", text: "rewritten validation" }];
-	if (kind === "memory-and-disk") {
-		const entry = h.sm.getEntries().find((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === "validation");
-		assert.ok(entry?.type === "message" && entry.message.role === "toolResult");
-		entry.message.content = [{ type: "text", text: "rewritten validation" }];
-	}
-	await writeFile(h.sm.getSessionFile()!, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
-	await assert.rejects(verifyRecordedResult(review, h.ctx), /终态未唯一落盘/);
+	await assert.rejects(verifyRecordedResult(state, h.ctx), /父交付工具终态未唯一落盘或与实际结果不符/);
 });

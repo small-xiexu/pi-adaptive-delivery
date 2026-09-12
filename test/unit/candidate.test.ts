@@ -17,7 +17,7 @@ async function host() {
 	await writeFile(path.join(root, "plan.md"), "原始台账\n");
 	const scope = { workspace: await resolveWorkspaceIdentity(root),
 		readPaths: ["inputs"], writePaths: ["src"], protectedPaths: [path.join(root, "plan.md")] };
-	return { root, scope, commands: ["node inputs/check.js"], capture: () => captureCandidate(scope, ["node inputs/check.js"]) };
+	return { root, scope, capture: () => captureCandidate(scope) };
 }
 
 test("候选来自实际输入/源码内容及元数据，重复读取稳定且不读取规划文档", async () => {
@@ -30,11 +30,10 @@ test("候选来自实际输入/源码内容及元数据，重复读取稳定且�
 	assert.equal(await readFile(path.join(h.root, "src/value.js"), "utf8"), "export const value = 1;\n");
 });
 
-for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "same-content-rewrite", "command", "command-order", "scope", "cwd"]) {
+for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "same-content-rewrite", "scope", "cwd"]) {
 	test(`候选 ${kind} 变化使原指纹失效`, async () => {
 		const h = await host();
-		const original = await captureCandidate(h.scope, ["first", "second"]);
-		let commands = ["first", "second"];
+		const original = await captureCandidate(h.scope);
 		const file = path.join(h.root, "src/value.js");
 		if (kind === "source") await writeFile(file, "export const value = 2;\n");
 		if (kind === "test") await writeFile(path.join(h.root, "inputs/check.js"), "console.log(2);\n");
@@ -43,15 +42,13 @@ for (const kind of ["source", "test", "new-file", "delete", "rename", "mode", "s
 		if (kind === "rename") await rename(file, path.join(h.root, "src/renamed.js"));
 		if (kind === "mode") await chmod(file, 0o700);
 		if (kind === "same-content-rewrite") await writeFile(file, await readFile(file));
-		if (kind === "command") commands = ["changed", "second"];
-		if (kind === "command-order") commands.reverse();
 		if (kind === "scope") h.scope.writePaths.push("new-directory");
 		if (kind === "cwd") {
 			h.scope.workspace.cwdPath = path.join(h.root, "src");
 			h.scope.readPaths = ["../inputs"];
 			h.scope.writePaths = ["."];
 		}
-		assert.notEqual((await captureCandidate(h.scope, commands)).digest, original.digest);
+		assert.notEqual((await captureCandidate(h.scope)).digest, original.digest);
 	});
 }
 
@@ -62,5 +59,5 @@ for (const kind of ["protected", "symlink", "hardlink", "cancel"]) test(`候选 
 	if (kind === "symlink") await symlink("../plan.md", path.join(h.root, "src/alias"));
 	if (kind === "hardlink") await link(path.join(h.root, "plan.md"), path.join(h.root, "src/alias"));
 	if (kind === "cancel") controller.abort(new Error("fixture candidate cancel"));
-	await assert.rejects(captureCandidate(h.scope, h.commands, controller.signal));
+	await assert.rejects(captureCandidate(h.scope, controller.signal));
 });

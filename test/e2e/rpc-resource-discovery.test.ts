@@ -52,7 +52,7 @@ test("npm tarball 在无 node_modules 的隔离目录加载完整自有资源并
 	const [pack] = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", root],
 		{ cwd: stage, env, encoding: "utf8", timeout: 30_000, maxBuffer: 1024 * 1024 }));
 	const files = pack.files.map((entry: { path: string }) => entry.path);
-	for (const file of ["extensions/delivery-gate/src/candidate.ts", "extensions/delivery-gate/src/validation.ts", "extensions/delivery-gate/src/review.ts", "skills/adaptive-delivery/SKILL.md"]) assert.ok(files.includes(file), file);
+	for (const file of ["extensions/delivery-gate/src/candidate.ts", "extensions/delivery-gate/src/review.ts", "skills/adaptive-delivery/SKILL.md"]) assert.ok(files.includes(file), file);
 	assert.ok(!files.some((file: string) => /(^|\/)(node_modules|test|\.git|\.pi|\.npmrc|\.env)(\/|$)/.test(file)));
 	const archive = path.join(root, pack.filename);
 	execFileSync("tar", ["-xzf", archive, "-C", extracted], { cwd: root, env, timeout: 10_000 });

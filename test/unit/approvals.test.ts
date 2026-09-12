@@ -8,8 +8,8 @@ import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-age
 import { APPROVAL_ENTRY, APPROVAL_TOOL, PROPOSAL_ENTRY, installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
 
-const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", implementationPlanPath: "docs/计划.md", paths: ["docs/方案.md", "docs/计划.md"], validationCommands: [] };
-const implementation = { stage: "implementation", body: "计划正文\n先实现，再验证；越界则停止。", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", implementationPlanPath: "docs/计划.md", paths: ["src", "test"], validationCommands: ["node --check src/index.js"] };
+const design = { stage: "design", body: "方案正文\n目标与边界\u2028保持\u2029原文", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", implementationPlanPath: "docs/计划.md", paths: ["docs/方案.md", "docs/计划.md"] };
+const implementation = { stage: "implementation", body: "计划正文\n先实现，再验证；越界则停止。", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", implementationPlanPath: "docs/计划.md", paths: ["src", "test"] };
 
 async function host(persist = true) {
 	const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "approval-unit-")));
@@ -33,7 +33,7 @@ async function host(persist = true) {
 	};
 	const approvals = installApprovals(pi as ExtensionAPI);
 	assert.equal(tool.name, APPROVAL_TOOL);
-	const run = (request: { stage: string; body: string; documentStrategy: string; technicalPlanPath?: string; implementationPlanPath?: string; paths: string[]; validationCommands: string[]; inputs?: string[]; validationRevisionOf?: string } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
+	const run = (request: { stage: string; body: string; documentStrategy: string; technicalPlanPath?: string; implementationPlanPath?: string; paths: string[]; inputs?: string[] } = design, signal?: AbortSignal) => tool.execute("fixture-request", request, signal, undefined, ctx);
 	const entries = (type: string) => sm.getEntries().filter((entry) => entry.type === "custom" && entry.customType === type);
 	const disk = async () => (await readFile(sm.getSessionFile()!, "utf8")).trim().split("\n").map((row) => JSON.parse(row));
 	return { cwd, sm, pi, ctx, displayed, notices, renderers, run, entries, disk, messages, continuations, approvals,
@@ -80,7 +80,7 @@ test("仅方案与实施两次确认，规划文档冻结为保护路径，文�
 	assert.equal(grant.documentStrategy, "reuse");
 	assert.deepEqual(grant.planningPaths, design.paths.map((file) => path.join(h.cwd, file)));
 	const changed = await h.readImplementation();
-	changed.planningPaths.push("/other.md"); changed.paths.push("/outside"); changed.validationCommands.push("unexpected");
+	changed.planningPaths.push("/other.md"); changed.paths.push("/outside");
 	await writeFile(path.join(h.cwd, "README.md"), "文档内容更新");
 	assert.deepEqual(await h.readImplementation(), grant);
 	assert.equal(h.displayed.length, 2);
@@ -145,24 +145,6 @@ test("实施确认支持意见，意见不授予权限也不启动开发", async
 	assert.equal(feedback.details.feedback, "先修正验收命令，再开始开发");
 	assert.equal(h.approvals.confirmedStage, "design");
 	assert.equal(h.entries(APPROVAL_ENTRY).length, 1);
-});
-
-test("固定验收命令机械修订使用轻量确认，相同提案不重复弹窗", async () => {
-	const h = await host();
-	await h.run();
-	const firstImplementation = await h.run(implementation);
-	const revision = { ...implementation, body: "修正原命令的 Python 语法错误，验收范围保持不变。", validationCommands: ["node --test src/index.test.js"], validationRevisionOf: firstImplementation.details.approvalId };
-	const revised = await h.run(revision);
-	assert.equal(revised.details.approved, true);
-	const grant = await h.readImplementation();
-	assert.deepEqual(grant.validationCommands, revision.validationCommands);
-	const proposal = (h.entries(PROPOSAL_ENTRY).at(-1) as any).data as any;
-	assert.equal(proposal.previousApprovalId, firstImplementation.details.approvalId);
-	assert.match(proposal.changeSummary, /固定验收命令/);
-	const approvals = h.entries(APPROVAL_ENTRY).length;
-	const duplicate = await h.run({ ...implementation, body: proposal.body, validationCommands: revision.validationCommands });
-	assert.equal(duplicate.details.approvalId, revised.details.approvalId);
-	assert.equal(h.entries(APPROVAL_ENTRY).length, approvals);
 });
 
 test("无规划文档方案的反馈与暂停恢复直接修订会话正文，不生成批准", async () => {
@@ -287,10 +269,10 @@ for (const mode of ["rpc", "json", "print", undefined]) test(`非 TUI ${mode} �
 	await assert.rejects(h.run(), /真实 TUI/); assert.equal(h.entries(PROPOSAL_ENTRY).length, 0);
 });
 
-test("方案路径须为 worktree 内确切 Markdown，命令及验收输入只在实施阶段申请", async () => {
+test("方案路径须为 worktree 内确切 Markdown，额外审查输入只在实施阶段申请", async () => {
 	const h = await host();
 	for (const request of [{ ...design, paths: ["src"] }, { ...design, paths: ["../outside.md"] },
-		{ ...design, paths: [" "] }, { ...design, body: " " }, { ...design, validationCommands: ["echo x"] },
+		{ ...design, paths: [" "] }, { ...design, body: " " },
 		{ ...design, inputs: ["src"] }, { ...design, technicalPlanPath: "other.md" },
 		{ ...design, paths: [], technicalPlanPath: undefined, implementationPlanPath: undefined }, { ...implementation, paths: [] }]) await assert.rejects(h.run(request));
 	assert.equal(h.displayed.length, 0);
@@ -343,8 +325,7 @@ test("实施确认明确本机 Shell 边界，冻结验收输入和原方案，�
 		assert.match(panel.body, /文档策略：复用现有文档/);
 		assert.match(panel.body, /允许修改（文件或目录）：• src • test/);
 		assert.ok(panel.detail.includes(body)); assert.ok(panel.detail.includes(design.body));
-		assert.match(panel.detail, /额外验收输入：\n• package.json/);
-		assert.match(panel.body, /验收时依次运行：\n1. node --check src\/index.js/);
+		assert.match(panel.detail, /额外审查输入：\n• package.json/);
 		for (const key of ["", "\x1b[6~", "\x0f", "\x1b[F"]) {
 			if (key) panel.handleInput(key);
 			const screen = panel.render(100).join("\n");
@@ -378,7 +359,6 @@ test("确认首屏显示文档策略、路径与改法，两阶段按键一致",
 				assert.match(panel.detail, /docs\/方案.md/);
 			} else {
 				assert.match(screen, /• src/);
-				assert.match(panel.body, /node --check src\/index.js/);
 			}
 			return panel;
 		}, options);

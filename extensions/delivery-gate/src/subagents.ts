@@ -378,6 +378,7 @@ export async function delegateReadOnly(
 	update: ProgressUpdate,
 	ctx: DialogContext,
 	progress = createTaskProgress(input.id, "只读", input.task, update),
+	mode: "readonly" | "review" = "readonly",
 ): Promise<{ text: string; sessionId: string; sessionFile: string; pid: number; toolErrors: boolean }> {
 	signal.throwIfAborted();
 	const rpc = await startChild(input, "readonly");
@@ -405,7 +406,7 @@ export async function delegateReadOnly(
 		await Promise.all([
 			rpc.waitSettled(operation),
 			// 不让任务正文以斜线命令的身份执行，避免绕过模型工具边界。
-			rpc.request({ type: "prompt", message: `只读子任务。仅分析并提供证据，不修改文件，不继续委派。\n\n${input.task}` }, operation),
+			rpc.request({ type: "prompt", message: `${mode === "review" ? "独立审查子任务。沿用父 Pi 的全部普通工具和权限；按任务需要检查、修改并报告结果，不批准、不继续委派。" : "只读子任务。仅分析并提供证据，不修改文件，不继续委派。"}\n\n${input.task}` }, operation),
 		]);
 		if (rpc.openTools.size) throw new Error("子任务存在未确认的工具执行终态");
 	} catch (error) { problem = error; }

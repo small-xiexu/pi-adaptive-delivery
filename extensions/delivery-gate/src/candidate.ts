@@ -53,7 +53,7 @@ const identity = (info: Stats) => ({ dev: info.dev, ino: info.ino, mode: info.mo
 	size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs });
 
 // 调用方持有 writer；此指纹不授予权限，也不提供对其他宿主进程的原子文件系统快照。
-export async function captureCandidate(scope: CandidateScope, commands: readonly string[], signal?: AbortSignal): Promise<CandidateSnapshot> {
+export async function captureCandidate(scope: CandidateScope, signal?: AbortSignal): Promise<CandidateSnapshot> {
 	const entries: { path: string; identity: ReturnType<typeof identity>; content?: string }[] = [];
 	const paths = await candidatePaths(scope, signal, async (file, info) => {
 		const entry = { path: path.relative(scope.workspace.workspacePath, file), identity: identity(info) } as typeof entries[number];
@@ -75,6 +75,6 @@ export async function captureCandidate(scope: CandidateScope, commands: readonly
 	signal?.throwIfAborted();
 	entries.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 	const digest = createHash("sha256").update(JSON.stringify({ workspace: scope.workspace,
-		environment: { platform: process.platform, arch: process.arch, node: process.version }, commands, paths, entries })).digest("hex");
+		environment: { platform: process.platform, arch: process.arch, node: process.version }, paths, entries })).digest("hex");
 	return { digest, files: entries.filter((entry) => entry.content !== undefined).map((entry) => entry.path) };
 }

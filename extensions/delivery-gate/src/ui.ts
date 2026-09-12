@@ -195,7 +195,7 @@ export class DeliveryPanel {
 	}
 	render(width: number) {
 		const body = wrapped(this.expanded ? this.detail : this.body, width);
-		const header = panelHeader(this.theme, width, this.title, this.detail ? "请核对实施范围和验收命令" : "查看信息 · Esc 关闭");
+		const header = panelHeader(this.theme, width, this.title, this.detail ? "请核对实施范围和检查方式" : "查看信息 · Esc 关闭");
 		const footer = panelFooter(this.theme, width,
 			this.detail ? "↑↓ 选择 · Enter 确定 · Esc 暂不批准" : "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭",
 			this.detail ? `Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页` : "");

@@ -312,33 +312,15 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	assert.match(panel.render(100).join("\n"), /代码审查需要检查权限边界/);
 });
 
-test("验收失败但子 Agent 正常收尾时显示已完成，并保留验收失败结果", async () => {
-	const root = await mkdtemp(path.join(os.tmpdir(), "delivery-validation-result-"));
-	const sm = SessionManager.create(root, path.join(root, "sessions"));
-	const progress = createTaskProgress("a", "验收", "执行固定验收", () => {});
-	progress.end(COMPLETED_STATUS, "固定验收未通过");
-	sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "a", name: "delivery_validate", arguments: {} }], timestamp: Date.now() } as any);
-	sm.appendMessage({ role: "toolResult", toolCallId: "a", toolName: "delivery_validate", isError: true,
-		content: [{ type: "text", text: "固定验收未通过：命令返回退出码 1" }], details: { progress: progress.snapshot() }, timestamp: Date.now() });
-	const task = taskDetails({ sessionManager: sm }, [])[0]!;
-	assert.equal(task.status, COMPLETED_STATUS);
-	assert.equal(task.resultFailed, true);
-	const panel = new TaskDetailsPanel(task, tui, plainTheme, () => {});
-	panel.update({ task, entries: [{ id: "result", name: "子任务说明", output: "子 Agent 已正常收尾" }] });
-	const output = panel.render(100).join("\n");
-	assert.match(output, /已完成/);
-	assert.match(output, /固定验收未通过：命令返回退出码 1/);
-});
-
 test("子任务按实施批准批次展示阶段和尝试次数", () => {
 	const call = (id: string, name: string, task: string) => ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: { task } }] } });
 	const result = (id: string) => ({ type: "message", message: { role: "toolResult", toolCallId: id, content: [{ type: "text", text: "done" }], isError: false, details: { progress: { status: "已完成", endedAt: Date.now() } } } });
 	const ref = (id: string, approvalId: string) => ({ type: "custom", customType: "delivery-development", data: { id, approvalId, designApprovalId: "design-1" } });
 	const branch = [call("dev-1", "delivery_develop", "首次开发"), result("dev-1"), ref("dev-1", "approval-1"),
 		call("dev-2", "delivery_develop", "范围内返工"), result("dev-2"), ref("dev-2", "approval-1"),
-		call("validate-1", "delivery_validate", "固定验收"), result("validate-1"), ref("validate-1", "approval-1")];
+		call("review-1", "delivery_review", "独立验收审查"), result("review-1"), ref("review-1", "approval-1")];
 	const tasks = taskDetails({ sessionManager: { getBranch: () => branch } } as any, []);
-	assert.deepEqual(tasks.map((task) => [task.batch, task.label, task.attempt]), [[1, "开发", 1], [1, "开发", 2], [1, "验收", 1]]);
+	assert.deepEqual(tasks.map((task) => [task.batch, task.label, task.attempt]), [[1, "开发", 1], [1, "开发", 2], [1, "审查", 1]]);
 });
 
 test("详情只留连续输出，万行滚动和完整任务切换保留阅读位置，Esc 直接关闭", () => {

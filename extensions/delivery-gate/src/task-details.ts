@@ -5,9 +5,9 @@ import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrap
 import { displayText } from "./ui.ts";
 import { ABNORMAL_STATUS, COMPLETED_STATUS, RUNNING_STATUS, type TaskProgress } from "./progress.ts";
 import { DELEGATE_TOOL, DELEGATION_ENTRY } from "./subagents.ts";
-import { DEVELOPMENT_TOOL, VALIDATION_TOOL, REVIEW_TOOL } from "./development.ts";
+import { DEVELOPMENT_TOOL, REVIEW_TOOL } from "./development.ts";
 
-const labels: Record<string, string> = { [DELEGATE_TOOL]: "只读", [DEVELOPMENT_TOOL]: "开发", [VALIDATION_TOOL]: "验收", [REVIEW_TOOL]: "审查" };
+const labels: Record<string, string> = { [DELEGATE_TOOL]: "只读", [DEVELOPMENT_TOOL]: "开发", [REVIEW_TOOL]: "审查" };
 const text = (message: any) => (message?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
 export interface TaskDetail {
 	id: string;
@@ -31,7 +31,7 @@ export function taskDetails(ctx: Pick<ExtensionContext, "sessionManager">, live:
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			for (const part of entry.message.content) if (part.type === "toolCall" && labels[part.name]) tasks.set(part.id,
-				{ id: part.id, label: labels[part.name]!, task: String(part.arguments.task ?? "执行本轮固定候选验收"), status: "未取得执行终态" });
+				{ id: part.id, label: labels[part.name]!, task: String(part.arguments.task ?? "执行本次任务"), status: "未取得执行终态" });
 		} else if (entry.type === "message" && entry.message.role === "toolResult") {
 			const task = tasks.get(entry.message.toolCallId);
 			if (!task) continue;

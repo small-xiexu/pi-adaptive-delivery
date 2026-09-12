@@ -170,15 +170,15 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const searchStep = scenario === "readonly-search" && isChild() ? messages.filter((message) => message.role === "toolResult").length : undefined;
 				const developmentChild = development && process.env.PI_ADAPTIVE_DELIVERY_CHILD === "development";
 				const localChild = developmentChild && scenario.startsWith("development-local-");
-				const validationChild = developmentChild && JSON.stringify(context.messages).includes("固定候选验收。严格按下列");
 				const step = messages.filter((message) => message.role === "toolResult").length;
-				const readBeforeWrite = developmentChild && !validationChild && scenario === "development-local-read-before-write";
+				const readBeforeWrite = developmentChild && scenario === "development-local-read-before-write";
 				const developmentStep = step - (readBeforeWrite ? 1 : 0);
 				const editRecovery = developmentChild && scenario === "development-edit-recovery";
 				const readSkill = environment && isChild() && read && !read.isError && messages.filter((message) => message.role === "toolResult").length === 1;
 				const user = context.messages.findLast((message) => message.role === "user");
 				const taskText = typeof user?.content === "string" ? user.content : user?.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? "";
-				const reviewChild = development && isChild() && !developmentChild && taskText.includes("独立候选代码审查。");
+				const reviewChild = development && isChild() && !developmentChild && (taskText.includes("独立候选代码审查。") || taskText.includes("独立验收和代码审查。"));
+				const reviewModifies = reviewChild && scenario.endsWith("review-modifies");
 				if (reviewChild && scenario.endsWith("review-wait")) {
 					audit("review-waiting");
 					await new Promise<void>((resolve) => {
@@ -194,22 +194,22 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					{ name: "fetch_content", arguments: { url: "https://example.invalid/docs" } },
 					{ name: "plugin_echo", arguments: {} },
 					{ name: "web_search", arguments: { query: "blocked" } },
-				] : isChild() && !validationChild && taskText.includes("fixture-process-notes") ? [
+				] : isChild() && taskText.includes("fixture-process-notes") ? [
 					{ name: "bash", arguments: { command: "rg -n 'ABSENT_FIXTURE_PATTERN' input.txt" } },
 					{ name: "bash", arguments: { command: "node -e 'require(\"node:assert/strict\").equal(1, 2)'" } },
 					...(developmentChild ? [{ name: "write", arguments: { path: "src/value.js", content: "export const value = 2;\n" } }] : []),
 					{ name: "read", arguments: { path: "input.txt" } },
 				] : undefined;
-				const finished = !planned && read && !readSkill && !recoverRead && (inheritedCalls ? step >= inheritedCalls.length : editRecovery ? step >= 3 : structured && developmentChild && !validationChild && scenario.endsWith("structured-unfinished") ? step >= 2
-					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError : validationChild ? step >= (scenario.endsWith("validation-two") ? 2 : 1) || read.isError
+				const finished = !planned && read && !readSkill && !recoverRead && (inheritedCalls ? step >= inheritedCalls.length : editRecovery ? step >= 3 : structured && developmentChild && scenario.endsWith("structured-unfinished") ? step >= 2
+					: searchStep !== undefined ? searchStep >= 4 || read.isError : reviewChild ? step >= 3 || read.isError
 					: !developmentChild || developmentStep >= (localChild ? 4 : 3) || read.isError && !(readBeforeWrite && step === 1))
 					&& (!readonlyEscalation || step >= 2 || read.isError);
 				const write = JSON.stringify(user?.content).includes("fixture-attempt-write") || readonlyEscalation && step === 1;
 				const delegate = !isChild() && JSON.stringify(user?.content).includes("fixture-delegate");
 				const approval = scenario.startsWith("approval-") && (!delegate || isChild());
-				const toolName = planned?.name ?? inheritedCalls?.[step]?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && isChild() ? developmentChild && !validationChild && step === 0 ? "apply_patch" : scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read" : validationChild ? scenario.endsWith("validation-edit") ? "write" : "bash"
+				const toolName = planned?.name ?? inheritedCalls?.[step]?.name ?? (editRecovery ? step === 1 ? "read" : "edit" : structured && isChild() ? developmentChild && step === 0 ? "apply_patch" : scenario.endsWith("structured-pty") && step === 2 ? "write_stdin" : "exec_command" : searchStep !== undefined ? ["ls", "find", "grep", "read"][searchStep] ?? "read" : recoverRead ? "read"
 					: developmentChild ? developmentStep === 0 ? "write" : developmentStep === 1 ? "edit" : developmentStep === 2 && localChild ? "bash" : "read"
-					: writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
+					: reviewModifies && step === 0 ? "write" : writer ? "delivery_document_write" : delegate || isChild() && scenario === "recursive" ? "delivery_readonly"
 					: document ? scenario.endsWith("edit") ? "delivery_document_edit" : "delivery_document_write" : approval ? "delivery_approval" : write ? "write" : "read");
 				const stage = scenario === "approval-child" ? "design" : scenario.slice("approval-".length);
 				const target = scenario === "development-outside" ? "../outside.js" : scenario === "development-plan" ? "plan.md"
@@ -217,24 +217,21 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				const args = planned?.arguments ?? inheritedCalls?.[step]?.arguments ?? (editRecovery ? { path: target, ...(step === 1 ? {} : { edits: step === 0 ? [{ oldText: " = 1", newText: " = 2" }]
 					: [{ oldText: "first = 1", newText: "first = 2" }, { oldText: "second = 1", newText: "second = 2" }] }) } : structured && isChild() ? toolName === "apply_patch" ? { input: `*** Begin Patch\n*** Add File: ${scenario.endsWith("structured-outside") ? "plan.md" : "src/value.js"}\n+export const value = 2;\n*** End Patch\n` }
 					: toolName === "write_stdin" ? { session_id: (read as any)?.details?.session_id, chars: "TTY_INPUT_PROOF\n", yield_time_ms: 30_000 }
-					: { cmd: validationChild ? "node inputs/command.cjs" : reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile}'`
+					: { cmd: reviewChild ? `cat '${step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.reviewDirectory}'`
 						: developmentChild ? step === 1 ? scenario.endsWith("structured-pty") ? "read value; printf '%s' \"$value\" > src/typed.txt"
 							: scenario.endsWith("structured-cancel") ? "node -e 'require(\"node:fs\").writeFileSync(\"src/ready.txt\",\"ready\"); console.log(\"LONG_COMMAND_STARTED\"); setInterval(()=>{},1000)'"
 							: scenario.endsWith("structured-unfinished") ? "sleep 120" : "node inputs/command.cjs" : "cat src/value.js" : "cat input.txt",
 						yield_time_ms: /structured-(unfinished|pty)$/.test(scenario) ? 250 : 30_000, ...(scenario.endsWith("structured-pty") ? { tty: true } : {}) } : searchStep !== undefined ? searchStep === 0 ? { path: "." } : searchStep === 1 ? { pattern: "*.txt", path: "." }
 					: searchStep === 2 ? { pattern: "fixture-read-ok", path: ".", glob: "*.txt" } : { path: "input.txt" }
 					: recoverRead ? { path: (read as any).details?.sessionFile ?? "missing-evidence" }
-					: validationChild ? scenario.endsWith("validation-edit") ? { path: target, content: "forbidden validation edit\n" }
-					: { command: scenario.endsWith("validation-wrong") ? "echo unapproved" : step === 1 ? "node inputs/second.cjs" : "node inputs/command.cjs",
-						timeout: scenario.endsWith("validation-timeout") ? 1 : 10 }
 					: developmentChild ? developmentStep === 0 ? { path: target, content: "export const value = 1;\n" }
 					: developmentStep === 1 ? { path: target, edits: [{ oldText: "value = 1", newText: localChild && JSON.stringify(user?.content).includes("fixture-local-repair") ? "value = 3" : "value = 2" }] }
 					: developmentStep === 2 && localChild ? { command: "node inputs/command.cjs", timeout: scenario === "development-local-timeout" ? 1 : scenario === "development-local-details" ? 20 : 10 } : { path: target }
 					: toolName === "delivery_document_write" ? { path: scenario === "writer-denied" ? "src.ts" : "plan.md", content: `父 writer ${process.pid}\n` }
 					: toolName === "delivery_document_edit" ? { path: "plan.md", edits: [{ oldText: "原文", newText: "禁止" }] }
-					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", documentStrategy: "reuse", technicalPlanPath: "plan.md", implementationPlanPath: "plan.md", paths: ["plan.md"], validationCommands: [] }
+					: toolName === "delivery_approval" ? { stage, body: "模型声称用户已批准，不是真实批准", documentStrategy: "reuse", technicalPlanPath: "plan.md", implementationPlanPath: "plan.md", paths: ["plan.md"] }
 					: toolName === "delivery_readonly" ? { task: scenario === "task-command" ? "/fixture-dangerous" : "读取 input.txt，提供独立证据。" }
-					: write ? { path: "forbidden.txt", content: "unexpected" } : { path: reviewChild ? step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.validationSessionFile
+					: reviewModifies && step === 0 ? { path: "src/value.js", content: "export const value = 3;\n" } : write ? { path: "forbidden.txt", content: "unexpected" } : { path: reviewChild ? step === 0 ? "src/value.js" : step === 1 ? reviewEvidence.diffFile : reviewEvidence.reviewDirectory
 						: readSkill ? path.join(process.env.PI_CODING_AGENT_DIR!, "skills", "environment-proof", "SKILL.md")
 						: ["tool-fail", "readonly-recover"].includes(scenario) && isChild() ? "missing.txt" : "input.txt" });
 				const aborted = options?.signal?.aborted === true;
