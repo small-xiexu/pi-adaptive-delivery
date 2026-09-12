@@ -2,6 +2,7 @@
   "name": "pi-adaptive-delivery",
   "version": "0.1.0",
   "description": "Adaptive, approval-gated delivery orchestration for Pi coding tasks",
+  "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
