@@ -72,7 +72,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	});
 	await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session.reload() } as ExtensionCommandContextActions, uiContext: {
 		custom: approvalUI((...args) => select(...args), () => feedback?.()),
-		select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args), notify: (text: string) => { notices.push(text); },
+		select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args), notify: (text: string) => { notices.push(text); }, addAutocompleteProvider: () => {},
 	} as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
 	const model = modelRuntime.getModel("document-fixture", "fake");
 	assert.ok(model);
@@ -377,7 +377,7 @@ test("正式入口默认创建及持续编辑，文档写入无审批，进度�
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.choices.length, 0);
 	assert.equal((await h.approve()).isError, false);
-	assert.equal((await h.approve("implementation")).isError, false);
+	assert.equal((await h.approve("implementation", ["src"])).isError, false);
 	const approved = structuredClone(h.sm.getEntries().filter((row) => row.type === "custom"));
 	await writeFile(path.join(h.cwd, "plan.md"), "任意正文\n进度：待验证\n用户补充\n");
 	assert.equal((await h.call(documentEdit, { path: "plan.md", edits: [{ oldText: "进度：待验证", newText: "进度：已验证" }] })).isError, false);
