@@ -43,6 +43,10 @@ const structuredAdapter = process.env.DEMO_STRUCTURED
 	? await realpath(process.env.DEMO_STRUCTURED_ADAPTER ?? path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", "@howaboua", "pi-codex-conversion")).catch(() => "")
 	: undefined;
 if (process.env.DEMO_STRUCTURED && !structuredAdapter) throw new Error("未找到 pi-codex-conversion，需设置 DEMO_STRUCTURED_ADAPTER");
+// DEMO_PROXY_BASEURL：把 provider 指到本地转发代理（用于在真实模型上注入可重现的停顿）。
+if (process.env.DEMO_PROXY_BASEURL) {
+	await writeFile(path.join(agentDir, "models.json"), `${JSON.stringify({ providers: { [provider]: { baseUrl: process.env.DEMO_PROXY_BASEURL } } }, null, 2)}\n`);
+}
 const settings: Record<string, unknown> = { packages: structuredAdapter ? [structuredAdapter, repo] : [repo], defaultProvider: provider, defaultModel: modelId,
 	defaultThinkingLevel: thinking, compaction: { enabled: true }, httpIdleTimeoutMs: 60_000, retry: { enabled: true, maxRetries: 2 } };
 if (structuredAdapter) {
