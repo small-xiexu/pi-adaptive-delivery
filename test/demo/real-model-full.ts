@@ -5,7 +5,7 @@
 // 认证由 Pi 自己从符号链接的 auth.json 读取；本脚本不读取、不复制、不打印任何凭证。
 // 用法：node --import tsx test/demo/real-model-full.ts
 import { execFileSync, spawnSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +45,10 @@ const structuredAdapter = process.env.DEMO_STRUCTURED
 if (process.env.DEMO_STRUCTURED && !structuredAdapter) throw new Error("未找到 pi-codex-conversion，需设置 DEMO_STRUCTURED_ADAPTER");
 // DEMO_PROXY_BASEURL：把 provider 指到本地转发代理（用于在真实模型上注入可重现的停顿）。
 if (process.env.DEMO_PROXY_BASEURL) {
-	await writeFile(path.join(agentDir, "models.json"), `${JSON.stringify({ providers: { [provider]: { baseUrl: process.env.DEMO_PROXY_BASEURL } } }, null, 2)}\n`);
+	const target = path.join(agentDir, "models.json");
+	// 上面的符号链接指向用户全局配置：必须先断开再写，否则会顺着链接覆盖用户自己的文件。
+	await rm(target, { force: true });
+	await writeFile(target, `${JSON.stringify({ providers: { [provider]: { baseUrl: process.env.DEMO_PROXY_BASEURL } } }, null, 2)}\n`);
 }
 const settings: Record<string, unknown> = { packages: structuredAdapter ? [structuredAdapter, repo] : [repo], defaultProvider: provider, defaultModel: modelId,
 	defaultThinkingLevel: thinking, compaction: { enabled: true }, httpIdleTimeoutMs: 60_000, retry: { enabled: true, maxRetries: 2 } };
