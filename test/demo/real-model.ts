@@ -49,7 +49,7 @@ const modelId = process.env.DEMO_MODEL?.split("/")[1] ?? realSettings.defaultMod
 const thinking = process.env.DEMO_THINKING ?? "medium";
 await writeFile(path.join(agentDir, "settings.json"), `${JSON.stringify({
 	packages: [repo], defaultProvider: provider, defaultModel: modelId, defaultThinkingLevel: thinking,
-	compaction: { enabled: true }, retry: { enabled: true, maxRetries: 2 },
+	compaction: { enabled: true }, httpIdleTimeoutMs: 60_000, retry: { enabled: true, maxRetries: 2 },
 }, null, 2)}\n`);
 
 const keep = ["PATH", "LANG", "LC_ALL", "TERM", "SHELL", "USER", "LOGNAME", "TZ"];

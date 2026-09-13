@@ -203,11 +203,11 @@ node --import tsx test/support/run-tests.ts test/demo/full-flow.test.ts
 node --import tsx test/demo/real-model.ts
 ```
 
-使用 `pi-codex-conversion` 时，再按已安装插件的实际路径运行 Structured 专项：
+使用 `pi-codex-conversion` 时，再按已安装插件的实际路径运行 Structured 专项（由 Pi 安装的 npm 插件通常在 `~/.pi/agent/npm/node_modules/` 下；已在本机 `@howaboua/pi-codex-conversion 3.0.31` 上验证通过）：
 
 ```sh
 node --import tsx test/support/run-tests.ts \
-  --adapter /absolute/path/to/pi-codex-conversion \
+  --adapter "$HOME/.pi/agent/npm/node_modules/@howaboua/pi-codex-conversion" \
   test/structured/flow.test.ts
 ```
 

@@ -39,7 +39,7 @@ for (const file of ["auth.json", "models.json", "models-store.json", "AGENTS.md"
 }
 const [provider, modelId] = model.split("/");
 await writeFile(path.join(agentDir, "settings.json"), `${JSON.stringify({ packages: [repo], defaultProvider: provider, defaultModel: modelId,
-	defaultThinkingLevel: thinking, compaction: { enabled: true }, retry: { enabled: true, maxRetries: 2 } }, null, 2)}\n`);
+	defaultThinkingLevel: thinking, compaction: { enabled: true }, httpIdleTimeoutMs: 60_000, retry: { enabled: true, maxRetries: 2 } }, null, 2)}\n`);
 
 // 2. demo 项目：多模块订单结算服务，基线只有满 100 减 10
 const cwd = path.join(root, "repo");
