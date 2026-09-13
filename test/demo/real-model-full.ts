@@ -141,10 +141,20 @@ const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManage
 		injected = true;
 		const target = path.join(cwd, "src/discount.js");
 		const source = await readFile(target, "utf8");
-		const match = /(DISCOUNT\w*THRESHOLD\w*\s*=\s*)(\d+)/.exec(source);
-		if (!match) { injectNote = "未能定位门槛常量，未注入"; return; }
-		await writeFile(target, source.slice(0, match.index) + `${match[1]}20000` + source.slice(match.index + match[0].length));
-		injectNote = `已注入单文件缺陷：${match[0]} → ${match[1]}20000（九折门槛退回 200 元）`;
+		// 不依赖常量命名：依次尝试“新门槛数值 → 任意 THRESHOLD 常量 → 任意门槛比较数值”。
+		const patterns: { name: string; regex: RegExp; replace: (match: RegExpExecArray) => string }[] = [
+			{ name: "门槛数值 12000", regex: /12000/, replace: () => "20000" },
+			{ name: "THRESHOLD 常量", regex: /(\w*THRESHOLD\w*\s*=\s*)(\d+)/, replace: (match) => `${match[1]}20000` },
+			{ name: "门槛比较数值", regex: /(>=\s*)(\d{4,6})/, replace: (match) => `${match[1]}20000` },
+		];
+		for (const pattern of patterns) {
+			const match = pattern.regex.exec(source);
+			if (!match) continue;
+			await writeFile(target, source.slice(0, match.index) + pattern.replace(match) + source.slice(match.index + match[0].length));
+			injectNote = `已注入单文件缺陷（${pattern.name}）：${match[0]} → ${pattern.replace(match)}`;
+			return;
+		}
+		injectNote = "未能定位门槛，未注入";
 	}) }] });
 await resourceLoader.reload();
 const loadErrors = resourceLoader.getExtensions().errors;
