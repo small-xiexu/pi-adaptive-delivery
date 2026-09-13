@@ -6,6 +6,7 @@
 //   3) 加 -plugin 参数时，加载 pi-codex-conversion 后上述行为是否仍然成立。
 // 不调用真实模型、不读取、不复制、不打印任何凭证。
 // 用法：node --import tsx test/demo/idle-timeout-probe.ts [idleMs] [--plugin]
+import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -16,6 +17,7 @@ import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, Ses
 const repo = await realpath(fileURLToPath(new URL("../../", import.meta.url)));
 const idleMs = Number(process.argv[2] ?? 5_000);
 const withPlugin = process.argv.includes("--plugin");
+const withWatch = process.env.PROBE_WATCH === "1";
 const adapter = path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", "@howaboua", "pi-codex-conversion");
 let stalls = Number(process.env.PROBE_STALLS ?? 1);
 const started = Date.now();
@@ -53,7 +55,8 @@ for (const file of ["auth.json", "models-store.json"]) {
 }
 // 用户自己的 models.json 就是这么覆盖 baseUrl 的；这里把它指向本地假服务。
 await writeFile(path.join(agentDir, "models.json"), `${JSON.stringify({ providers: { deepseek: { baseUrl: `http://127.0.0.1:${port}/v1` } } }, null, 2)}\n`);
-const settings: Record<string, unknown> = { packages: withPlugin ? [adapter] : [], defaultProvider: "deepseek", defaultModel: "deepseek-flash",
+execFileSync("git", ["init", "-q"], { cwd: root });   // 交付入口要求 Git 工作区
+const settings: Record<string, unknown> = { packages: withPlugin ? [adapter] : withWatch ? [repo] : [], defaultProvider: "deepseek", defaultModel: "deepseek-flash",
 	httpIdleTimeoutMs: idleMs, retry: { enabled: true, maxRetries: 3, baseDelayMs: 300 }, compaction: { enabled: false } };
 if (withPlugin) settings.defaultTools = ["read", "bash", "write", "edit", "grep", "find", "ls"];
 await writeFile(path.join(agentDir, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`);
@@ -68,7 +71,7 @@ const env = { ...process.env, HOME: path.join(root, "home"), TMPDIR: root, PI_CO
 for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
 Object.assign(process.env, env);
 
-console.log(`模式：${withPlugin ? "加载 pi-codex-conversion" : "原生"} · httpIdleTimeoutMs=${idleMs} · 假服务 http://127.0.0.1:${port}/v1`);
+console.log(`模式：${withPlugin ? "加载 pi-codex-conversion" : withWatch ? "交付包 + 停顿看门狗" : "原生"} · httpIdleTimeoutMs=${idleMs} · 假服务 http://127.0.0.1:${port}/v1`);
 console.log(`（第一个请求只发响应头后沉默，之后正常回复"收到"）`);
 
 const timeline: string[] = [];
@@ -86,8 +89,9 @@ const sm = SessionManager.create(root, path.join(root, "sessions"));
 const { session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, sessionManager: sm });
 initTheme("dark");
 await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session.reload() } as unknown as ExtensionCommandContextActions,
-	abortHandler: () => { session.clearQueue(); void session.abort(); }, uiContext: { ...session.extensionRunner.getUIContext(), notify: () => {} } as never, onError: () => {} });
+	abortHandler: () => { session.clearQueue(); void session.abort(); }, uiContext: { ...session.extensionRunner.getUIContext(), notify: (text: string, level?: string) => console.log(`[通知${level ? `/${level}` : ""}] ${text}`) } as never, onError: () => {} });
 await session.setModel(target);
+if (withWatch) await session.prompt("/delivery-shape");   // 启用交付后才会安装停顿看门狗
 
 const began = Date.now();
 await session.prompt("只回答两个字：收到。").catch((error) => console.log("prompt 抛错：", String(error).slice(0, 120)));

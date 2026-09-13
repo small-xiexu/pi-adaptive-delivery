@@ -15,6 +15,7 @@ import { installTaskDetails } from "./src/task-details.ts";
 import { installStreamRetry } from "./src/stream-retry.ts";
 import { agentSelection, selectChildAgent } from "./src/agent-selection.ts";
 import { installActivation } from "./src/activation.ts";
+import { installStallWatch } from "./src/stall-watch.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	if (process.env[CHILD_ENV]) { installDelivery(pi); return; }
@@ -24,6 +25,8 @@ export default function adaptiveDelivery(pi: ExtensionAPI): void {
 function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	const entryPath = fileURLToPath(import.meta.url);
 	installStreamRetry(pi);
+	// 内容级停顿看门狗：Pi 的字节级 idle 超时对 openai SDK 与插件自带的传输都不可靠。
+	installStallWatch(pi);
 	// 子进程启动前确定角色；该内部标记只去除协调权限，不提供批准能力。
 	const child = Boolean(process.env[CHILD_ENV]);
 	const childDevelopment = process.env[CHILD_ENV] === "development" ? createChildDevelopment() : undefined;
