@@ -12,16 +12,19 @@ const wrapped = (text: string, width: number, prefix = "  ") => {
 
 const panelHeader = (theme: Theme, width: number, title: string, subtitle: string) => [
 	...wrapped(title, width).map((line) => theme.fg("accent", line)),
-	...wrapped(subtitle, width).map((line) => theme.fg("muted", line)),
+	...(subtitle ? wrapped(subtitle, width).map((line) => theme.fg("muted", line)) : []),
 	rule(theme, width),
 ];
 
+// 页脚以分隔线开断，与上方操作区区分。
 const panelFooter = (theme: Theme, width: number, first: string, second: string) => [
 	rule(theme, width),
 	...wrapped([first, second].filter(Boolean).join("\n"), width).map((line) => theme.fg("muted", line)),
 ];
 
+// 说明区自带空行，与上方正文分开；正文区和操作区不再挤在一起。
 const noticeLines = (theme: Theme, width: number, notice: string) => notice ? [
+	"",
 	...wrapped("说明", width).map((line) => theme.fg("muted", line)),
 	...wrapped(notice, width, "  │ ").map((line) => theme.fg("muted", line)),
 ] : [];
@@ -62,7 +65,7 @@ export class DesignReviewPanel {
 		this.acceptLabel = options.acceptLabel ?? "确认方案";
 		this.feedbackLabel = options.feedbackLabel ?? "提出修改意见";
 		this.pauseLabel = options.pauseLabel ?? "稍后再看";
-		this.subtitle = options.subtitle ?? "请先阅读，再选择下一步";
+		this.subtitle = options.subtitle ?? "";
 		this.choices = [this.acceptLabel, this.feedbackLabel, this.pauseLabel];
 		const selectTheme = {
 			selectedPrefix: (text: string) => theme.fg("accent", text), selectedText: (text: string) => theme.fg("accent", text),
@@ -116,13 +119,13 @@ export class DesignReviewPanel {
 	render(width: number) {
 		const body = wrapped(this.expanded ? this.detail : this.body, width);
 		const editor = this.editing ? this.editor.render(width) : [];
-		const options = this.editing ? [] : this.select.render(width);
+		const options = this.editing ? [] : this.select.render(width).map((line) => truncateToWidth(`  ${line}`, width, ""));
 		const notice = this.notice && !this.editing ? noticeLines(this.theme, width, this.notice) : [];
 		const header = panelHeader(this.theme, width, this.title, this.editing ? "提出修改意见" : this.subtitle);
 		const footer = panelFooter(this.theme, width,
-			this.editing ? "Enter 发送意见 · Shift+Enter 换行 · Esc 返回确认内容" : `↑↓ 选择 · Enter 确定 · Esc ${this.pauseLabel}`,
+			this.editing ? "Enter 发送意见 · Shift+Enter 换行 · Esc 返回确认内容" : "↑↓ 选择 · Enter 确定 · Esc 暂停",
 			`Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页`);
-		const reserved = header.length + editor.length + options.length + notice.length + footer.length + (this.editing ? 2 : 3);
+		const reserved = header.length + editor.length + options.length + notice.length + footer.length + (this.editing ? 3 : 4);
 		this.fits = reserved + 1 < this.tui.terminal.rows;
 		if (!this.fits) return [truncateToWidth("请放大终端 · Esc 稍后再看", width)];
 		this.pageSize = Math.max(1, Math.min(body.length,
@@ -137,6 +140,7 @@ export class DesignReviewPanel {
 		this.editorHeight = editor.length;
 		lines.push(...editor);
 		if (!this.editing) {
+			lines.push("");
 			lines.push(this.theme.fg("accent", "  操作"));
 			this.optionsRow = lines.length;
 			lines.push(...options);
@@ -199,9 +203,9 @@ export class DeliveryPanel {
 		const footer = panelFooter(this.theme, width,
 			this.detail ? "↑↓ 选择 · Enter 确定 · Esc 暂不批准" : "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭",
 			this.detail ? `Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页` : "");
-		const options = this.select?.render(width) ?? [];
+		const options = this.select?.render(width).map((line) => truncateToWidth(`  ${line}`, width, "")) ?? [];
 		const notice = noticeLines(this.theme, width, this.notice);
-		const reserved = header.length + footer.length + options.length + notice.length + (this.select ? 3 : 1);
+		const reserved = header.length + footer.length + options.length + notice.length + (this.select ? 4 : 1);
 		this.fits = reserved + 1 < this.tui.terminal.rows;
 		if (!this.fits) return [truncateToWidth("请放大终端 · Esc 取消", width)];
 		this.pageSize = Math.max(1, Math.min(body.length,
@@ -214,6 +218,7 @@ export class DeliveryPanel {
 		const lines = [...header, ...page,
 			truncateToWidth(this.theme.fg("dim", position), width, ""), ...notice];
 		if (this.select) {
+			lines.push("");
 			lines.push(this.theme.fg("accent", "  操作"));
 			this.optionsRow = lines.length;
 		}

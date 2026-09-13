@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -15,12 +15,12 @@ export const APPROVAL_ENTRY = "delivery-approval";
 
 const parameters = Type.Object({
 	stage: StringEnum(["design", "implementation"] as const),
-	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用大白话分行说明，不复制全文台账。design 先说明本次要改成什么、范围、关键设计、风险和验收方向；有规划文档时在正文后补充修改摘要，路径由界面详情列出。简单任务直接说明，无须新建文档。implementation 先说明具体步骤、依赖、环境、验证方式与停止条件；工具提供原方案查看入口，不重述相同方案，不以路径或摘要 ID 代替决策内容。" }),
+	body: Type.String({ minLength: 1, description: "本阶段完整决策正文，用大白话分行说明，不复制全文台账。design 先说明本次要改成什么、范围、关键设计、风险和验收方向；结尾固定另起一行“本次假设：”，列出方案依赖但你尚未向用户确认、若不成立就要改方案的推断（最多 3 条），确实没有写“无”。有规划文档时在正文后补充修改摘要，路径由界面详情列出。简单任务直接说明，无须新建文档。implementation 先说明具体步骤、依赖、环境、验证方式与停止条件；工具提供原方案查看入口，不重述相同方案，不以路径或摘要 ID 代替决策内容。" }),
 	documentStrategy: StringEnum(["none", "reuse", "new"] as const, { description: "本次规划文档策略：none=不落盘，reuse=复用现有文档，new=新建需求文档。implementation 与已确认的 design 使用相同策略。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "design 列明本任务由父维护的确切规划 Markdown 路径，随确认保护；简单任务没有规划文档时传 []，不得为填参数创建占位文档或遗漏已有需维护的方案/台账。implementation 必须列明允许子修改的文件或目录，不能传空数组。路径按 cwd 解析，不是 glob。" }),
-	technicalPlanPath: Type.Optional(Type.String({ minLength: 1, description: "design 中技术方案 Markdown 的相对路径；必须同时出现在 design.paths 中。无对应文件时省略。implementation 沿用已确认 design 的值。" })),
-	implementationPlanPath: Type.Optional(Type.String({ minLength: 1, description: "design 中实施计划 Markdown 的相对路径；必须同时出现在 design.paths 中。无对应文件时省略。implementation 沿用已确认 design 的值。" })),
-	inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "implementation 中纳入候选指纹的额外源码、配置或测试输入，按 cwd 解析，必须在 worktree 内且不含凭据。不包含整个工作区、规划文档、Git 或执行记录；这是审查输入，不是 Shell 隔离。" })),
+	technicalPlanPath: Type.Optional(Type.String({ description: "design 中技术方案 Markdown 的相对路径；必须同时出现在 design.paths 中。没有对应文件时省略该字段，不要传空字符串；implementation 沿用已确认 design 的值。" })),
+	implementationPlanPath: Type.Optional(Type.String({ description: "design 中实施计划 Markdown 的相对路径；必须同时出现在 design.paths 中。没有对应文件时省略该字段，不要传空字符串；implementation 沿用已确认 design 的值。" })),
+	inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "implementation 中纳入候选指纹的额外源码、配置或测试输入，按 cwd 解析，必须在 worktree 内且不含凭据。不包含整个工作区、规划文档、Git 或执行记录；不要与 paths 重复（paths 已包含待审查的可写文件）。这是审查输入，不是 Shell 隔离。" })),
 }, { additionalProperties: false });
 
 type Request = Static<typeof parameters>;
@@ -67,13 +67,30 @@ const permissions = {
 const documentStrategyLabels = { none: "不落盘", reuse: "复用现有文档", new: "新建需求文档" } as const;
 type DocumentPlan = Pick<Proposal, "documentStrategy" | "technicalPlanPath" | "implementationPlanPath">;
 
+// 面板会直接显示规划文档路径；落盘策略下用户按路径必须真能查阅到文件。
+async function assertPlanningFiles(paths: readonly string[], cwd: string): Promise<void> {
+	for (const target of paths) {
+		const relative = path.relative(cwd, target) || ".";
+		let info;
+		try { info = await lstat(target); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				throw new Error(`规划文档尚未写入：${relative}。先用 delivery_document_write 落盘（或改用 documentStrategy: "none"），再提交本次确认。`);
+			}
+			throw error;
+		}
+		if (info.isSymbolicLink() || !info.isFile() || info.size === 0) throw new Error(`规划文档不是可查阅的普通 Markdown 文件：${relative}`);
+	}
+}
+
 function documentSummary(proposal: Proposal): string {
 	const relative = (file?: string) => file ? path.relative(proposal.cwd, file) || "." : "无";
 	const planningPaths = proposal.planningPaths;
 	const labeled = new Set([proposal.technicalPlanPath, proposal.implementationPlanPath].filter(Boolean));
 	const extra = planningPaths.filter((file) => !labeled.has(file));
 	const scope = proposal.stage === "implementation" ? `\n允许修改（文件或目录）：${proposal.paths.map((file) => `• ${relative(file)}`).join(" ") || "无"}` : "";
-	return `文档策略：${documentStrategyLabels[proposal.documentStrategy]}\n技术方案：${relative(proposal.technicalPlanPath)}\n实施计划：${relative(proposal.implementationPlanPath)}`
+	const strategy = proposal.documentStrategy === "none" ? "不落盘（方案保存在本次会话，项目里不新增文档）" : documentStrategyLabels[proposal.documentStrategy];
+	return `文档策略：${strategy}\n技术方案：${relative(proposal.technicalPlanPath)}\n实施计划：${relative(proposal.implementationPlanPath)}`
 		+ scope
 		+ (extra.length ? `\n其他规划文档：\n${extra.map((file) => `• ${relative(file)}`).join("\n")}` : "");
 }
@@ -166,7 +183,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		if (ctx.mode !== "tui" || !ctx.hasUI || !ctx.isIdle() || ctx.hasPendingMessages()) return;
 		const content = next.stage === "design"
 			? "当前方案已由用户明确确认。请基于已确认方案整理实施步骤、修改范围、验证方式和停止条件，并立即调用 delivery_approval 提交 implementation 阶段实施确认；不要修改源码、不要启动子任务，不要把方案批准当作实施批准。"
-			: "当前实施已由用户明确确认。请基于已批准范围立即调用 delivery_develop 委派当前最小可验证节点；不要再次请求相同实施确认，不要扩大修改范围。";
+			: "当前实施已由用户明确确认。请按本次任务的复杂度推进：简单任务由父 Pi 在已批准范围内直接修改并运行项目已有检查；只有确实需要独立子会话时才调用 delivery_develop，需要时再按风险安排 delivery_review。不要再次请求相同实施确认，不要扩大修改范围，完成后核对实际差异与检查结果再交付。";
 		pi.sendMessage({ customType: "delivery-continuation", content, display: false, details: { stage: next.stage, approvalId: next.approvalId } },
 			{ deliverAs: "followUp", triggerTurn: true });
 	});
@@ -222,8 +239,12 @@ export function installApprovals(pi: ExtensionAPI) {
 		name: APPROVAL_TOOL, label: "请求交付批准",
 					description: "在父 Pi TUI 分别请求方案和实施确认，RPC/JSON/print 不接受批准。简单任务直接说明正文，design.paths 可为空；需要持续维护的方案/台账沿用已有文档。实施须列明约定修改范围、步骤、本机环境、验证方式和停止条件。确认管理本 Package 的交付入口，普通工具沿用 Pi 权限，不提供文件或网络隔离。",
 		parameters,
-		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
+		execute: async (toolCallId, rawRequest, signal, _onUpdate, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("批准只接受父 Pi 的真实 TUI 交互；当前模式不接受批准");
+			// 模型常把“没有对应文件”写成空串；空串与省略等价，不能因此拒绝整次批准。
+			const request = { ...rawRequest,
+				technicalPlanPath: rawRequest.technicalPlanPath?.trim() ? rawRequest.technicalPlanPath : undefined,
+				implementationPlanPath: rawRequest.implementationPlanPath?.trim() ? rawRequest.implementationPlanPath : undefined };
 			if (pending) throw new Error("已有批准请求等待处理，不并发显示第二个请求");
 			if (request.stage !== "design" && request.stage !== "implementation") throw new Error("只接受方案或实施确认；Markdown 编辑无需单独授权");
 			if (request.stage === "design") invalidateDesign();
@@ -261,6 +282,11 @@ export function installApprovals(pi: ExtensionAPI) {
 					}
 				}
 				const documentPlan = resolveDocumentPlan(request, workspace.cwdPath, approvedDesign ?? expectedDesign?.proposal);
+				if (request.stage === "design" && request.documentStrategy !== "none") {
+					// 实施计划按流程在方案确认之后才写，方案阶段只要求其余声明路径（含技术方案）已可查阅。
+					await assertPlanningFiles(paths.filter((target) => target !== documentPlan.implementationPlanPath), workspace.cwdPath);
+				}
+				if (request.stage === "implementation") await assertPlanningFiles(approvedDesign!.paths, workspace.cwdPath);
 				const proposal: Proposal = { id: randomUUID(), sessionId, workspaceKey: workspace.key, cwd: workspace.cwdPath,
 					stage: request.stage, body: request.body, documentStrategy: documentPlan.documentStrategy,
 					...(documentPlan.technicalPlanPath ? { technicalPlanPath: documentPlan.technicalPlanPath } : {}),

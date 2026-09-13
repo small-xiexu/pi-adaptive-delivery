@@ -18,7 +18,7 @@ export type ProgressUpdate = (message: string, progress: TaskProgress) => void;
 export const RUNNING_STATUS = "运行中";
 export const COMPLETED_STATUS = "已完成";
 export const ABNORMAL_STATUS = "异常退出";
-export const TOOL_ERROR_GUIDANCE = "以下为过程中工具调用的原始异常摘要。它不单独改变子 Agent 状态；请交给父 Pi 结合调用、原始返回、后续操作和最终产物判断是否继续。";
+export const TOOL_ERROR_GUIDANCE = "工具调用失败记录：以下调用返回了失败结果（可能是检查未通过，也可能是命令或检索失败），不单独改变子 Agent 状态；请父 Pi 结合原始返回、后续操作和最终产物判断。";
 const short = (text: string, limit = 300) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, limit);
 const tail = (text: string) => text.length > 4000 ? `[预览已省略，详情查看完整内容]\n${text.slice(-4000)}` : text;
 const streamingTail = (text: string) => text.length > 64_000 ? `[在途输出仅保留最近片段，完成后可查看原始结果]\n${text.slice(-64_000)}` : text;
@@ -54,7 +54,7 @@ export function summarizeToolErrors(rows: readonly SessionEntry[]) {
 		}
 	}
 	if (!count) return undefined;
-	return { action: `${count} 次工具异常 · ${first}`, text: `过程记录（${count} 次工具异常）：\n${notes.join("\n")}`
+	return { action: `${count} 次工具调用失败 · ${first}`, text: `过程记录（${count} 次工具调用失败）：\n${notes.join("\n")}`
 		+ (count > notes.length ? `\n其余 ${count - notes.length} 次见原始子 Session。` : "") };
 }
 

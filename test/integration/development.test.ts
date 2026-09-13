@@ -43,6 +43,8 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	assert.ok(reviewRequest);
 	assert.match(JSON.stringify(reviewRequest.messages), /默认不修改源码/);
 	assert.match(JSON.stringify(reviewRequest.messages), /交回父 Pi/);
+	// 审查子看不到父会话里的例外授权，必须显式告知规划文档属于父维护、不算越界。
+	assert.match(JSON.stringify(reviewRequest.messages), /父维护的规划文档.*plan\.md/);
 	assert.ok(reviewRequest.tools.includes("write") && reviewRequest.tools.includes("edit") && reviewRequest.tools.includes("bash"));
 });
 

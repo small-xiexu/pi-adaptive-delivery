@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 import { installActivation } from "../../extensions/delivery-gate/src/activation.ts";
 
-function host(entries: any[] = []) {
+const execFileAsync = promisify(execFile);
+const repo = await mkdtemp(path.join(os.tmpdir(), "adaptive-activation-repo-"));
+await execFileAsync("git", ["init", "-q"], { cwd: repo });
+
+function host(entries: any[] = [], cwd = repo) {
 	const handlers = new Map<string, Function>();
 	const commands = new Map<string, any>();
 	const notices: string[] = [];
@@ -15,7 +24,7 @@ function host(entries: any[] = []) {
 	const pi: any = { on: (name: string, fn: Function) => handlers.set(name, fn), registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
 		getActiveTools: () => [...tools], getAllTools: () => ["read", "bash", "plugin"].map((name) => ({ name })), setActiveTools: (names: string[]) => { tools = names; },
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }), sendUserMessage: (...args: any[]) => messages.push(args), sendMessage: (...args: any[]) => messages.push(args) };
-	const ctx: any = { hasUI: true, sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
+	const ctx: any = { hasUI: true, cwd, sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
 		ui: { notify: (text: string) => notices.push(text), addAutocompleteProvider: (factory: any) => { autocompleteProvider = factory(autocompleteProvider); } }, reload: async () => { reloads++; } };
 	installActivation(pi, (current) => { assert.equal(current, ctx); starts++; return { initialize: async () => { tools = ["read"]; }, assertCanExit: async () => { if (blocked) throw new Error("未知 writer"); } }; });
 	autocompleteProvider = new CombinedAutocompleteProvider([...commands].map(([name, command]) => ({ name, description: command.description })), "/tmp");
@@ -43,8 +52,10 @@ test("启动时建立的补全已包含任务与恢复入口，首次 shape 后�
 	const before = await h.completions();
 	assert.ok(before?.includes("delivery-tasks"));
 	assert.ok(before?.includes("delivery-resume"));
+	assert.ok(before?.includes("delivery-unlock"));
 	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-tasks"));
 	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-resume"));
+	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-unlock"));
 	await h.command("delivery-shape");
 	assert.deepEqual(await h.completions(), before);
 });
@@ -70,6 +81,16 @@ for (const busy of ["running", "queued", "writer"]) test(`退出拒绝 ${busy}�
 	assert.equal(h.reloads(), 0);
 	assert.equal(h.entries.length, 1);
 	assert.deepEqual(h.pi.getActiveTools(), ["read"]);
+});
+
+test("非 Git 目录不启用交付，说明 Git 要求且不写启用记录", async () => {
+	const plain = await mkdtemp(path.join(os.tmpdir(), "adaptive-activation-plain-"));
+	const h = host([], plain);
+	await h.command("delivery-shape", "修复列表空数据报错");
+	assert.equal(h.starts(), 0);
+	assert.deepEqual(h.entries, []);
+	assert.deepEqual(h.messages, []);
+	assert.match(h.notices.at(-1)!, /Git/);
 });
 
 test("退出经重载恢复原工具集合，只消费一次恢复记录", async () => {

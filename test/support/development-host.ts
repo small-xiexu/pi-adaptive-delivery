@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TestContext } from "node:test";
@@ -66,9 +66,15 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session.messages));
 		return row.message;
 	};
-	const approve = (stage: string, paths: string[], inputs: string[] = [], _legacyValidationCommands: string[] = [], _legacyRevisionOf?: string, body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
+	const approve = async (stage: string, paths: string[], inputs: string[] = [], _legacyValidationCommands: string[] = [], _legacyRevisionOf?: string, body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
 		const latest = sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "design") as any;
 		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
+		// 落盘策略下批准前要求规划文档真实存在；夹具先把声明路径写成真实文件。
+		if (stage === "design" && paths.length) {
+			const target = path.join(fixture.cwd, paths[0]!);
+			await mkdir(path.dirname(target), { recursive: true });
+			await writeFile(target, "# 规划文档\n").catch(() => {});
+		}
 		return call("delivery_approval", { stage, body, documentStrategy,
 			...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}),
 			paths, inputs });

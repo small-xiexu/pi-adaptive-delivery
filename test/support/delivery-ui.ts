@@ -5,12 +5,13 @@ import type { DesignReviewPanel, DeliveryPanel } from "../../extensions/delivery
 export const plainTheme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
 
 // SDK 父的模拟交互宿主：实际创建产品组件，并用键盘选择；不是用户批准证据。
-export function approvalUI(select: ExtensionUIContext["select"], feedback?: () => string | undefined): ExtensionUIContext["custom"] {
+// rows 默认 32（历史上的最小验收尺寸）；关注“首屏能否看到正文”的用例可传全屏尺寸。
+export function approvalUI(select: ExtensionUIContext["select"], feedback?: () => string | undefined, rows = 32): ExtensionUIContext["custom"] {
 	return (async (factory: Parameters<ExtensionUIContext["custom"]>[0], options?: Parameters<ExtensionUIContext["custom"]>[1]) => {
 		assert.notEqual(options?.overlay, true, "审批应使用原生底部输入区，不能覆盖主对话");
 		let done!: (value: unknown) => void;
 		const result = new Promise((resolve) => { done = resolve; });
-		const panel = await factory({ terminal: { rows: 32 }, requestRender() {} } as any, plainTheme, {} as any, done) as (DeliveryPanel | DesignReviewPanel) & { dispose?(): void };
+		const panel = await factory({ terminal: { rows }, requestRender() {} } as any, plainTheme, {} as any, done) as (DeliveryPanel | DesignReviewPanel) & { dispose?(): void };
 		try {
 			const review = panel.title === "方案审阅";
 			assert.equal(panel.choices.at(-1), review ? "稍后再看" : "暂不批准");

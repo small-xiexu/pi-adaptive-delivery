@@ -406,7 +406,7 @@ export async function delegateReadOnly(
 		await Promise.all([
 			rpc.waitSettled(operation),
 			// 不让任务正文以斜线命令的身份执行，避免绕过模型工具边界。
-			rpc.request({ type: "prompt", message: `${mode === "review" ? "独立审查子任务。沿用父 Pi 的全部普通工具和权限；职责是独立检查、运行检查并报告问题，默认不修改源码。发现问题交回父 Pi，由父 Pi 决定直接修复或重新委派开发；不批准、不继续委派。" : "只读子任务。仅分析并提供证据，不修改文件，不继续委派。"}\n\n${input.task}` }, operation),
+			rpc.request({ type: "prompt", message: `${mode === "review" ? "独立审查子任务。不要只表态是否完成：先列出方案与实现依赖的关键事实（接口、数据结构、假定行为）并逐条到代码中核对、给出文件与行号，再列出最可能失败但现有检查未覆盖的路径；只有实际读取或实际运行证实的结论才写“成立”，其余标为未验证。沿用父 Pi 的全部普通工具和权限；职责是独立检查、运行检查并报告问题，默认不修改源码。发现问题交回父 Pi，由父 Pi 决定直接修复或重新委派开发；不批准、不继续委派。" : "只读子任务。仅分析并提供证据，不修改文件，不继续委派。"}\n\n${input.task}` }, operation),
 		]);
 		if (rpc.openTools.size) throw new Error("子任务存在未确认的工具执行终态");
 	} catch (error) { problem = error; }
@@ -442,6 +442,6 @@ export async function delegateReadOnly(
 		+ `\n父 Session ID：${input.parentSessionId}\n本次工具调用：${input.id}`
 		+ "\n此结果仍为失败；先读取已有原始证据，不据此自动重试或放宽权限。", { cause: problem });
 	const output = truncateHead(text!);
-	return { text: `${rpc.toolError ? `${TOOL_ERROR_GUIDANCE}\n${toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}\n\n` : ""}${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}`,
+	return { text: `${output.content}${output.truncated ? "\n[已截断，完整结果见子会话记录]" : ""}${rpc.toolError ? `\n\n${TOOL_ERROR_GUIDANCE}\n${toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}` : ""}`,
 		sessionId: state!.sessionId, sessionFile: state!.sessionFile!, pid: rpc.process.pid!, toolErrors: rpc.toolError };
 }

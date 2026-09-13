@@ -43,6 +43,12 @@ export interface WriterLeaseReference {
 	workspaceKey: string;
 }
 
+// 人工强制清理前的现场快照；只报告事实，不代表原执行已经停止。
+export interface WriterLeaseBlockage {
+	lease?: { leaseId?: string; digest: string; record?: WriterLeaseRecord };
+	operationLock: boolean;
+}
+
 export type AcquireWriterLeaseResult =
 	| { ok: true; record: WriterLeaseRecord; reference: WriterLeaseReference }
 	| { ok: false; reason: string; existing?: WriterLeaseRecord };
@@ -301,6 +307,40 @@ export class WriterLeaseManager {
 		try { await lstat(this.operationLockPath(workspaceKey)); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
 		throw new Error("writer 操作锁仍在，收尾尚未核实；不自动解锁。");
+	}
+
+	// 人工确认前只读取现场；损坏记录也能被报告和清理，否则会永久阻塞。
+	async inspectBlockage(workspaceKey: string): Promise<WriterLeaseBlockage> {
+		let lease: WriterLeaseBlockage["lease"];
+		try {
+			const raw = await readFile(this.leasePath(workspaceKey), "utf8");
+			let record: WriterLeaseRecord | undefined;
+			try { record = parseWriterLeaseRecord(JSON.parse(raw)); } catch { record = undefined; }
+			lease = { digest: createHash("sha256").update(raw).digest("hex"), ...(record ? { leaseId: record.leaseId, record } : {}) };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		let operationLock = false;
+		try { await lstat(this.operationLockPath(workspaceKey)); operationLock = true; }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		return { ...(lease ? { lease } : {}), operationLock };
+	}
+
+	// 仅由用户显式确认后调用：这是强制重置，不是安全释放，也不判断原进程是否已停止。
+	async discard(workspaceKey: string, expectation: WriterLeaseBlockage): Promise<{ lease: boolean; operationLock: boolean }> {
+		const current = await this.inspectBlockage(workspaceKey);
+		if (current.operationLock !== expectation.operationLock
+			|| (current.lease?.digest ?? null) !== (expectation.lease?.digest ?? null)) {
+			throw new Error("现场已变化，未清理；请重新查看后再确认");
+		}
+		if (current.lease) await unlink(this.leasePath(workspaceKey));
+		if (current.operationLock) {
+			try { await rm(this.operationLockPath(workspaceKey), { recursive: true }); }
+			catch (error) {
+				throw new Error(`lease 记录已删除，但残留操作锁未清理：${error instanceof Error ? error.message : String(error)}`, { cause: error });
+			}
+		}
+		return { lease: Boolean(current.lease), operationLock: current.operationLock };
 	}
 
 	async acquire(

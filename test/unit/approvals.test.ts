@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, copyFile, mkdtemp, readFile, readdir, realpath, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,6 +14,11 @@ const implementation = { stage: "implementation", body: "计划正文\n先实现
 async function host(persist = true) {
 	const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "approval-unit-")));
 	execFileSync("git", ["init", "--quiet"], { cwd });
+	// 落盘策略下批准前要求规划文档真实存在，夹具按接口默认路径先写入。
+	await mkdir(path.join(cwd, "docs"), { recursive: true });
+	await writeFile(path.join(cwd, "docs/方案.md"), "# 方案\n");
+	await writeFile(path.join(cwd, "docs/计划.md"), "# 计划\n");
+	await writeFile(path.join(cwd, "new-plan.md"), "# 新计划\n");
 	const sm = SessionManager.create(cwd, path.join(cwd, "sessions"));
 	if (persist) sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "模拟模型讨论，非真实用户批准" }],
 		api: "openai-completions", provider: "fixture", model: "fake", timestamp: Date.now(), stopReason: "stop",
@@ -42,6 +47,15 @@ async function host(persist = true) {
 		event: async (name: string, payload: unknown = {}) => { for (const handler of handlers.get(name) ?? []) await handler(payload, ctx); } };
 }
 
+test("空字符串规划路径按省略处理，不拒绝整次批准", async () => {
+	const h = await host();
+	const result = await h.run({ ...design, documentStrategy: "none", paths: [], technicalPlanPath: "", implementationPlanPath: "" } as never);
+	assert.equal((result as { details: { approved?: boolean } }).details.approved, true);
+	const proposal = (h.entries(PROPOSAL_ENTRY).at(-1) as { data: { technicalPlanPath?: string; implementationPlanPath?: string } }).data;
+	assert.equal(proposal.technicalPlanPath, undefined);
+	assert.equal(proposal.implementationPlanPath, undefined);
+});
+
 test("阶段批准后在 agent settled 时自动衔接下一回合，模型已衔接时不重复发送", async () => {
 	const h = await host();
 	await h.run();
@@ -57,6 +71,8 @@ test("阶段批准后在 agent settled 时自动衔接下一回合，模型已�
 	await h.event("agent_settled");
 	assert.equal(h.continuations.length, 2);
 	assert.match(JSON.stringify(h.continuations[1]), /delivery_develop/);
+	// 简单任务不应被衔接文案硬推到子 Agent。
+	assert.match(JSON.stringify(h.continuations[1]), /简单任务由父 Pi/);
 	await h.event("tool_call", { toolName: "delivery_develop", input: {} });
 	await h.event("agent_settled");
 	assert.equal(h.continuations.length, 2);
@@ -346,11 +362,13 @@ test("确认首屏显示文档策略、路径与改法，两阶段按键一致",
 	const h = await host();
 	const bodies = { design: "非法日期显示“时间格式异常”；空值和正常日期沿用原行为。", implementation: "修改日期格式函数，补充非法日期测试。" };
 	for (const stage of ["design", "implementation"] as const) {
-		h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0])(async (...args) => {
+		h.ctx.ui.custom = (factory: any, options: any) => approvalUI(async (_title, choices) => choices[0], undefined, 50)(async (...args) => {
 			const panel = await factory(...args);
-			const screen = panel.render(100).join("\n");
-			const bodyLine = screen.split("\n").findIndex((line: string) => line.includes(bodies[stage]));
-			assert.ok(bodyLine >= 1 && bodyLine <= 9, "正文应在面板顶部内容区显示");
+			const lines = panel.render(100) as string[];
+			const screen = lines.join("\n");
+			const bodyLine = lines.findIndex((line) => line.includes(bodies[stage]));
+			const optionsLine = lines.findIndex((line) => line.trim() === "操作");
+			assert.ok(bodyLine >= 1 && optionsLine > bodyLine, "正文应在面板内容区、操作区之前显示");
 			assert.match(screen, /↑↓ 选择 · Enter 确定/);
 			assert.match(screen, /Ctrl\+O 查看详情/);
 			assert.doesNotMatch(screen, /父会话|提案记录|项路径|你希望怎么改/);
@@ -365,6 +383,20 @@ test("确认首屏显示文档策略、路径与改法，两阶段按键一致",
 		await h.run({ ...(stage === "design" ? design : implementation), body: bodies[stage] });
 	}
 	assert.equal(h.entries(APPROVAL_ENTRY).length, 2);
+});
+
+test("落盘策略要求规划文档真实存在，实施计划可等到方案确认后再写", async () => {
+	const h = await host();
+	// 方案阶段：技术方案等缺失直接拒绝，且不产生提案记录。
+	await assert.rejects(h.run({ ...design, paths: ["docs/方案.md", "docs/计划.md", "missing.md"] }), /规划文档尚未写入：missing\.md/);
+	assert.equal(h.entries(PROPOSAL_ENTRY).length, 0);
+	// 方案阶段：实施计划可以还不存在（它在确认之后才写）。
+	await unlink(path.join(h.cwd, "docs/计划.md"));
+	assert.equal((await h.run(design)).details.approved, true);
+	// 实施阶段：声明的规划路径必须全部已可查阅。
+	await assert.rejects(h.run(implementation), /规划文档尚未写入：docs\/计划\.md/);
+	await writeFile(path.join(h.cwd, "docs/计划.md"), "# 计划\n");
+	assert.equal((await h.run(implementation)).details.approved, true);
 });
 
 for (const stage of ["design", "implementation"]) for (const type of [PROPOSAL_ENTRY, APPROVAL_ENTRY]) test(`同时篡改内存与磁盘 ${stage}/${type} 不能扩大权限`, async () => {

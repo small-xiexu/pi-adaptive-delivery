@@ -19,7 +19,7 @@ test("过程摘要关联原始调用和行号，同为退出 1 不自动解释�
 	];
 	const before = structuredClone(rows);
 	const note = summarizeToolErrors(rows)!;
-	assert.match(note.action, /2 次工具异常.*bash.*code 1/);
+	assert.match(note.action, /2 次工具调用失败.*bash.*code 1/);
 	assert.match(note.text, /原记录第 3 行.*node failing-test.cjs.*AssertionError/s);
 	assert.match(note.text, /原记录第 4 行.*rg missing input.txt.*code 1/s);
 	assert.match(summarizeToolErrors([rows[3]])!.action, /code 1.*CONFIGURED_RESULT_HOOK/);
@@ -35,7 +35,7 @@ test("过程摘要有界、移除终端控制序列，缺少调用或正文时�
 	} }));
 	rows[0].message.content = [];
 	const note = summarizeToolErrors(rows)!;
-	assert.match(note.action, /20 次工具异常/);
+	assert.match(note.action, /20 次工具调用失败/);
 	assert.match(note.text, /未取得文本返回/);
 	assert.match(note.text, /其余 17 次/);
 	assert.match(note.text, /ERROR_END/);

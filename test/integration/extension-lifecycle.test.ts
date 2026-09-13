@@ -103,8 +103,10 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		if (scenario === "tool-fail" || scenario === "readonly-recover") {
 			const text = tool.result.content[0].text;
 			assert.ok(text.includes(ended.sessionFile));
-			assert.match(text, /过程记录.*工具异常/);
+			assert.match(text, /工具调用失败记录/);
+			assert.match(text, /过程记录（\d+ 次工具调用失败）/);
 			assert.match(text, /不单独改变子 Agent 状态/);
+			assert.ok(text.indexOf("工具调用失败记录") > text.indexOf("子任务执行结束"), "失败记录应排在正文之后");
 			assert.equal(ended.toolErrors, true);
 			assert.match(await readFile(ended.sessionFile, "utf8"), /"stopReason":"stop"/);
 			if (scenario === "readonly-recover") {

@@ -231,6 +231,9 @@ test("关闭失败即使有原生错误记录也不释放 writer", async (t) => 
 	await call.persist();
 	await h.event("turn_end");
 	assert.ok(await h.readLease());
+	// 已终结但未收尾的失败仍算 pending，同时暴露具体原因供退出判断区分终态与在途。
+	assert.equal(h.writer.pending, true);
+	assert.match(h.writer.fault ?? "", /清理失败/);
 	assert.ok(h.notices.some((text) => text.includes("清理失败")));
 });
 

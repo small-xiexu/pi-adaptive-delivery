@@ -191,13 +191,14 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					const candidate = await captureCandidate(scope, running);
 					const artifact = await prepareReview(scope, candidate);
 					const reviewTask = [
-						"独立验收和代码审查。对照原始目标、批准要求、当前代码和实际差异判断是否完成。",
+						"独立验收和代码审查。不要只表态是否完成：先列出方案与实现所依赖的关键事实（调用的接口、数据结构、假定的行为），逐条到实际代码中核对并给出文件与行号；再列出你认为最可能失败但现有检查未覆盖的路径。只有经实际读取或实际运行证实的结论才写“成立”，其余明确标注为未验证。",
 						"主动识别项目已有的测试、编译、lint 或其他适合本任务的检查并实际运行，记录命令和真实结果；没有运行不能声称通过。",
 						"沿用父 Pi 的全部普通工具和权限；职责是独立检查、运行检查并报告问题，默认不修改源码。发现问题交回父 Pi，由父 Pi 决定直接修复或重新委派开发；不批准、不继续委派。",
 						`已批准方案：${grant.designBody}`,
 						`已批准实施说明：${grant.implementationBody}`,
 						`候选：${candidate.digest}`,
 						`代码路径：${JSON.stringify(grant.paths)}`,
+						`父维护的规划文档：${JSON.stringify(grant.planningPaths)}（本次设计确认声明的父维护文档，不在你的修改范围，出现在工作区不算越界改动；但文档描述与实际代码是否一致仍要核对）`,
 						`额外审查输入：${JSON.stringify(grant.inputs)}`,
 						`审查证据：${JSON.stringify({ reviewDirectory: artifact.directory, diffFile: artifact.diffFile })}`,
 						`差异基线：${artifact.baseHead ?? "无 HEAD，空基线"}；before/after 为原始 Git blob/当前文件副本。`,
@@ -229,6 +230,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						"不要修改父规划文档，不继续委派，不执行未授权的外部写入。",
 						`本机工作目录：${input.cwd}`,
 						`已批准开发路径：${JSON.stringify(grant.paths)}`,
+						`父维护的规划文档（不要修改）：${JSON.stringify(grant.planningPaths)}`,
 						`额外审查输入：${JSON.stringify(grant.inputs)}`,
 						`已批准方案：${grant.designBody}`,
 						`已批准实施说明：${grant.implementationBody}`,
@@ -250,14 +252,14 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.review) {
 					const review = state.review;
 					progress.end(COMPLETED_STATUS);
-					const result = { content: [{ type: "text" as const, text: [`独立验收和审查已结束，发现仍由父会话裁决，不等于自动交付通过：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n") }], details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
+					const result = { content: [{ type: "text" as const, text: [`独立验收和审查已结束，发现仍由父会话裁决，不等于自动交付通过（修复方式：单文件且不改对外行为契约的由父 Pi 直接改并复跑检查；多文件或金额、并发、权限等边界问题重新委派 delivery_develop）：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n") }], details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
 					state.result = snapshot({ ...result, isError: false });
 					return result;
 				}
 				const terminal = await childTerminal(state);
 				const text = ((terminal.last as any)?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
 				progress.end(COMPLETED_STATUS);
-				const result = { content: [{ type: "text" as const, text: `${state.rpc!.toolError ? `${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}\n\n` : ""}开发子任务已结束，仍需父 Pi 核对实际变更和审查结果：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}` }], details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, progress: progress.snapshot() } };
+				const result = { content: [{ type: "text" as const, text: `开发子任务已结束，仍需父 Pi 核对实际变更和审查结果：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}${state.rpc!.toolError ? `\n\n${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}` : ""}` }], details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, progress: progress.snapshot() } };
 				state.result = snapshot({ ...result, isError: false });
 				return result;
 			} catch (error) {
@@ -305,5 +307,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		review: (input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext, update: ProgressUpdate) => execute(REVIEW_TOOL, input, signal, ctx, update),
 		get progress() { return active?.progress?.snapshot(); },
 		get pending() { return active !== undefined; },
+		// 已结束且未自动收尾的失败是终态记录，不是仍在途的执行。
+		get fault() { return active?.fault; },
 	};
 }

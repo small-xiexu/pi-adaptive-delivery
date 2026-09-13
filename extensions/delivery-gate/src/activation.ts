@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import { fileURLToPath } from "node:url";
+import { resolveWorkspaceIdentity } from "./workspace.ts";
 
 const ENTRY = "delivery-activation";
 type Activation = { enabled: boolean; tools?: string[] };
@@ -68,6 +69,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 	for (const [name, description] of [
 		["delivery-tasks", "查看交付子任务的实时输出，Esc 关闭详情"],
 		["delivery-resume", "继续尚未确认的方案审阅"],
+		["delivery-unlock", "人工核对并强制清理残留的 writer 记录"],
 	] as const) pi.registerCommand(name, {
 		description,
 		handler: async (_args, ctx) => { ctx.ui.notify("请先用 /delivery-shape 进入交付流程。当前仍沿用 Pi 原有工具。", "info"); },
@@ -81,6 +83,12 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 			}
 			changing = true;
 			try {
+				// 交付以 worktree 为单位记录 writer；非 Git 目录在首次批准或写入时才失败会误导用户。
+				try { await resolveWorkspaceIdentity(ctx.cwd); }
+				catch (error) {
+					ctx.ui.notify(`交付需要 Git 仓库（writer lease 以 worktree 为单位）；当前目录未能确认 Git 工作区：${error instanceof Error ? error.message : String(error)}\n继续使用普通 Pi，未启用交付。`, "warning");
+					return;
+				}
 				if (!runtime) {
 					originalTools = pi.getActiveTools();
 					pi.appendEntry(ENTRY, { enabled: true, tools: originalTools });

@@ -182,6 +182,8 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 	});
 	return {
 		get pending() { return active !== undefined; },
+		// 已结束且未自动收尾的失败是终态记录，不是仍在途的写入。
+		get fault() { return active?.fault; },
 		edit: (id: string, input: EditToolInput, signal: AbortSignal | undefined, ctx: ExtensionContext) => execute("edit", id, input, signal, ctx),
 		write: (id: string, input: WriteToolInput, signal: AbortSignal | undefined, ctx: ExtensionContext) => execute("write", id, input, signal, ctx),
 	};

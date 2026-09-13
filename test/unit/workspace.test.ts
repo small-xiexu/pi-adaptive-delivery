@@ -75,6 +75,54 @@ test("退出所需 writer 空闲证据拒绝损坏记录及残留操作锁，不
 	await access(lock);
 });
 
+test("人工强制重置清理残留 lease 与操作锁，现场变化时拒绝", async () => {
+	const repo = await gitRepo("adaptive-discard-");
+	const workspace = await resolveWorkspaceIdentity(repo);
+	const root = await getWriterStateRoot(workspace);
+	const manager = new WriterLeaseManager(root);
+	const acquired = await manager.acquire(workspace, { kind: "parent", sessionId: "session", pid: process.pid, runId: "call" });
+	assert.ok(acquired.ok);
+	const leaseFile = path.join(root, "leases", `${workspace.key}.json`);
+	const lock = path.join(root, "leases", `${workspace.key}.operation-lock`);
+	await mkdir(lock);
+	const blockage = await manager.inspectBlockage(workspace.key);
+	assert.equal(blockage.lease?.leaseId, acquired.record.leaseId);
+	assert.equal(blockage.operationLock, true);
+	// 展示后的变更必须让清理失败，不能用旧证据删除新现场。
+	await writeFile(leaseFile, `${JSON.stringify({ ...acquired.record, leaseId: "changed" })}\n`);
+	await assert.rejects(manager.discard(workspace.key, blockage), /现场已变化/);
+	const changed = await manager.inspectBlockage(workspace.key);
+	assert.deepEqual(await manager.discard(workspace.key, changed), { lease: true, operationLock: true });
+	await assert.rejects(access(leaseFile), { code: "ENOENT" });
+	await assert.rejects(access(lock), { code: "ENOENT" });
+	await manager.assertIdle(workspace.key);
+	assert.equal((await manager.acquire(workspace, { kind: "parent", sessionId: "session-2", pid: process.pid })).ok, true);
+});
+
+test("损坏的残留记录仍可查看和清理，不永久阻塞", async () => {
+	const repo = await gitRepo("adaptive-discard-broken-");
+	const workspace = await resolveWorkspaceIdentity(repo);
+	const root = await getWriterStateRoot(workspace);
+	const manager = new WriterLeaseManager(root);
+	await mkdir(path.join(root, "leases"), { recursive: true });
+	await writeFile(path.join(root, "leases", `${workspace.key}.json`), "broken");
+	await assert.rejects(manager.read(workspace.key));
+	const blockage = await manager.inspectBlockage(workspace.key);
+	assert.equal(blockage.lease?.leaseId, undefined);
+	assert.ok(blockage.lease?.digest);
+	assert.deepEqual(await manager.discard(workspace.key, blockage), { lease: true, operationLock: false });
+	await manager.assertIdle(workspace.key);
+});
+
+test("没有残留时查看结果为空，重置不改动现场", async () => {
+	const repo = await gitRepo("adaptive-discard-empty-");
+	const workspace = await resolveWorkspaceIdentity(repo);
+	const manager = new WriterLeaseManager(await getWriterStateRoot(workspace));
+	const blockage = await manager.inspectBlockage(workspace.key);
+	assert.deepEqual(blockage, { operationLock: false });
+	assert.deepEqual(await manager.discard(workspace.key, blockage), { lease: false, operationLock: false });
+});
+
 test("canonicalizes symlink aliases to the same workspace key", async () => {
 	const repo = await gitRepo("adaptive-lease-repo-");
 	const aliases = await mkdtemp(path.join(os.tmpdir(), "adaptive-lease-alias-"));
