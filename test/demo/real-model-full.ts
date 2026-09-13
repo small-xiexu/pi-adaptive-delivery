@@ -38,8 +38,20 @@ for (const file of ["auth.json", "models.json", "models-store.json", "AGENTS.md"
 	catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 }
 const [provider, modelId] = model.split("/");
-await writeFile(path.join(agentDir, "settings.json"), `${JSON.stringify({ packages: [repo], defaultProvider: provider, defaultModel: modelId,
-	defaultThinkingLevel: thinking, compaction: { enabled: true }, httpIdleTimeoutMs: 60_000, retry: { enabled: true, maxRetries: 2 } }, null, 2)}\n`);
+// DEMO_STRUCTURED=1 时按 test/structured/flow.test.ts 的方式挂载已安装的 pi-codex-conversion。
+const structuredAdapter = process.env.DEMO_STRUCTURED
+	? await realpath(process.env.DEMO_STRUCTURED_ADAPTER ?? path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", "@howaboua", "pi-codex-conversion")).catch(() => "")
+	: undefined;
+if (process.env.DEMO_STRUCTURED && !structuredAdapter) throw new Error("未找到 pi-codex-conversion，需设置 DEMO_STRUCTURED_ADAPTER");
+const settings: Record<string, unknown> = { packages: structuredAdapter ? [structuredAdapter, repo] : [repo], defaultProvider: provider, defaultModel: modelId,
+	defaultThinkingLevel: thinking, compaction: { enabled: true }, httpIdleTimeoutMs: 60_000, retry: { enabled: true, maxRetries: 2 } };
+if (structuredAdapter) {
+	settings.defaultTools = ["read", "bash", "write", "edit", "grep", "find", "ls"];
+	await writeFile(path.join(agentDir, "pi-codex-conversion.json"), JSON.stringify({ executionMode: "normal", voiceFeaturesOnly: false,
+		scope: { allProviders: "on", additionalProviders: [] }, voice: { audioSetupCompleted: true },
+		openai: { forceCachedWebSockets: false, cacheKeepalive: false, lunaCacheKeepaliveMinutes: 0, verbosity: "low" } }));
+}
+await writeFile(path.join(agentDir, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`);
 
 // 2. demo 项目：多模块订单结算服务，基线只有满 100 减 10
 const cwd = path.join(root, "repo");
@@ -70,7 +82,7 @@ execFileSync("git", ["init", "--quiet"], { cwd });
 execFileSync("git", ["add", "-A"], { cwd });
 execFileSync("git", ["-c", "user.name=Demo", "-c", "user.email=demo@example.invalid", "commit", "-qm", "订单结算服务基线"], { cwd });
 section("0 · demo 项目与基线");
-say(`真实模型：${model} · thinking ${thinking} · 隔离根：${root}`);
+say(`真实模型：${model} · thinking ${thinking} · 模式：${structuredAdapter ? `Structured（${structuredAdapter}）` : "原生 Pi"} · 隔离根：${root}`);
 say(`基线检查：node inputs/command.cjs → 退出码 ${check().code}`);
 
 // 3. 交互替身（记录面板原文；批准由脚本代选，不是真实用户点击）
