@@ -54,7 +54,7 @@ flowchart TD
 
 ## 快速开始
 
-Package 支持本地路径和 npm 安装。本版本为 `0.1.5`，可以使用 `pi install npm:pi-adaptive-delivery` 安装 npm 上的最新版；本地开发或试用仍可按下面的路径配置。你只需要已配置模型的 Pi 和一个 Git 项目。**开发和测试直接在本机运行，不需要 Docker 或镜像。** 项目原本需要的 Node、Python、Java 等工具和依赖，继续使用你本机已有的环境。
+Package 支持本地路径和 npm 安装。本版本为 `0.1.6`，可以使用 `pi install npm:pi-adaptive-delivery` 安装 npm 上的最新版；本地开发或试用仍可按下面的路径配置。你只需要已配置模型的 Pi 和一个 Git 项目。**开发和测试直接在本机运行，不需要 Docker 或镜像。** 项目原本需要的 Node、Python、Java 等工具和依赖，继续使用你本机已有的环境。
 
 1. 获取本仓库：
 
