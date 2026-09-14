@@ -4,6 +4,8 @@
 
 ![Pi Adaptive Delivery 交付流程：方案确认 → 实施确认 → 开发 · 检查 · 审查](https://raw.githubusercontent.com/small-xiexu/pi-adaptive-delivery/main/docs/images/preview.png)
 
+![Pi Adaptive Delivery 完整流程：普通使用 → 需求与方案 → 方案确认 → 实施确认 → 父 Pi 直接改或委派开发子会话 → 运行项目检查 → 按需独立审查 → 交付结果 → 退出交付；图中还标出两条返工回路与底部四项保障机制](https://raw.githubusercontent.com/small-xiexu/pi-adaptive-delivery/main/docs/images/flow.png)
+
 这是一个 Pi 扩展包。你决定要做什么、允许改哪里，Pi 负责组织开发和检查；简单任务由当前 Pi 直接完成，复杂任务才安排开发或独立审查。适合需要先讨论方案、明确修改范围，并查看实际检查结果的项目任务。
 
 **安装后默认不开启交付流程，日常照常使用 Pi。** 输入 `/delivery-shape 你的需求` 才进入；任务结束后用 `/delivery-exit` 退出。简单任务可以只在聊天中写清方案和步骤，不必专门创建技术方案和实施计划文件。
