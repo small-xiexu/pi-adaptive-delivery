@@ -251,7 +251,7 @@ test("暂停后命令恢复最新未确认方案，重载只恢复讨论，批�
 	await assert.rejects(h.run(implementation), /尚无可信方案确认/);
 	h.ctx.ui.select = async (_title: string, options: string[]) => options[0];
 	await h.run(); await h.resume();
-	assert.equal(h.messages.length, 1); assert.match(h.notices.at(-1)!, /没有待恢复/);
+	assert.equal(h.messages.length, 1); assert.match(h.notices.at(-1)!, /没有可恢复的方案审阅/);
 });
 
 for (const boundary of ["none", "busy", "queue", "pending", "rpc", "branch", "workspace", "tamper", "reload-during-read"]) test(`审阅恢复 ${boundary} 不误唤醒或授予权限`, async (t) => {

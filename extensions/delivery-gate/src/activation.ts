@@ -49,7 +49,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		if (state.enabled) {
 			originalTools = state.tools ?? [];
 			await enter(ctx);
-			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载，旧方案与实施确认已失效，继续开发须重新确认。Pi 保留当前启用的工具列表；若升级后工具缺失，待执行收尾后用 /delivery-exit 恢复进入前工具。", "info");
+			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载；旧方案与实施确认已失效，继续开发须重新确认。当前仍保留交付工具；任务收尾后用 /delivery-exit 恢复普通工具，工具不一致时先用 /delivery-status details 核对。", "info");
 		} else if (state.tools) {
 			restoreTools = state.tools;
 		}
@@ -94,7 +94,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 					pi.appendEntry(ENTRY, { enabled: true, tools: originalTools });
 					await enter(ctx);
 				}
-				ctx.ui.notify("交付已启用；方案与实施仍需分别确认。任务收尾后用 /delivery-exit 恢复普通使用。", "info");
+				ctx.ui.notify("交付已启用。下一步：提交方案确认；方案与实施分别确认。任务完成并核对结果后用 /delivery-exit 恢复普通工具。", "info");
 				if (args.trim()) pi.sendUserMessage(`先读取并遵循 ${fileURLToPath(new URL("../../../skills/adaptive-delivery/SKILL.md", import.meta.url))}，核实项目事实并对齐需求；明确需求可以零追问，简单任务无须规划文档。当前需求：\n${args}`, { expandPromptTemplates: false });
 			} finally { changing = false; }
 		},
@@ -104,7 +104,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		handler: async (_args, ctx) => {
 			if (!runtime) { ctx.ui.notify("交付未启用。", "info"); return; }
 			if (changing || !ctx.isIdle() || ctx.hasPendingMessages()) {
-				ctx.ui.notify("当前仍有执行或排队消息，请先等待收尾或取消，再退出交付。", "warning");
+				ctx.ui.notify("暂不能退出：仍有执行或排队消息。等收尾后重试 /delivery-exit；可用 /delivery-status 查看。", "warning");
 				return;
 			}
 			changing = true;

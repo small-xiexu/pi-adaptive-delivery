@@ -64,6 +64,7 @@ test("正常结束的真实 Pi 卡片只显示已完成，过程摘要不改变�
 	component.updateResult({ content: [{ type: "text", text: "原始过程记录" }], details: { progress: p.snapshot() }, isError: false }, false);
 	const lines = component.render(100).join("\n");
 	assert.match(lines, /已完成/);
+	assert.match(lines, /检查结论由父 Pi 核对/);
 	assert.doesNotMatch(lines, /工具异常|工具失败/);
 	assert.ok(colors.some(([color, value]) => color === "toolTitle" && value.startsWith(COMPLETED_STATUS)));
 	assert.ok(!colors.some(([color, value]) => color === "warning" && value.includes("工具异常")));

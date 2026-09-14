@@ -66,7 +66,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。Pi 的交付命令（\`/delivery-shape\`、\`/delivery-exit\`、\`/delivery-unlock\` 等）由用户命令入口执行，不由模型执行也不会因模型回复而生效：如果用户消息里出现命令名、尤其是没有前导斜杠（例如单独一条 \`delivery-exit\`），说明该命令没有执行。此时不要声称已启用、已退出或已批准，要说明该命令未生效，提示用户等当前执行结束后重新输入 \`/命令\`，并可用 \`/delivery-status\` 核对。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守批准范围，不修改父规划文档、不批准或继续委派。"
-					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n简单明确、可一次完成并检查的任务，无须新建技术方案或实施计划文件；直接在会话中说明方案、实施步骤和检查方式，没有规划文档时 design.paths 传 []。有持续维护需要时落文档，已有方案/台账按项目规则沿用并列为规划路径，不为填参数创建占位文档。任务所需 Markdown 编辑默认允许，使用父文档工具并保留用户内容；每回合一次文档变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按 adaptive-delivery Skill 的工作场景、复杂度和风险选择推理级别，不另选模型。")
+					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n简单任务使用短方案和短实施说明：只写目标、范围、必要假设、步骤、检查和停止条件；不落盘时 design.paths 传 []，实施确认后由父 Pi 直接修改并检查。只有复杂任务或确有独立视角价值时才委派。需要持续维护时再沿用已有方案/台账；Markdown 编辑使用父文档工具并保留用户内容，每回合一次变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按工作场景、复杂度和风险选择推理级别，不另选模型。")
 				+ (!child && ctx.model ? `\n子任务固定继承父 Pi 当前模型 ${ctx.model.provider}/${ctx.model.id}；可选推理级别：${getSupportedThinkingLevels(ctx.model).join("、")}。省略 thinking 继承父当前级别；父切换模型后，新任务跟随，已启动的任务保持原模型。` : ""),
 		};
 	});
@@ -183,7 +183,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 			if (ctx.mode !== "tui" || !ctx.hasUI) { ctx.ui.notify("强制清理需要父 Pi TUI。", "warning"); return; }
 			if (!ctx.isIdle() || ctx.hasPendingMessages()) { ctx.ui.notify("请等待当前回合和排队消息结束后再清理。", "warning"); return; }
 			if (approvals.pending || active.size || (writer.pending && !writer.fault) || (developer.pending && !developer.fault)) {
-				ctx.ui.notify("仍有交互或任务在途，未清理；先等收尾或用 /delivery-status 核对。", "warning");
+				ctx.ui.notify("未清理：仍有交互或任务在途。等收尾后重试；需要核对现场时用 /delivery-status。", "warning");
 				return;
 			}
 			try {
@@ -191,7 +191,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 				const blockage = await leases.inspectBlockage(workspace.key);
 				if (!blockage.lease && !blockage.operationLock) {
-					ctx.ui.notify("现场没有残留的 writer 记录；仍不能退出或写入时，用 /delivery-status details 核对。", "info");
+					ctx.ui.notify("没有残留 writer 记录。若仍不能退出或写入，用 /delivery-status details 核对；不要直接重放。", "info");
 					return;
 				}
 				const owner = blockage.lease?.record?.owner;
@@ -207,7 +207,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const removed = await leases.discard(workspace.key, blockage);
 				pi.appendEntry("delivery-unlock", { workspaceKey: workspace.key, leaseId: blockage.lease?.leaseId, owner,
 					operationLock: removed.operationLock, at: new Date().toISOString() });
-				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。请自行核对代码改动；交付仍处于启用状态。`, "warning");
+				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。下一步：用 /delivery-status 核对现场，再决定退出；代码改动需自行检查。`, "warning");
 			} catch (error) {
 				ctx.ui.notify(`未清理：${error instanceof Error ? error.message : String(error)}`, "error");
 			}
@@ -226,13 +226,13 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const executing = running.filter((task) => !task.endedAt);
 				const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
 				let stage = approvals.confirmedStage === "implementation" ? "实施已确认" : approvals.confirmedStage === "design" ? "等待实施确认" : "等待方案确认";
-				let next = approvals.confirmedStage === "implementation" ? "核对已完成工作，按需继续开发或安排独立检查审查。"
-					: approvals.confirmedStage === "design" ? "整理修改范围和验证方式，再确认实施。" : "形成方案后调用 delivery_approval 提交确认；若上一轮模型请求中断，复用当前正文继续，不要开发。";
-				if (approvals.pending) next = "处理当前审阅；可以确认、提出意见或暂停。";
-				if (executing.length) next = "等待当前任务结束，再核对结果。";
-				else if (writer.fault || developer.fault) { stage = "需要核对未收尾的执行"; next = "现场未自动收尾；可用 /delivery-unlock 核对并清理，退出后自行核对代码改动。"; }
-				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，再继续下一步。"; }
-				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "取得原执行的收尾证据前，暂停写入。"; }
+				let next = approvals.confirmedStage === "implementation" ? "核对实际改动、检查命令和审查结果。"
+					: approvals.confirmedStage === "design" ? "补充修改范围和验证方式，再提交实施确认。" : "整理方案并调用 delivery_approval 提交确认；中断后用 /delivery-resume 继续审阅。";
+				if (approvals.pending) next = "在当前审阅面板选择确认、提出意见或暂停。";
+				if (executing.length) next = "等待当前任务收尾，再核对检查结论。";
+				else if (writer.fault || developer.fault) { stage = "需要核对未收尾的执行"; next = "用 /delivery-status details 查看证据；确认残留后用 /delivery-unlock 清理。"; }
+				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，暂不重放任务。"; }
+				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "先核对原执行的收尾证据；证据不足时暂停写入，不自动解锁。"; }
 				ctx.ui.notify(`交付状态\n当前阶段：${stage}\n下一步：${next}`
 					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}）`).join("；")}` : "\n当前任务：无")
 					+ "\n详情：/delivery-tasks；诊断：/delivery-status details。"
@@ -247,16 +247,16 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 		initialize: initializeStructured,
 		assertCanExit: async (ctx: ExtensionContext) => {
 			if (approvals.pending || active.size || (writer.pending && !writer.fault) || (developer.pending && !developer.fault)) {
-				throw new Error("交互或执行尚未收尾，请等待原始结果与写入权限交回。");
+				throw new Error("交互或执行尚未收尾。请等待原始结果与写入权限交回，再重试 /delivery-exit。");
 			}
 			// 已结束且未自动收尾的失败是终态记录；退出时说明，不再永久阻塞。
 			const stalled = [...(writer.pending && writer.fault ? [`父文档写入未收尾：${writer.fault}`] : []),
 				...(developer.pending && developer.fault ? [`交付委派未收尾：${developer.fault}`] : [])];
-			if (stalled.length) ctx.ui.notify(`以下现场未自动收尾，退出后可用 /delivery-unlock 核对并清理：\n${stalled.join("\n")}`, "warning");
+			if (stalled.length) ctx.ui.notify(`以下现场未自动收尾。退出后先用 /delivery-status 核对，确认残留再用 /delivery-unlock 清理：\n${stalled.join("\n")}`, "warning");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 			try { await leases.assertIdle(workspace.key); }
-			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 可用 /delivery-unlock 核对并强制清理残留记录。`); }
+			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 若确认是残留记录，再用 /delivery-unlock 强制清理。`); }
 		},
 	};
 }

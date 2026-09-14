@@ -252,14 +252,14 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.review) {
 					const review = state.review;
 					progress.end(COMPLETED_STATUS);
-					const result = { content: [{ type: "text" as const, text: [`独立验收和审查已结束，发现仍由父会话裁决，不等于自动交付通过（修复方式：单文件且不改对外行为契约的由父 Pi 直接改并复跑检查；多文件或金额、并发、权限等边界问题重新委派 delivery_develop）：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n") }], details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
+					const result = { content: [{ type: "text" as const, text: [`审查执行已结束；独立验收和审查结论见下文，最终由父 Pi 对照实际命令结果和当前候选核对，不自动等于交付通过（修复方式：单文件且不改对外行为契约的由父 Pi 直接改并复跑检查；多文件或金额、并发、权限等边界问题重新委派 delivery_develop）：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n") }], details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
 					state.result = snapshot({ ...result, isError: false });
 					return result;
 				}
 				const terminal = await childTerminal(state);
 				const text = ((terminal.last as any)?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
 				progress.end(COMPLETED_STATUS);
-				const result = { content: [{ type: "text" as const, text: `开发子任务已结束，仍需父 Pi 核对实际变更和审查结果：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}${state.rpc!.toolError ? `\n\n${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}` : ""}` }], details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, progress: progress.snapshot() } };
+				const result = { content: [{ type: "text" as const, text: `开发执行已结束；检查结论由父 Pi 根据真实命令结果核对，仍需核对实际变更和审查结果：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}${state.rpc!.toolError ? `\n\n${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}` : ""}` }], details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, progress: progress.snapshot() } };
 				state.result = snapshot({ ...result, isError: false });
 				return result;
 			} catch (error) {

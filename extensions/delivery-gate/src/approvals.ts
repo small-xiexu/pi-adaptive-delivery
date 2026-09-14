@@ -90,6 +90,7 @@ function documentSummary(proposal: Proposal): string {
 	const extra = planningPaths.filter((file) => !labeled.has(file));
 	const scope = proposal.stage === "implementation" ? `\n允许修改（文件或目录）：${proposal.paths.map((file) => `• ${relative(file)}`).join(" ") || "无"}` : "";
 	const strategy = proposal.documentStrategy === "none" ? "不落盘（方案保存在本次会话，项目里不新增文档）" : documentStrategyLabels[proposal.documentStrategy];
+	if (proposal.documentStrategy === "none") return `文档策略：${strategy}${scope}`;
 	return `文档策略：${strategy}\n技术方案：${relative(proposal.technicalPlanPath)}\n实施计划：${relative(proposal.implementationPlanPath)}`
 		+ scope
 		+ (extra.length ? `\n其他规划文档：\n${extra.map((file) => `• ${relative(file)}`).join("\n")}` : "");
@@ -217,7 +218,7 @@ export function installApprovals(pi: ExtensionAPI) {
 			try {
 				const latest = branch.findLast((row): row is CustomEntry<Proposal> => row.type === "custom" && row.customType === PROPOSAL_ENTRY && (row.data as Proposal)?.stage === "design");
 				if (!latest?.data || branch.some((row) => row.type === "custom" && row.customType === APPROVAL_ENTRY && (row.data as Approval)?.proposalId === latest.data!.id)) {
-					ctx.ui.notify("当前分支没有待恢复的方案审阅。", "info"); return;
+					ctx.ui.notify("没有可恢复的方案审阅。要继续当前任务，请回到父会话重新整理方案并提交 design 提案。", "info"); return;
 				}
 				const proposal = structuredClone(latest.data);
 				const workspace = await resolveWorkspaceIdentity(cwd);
@@ -368,7 +369,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				if (proposal.stage === "design") design = live;
 				if (proposal.stage === "implementation") implementation = live;
 				continuation = { stage: proposal.stage, approvalId: approval.id };
-				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。${request.stage === "implementation" ? "用户未要求暂停且没有未决问题时，继续在本轮已批准范围和 writer 交接下委派本机开发，无须额外的“继续”；复杂任务完成后按风险安排独立审查。" : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验证说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案、实施计划文件"}，实施仍须独立确认。`}` }],
+				return { content: [{ type: "text", text: `${titles[request.stage]}已记录。${request.stage === "implementation" ? "用户未要求暂停且没有未决问题时，简单任务由父 Pi 直接修改并运行项目已有检查；只有复杂任务或确有独立视角价值时才调用 delivery_develop，需要时再按风险安排独立审查。" : `用户未要求暂停且没有未决问题时，继续准备实施步骤与验证说明；${proposal.paths.length ? "按需维护已有规划文档" : "简单任务直接在会话中说明，无须补建技术方案、实施计划文件"}，实施仍须独立确认。`}` }],
 					details: { approved: true, approvalId: approval.id, proposalId: proposal.id, sessionFile: ctx.sessionManager.getSessionFile() } };
 			} catch (error) {
 				if (request.stage === "implementation") invalidateImplementation();

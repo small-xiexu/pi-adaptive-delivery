@@ -54,7 +54,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 			const briefCursor = rpc.records.length;
 			await rpc.send("prompt", { message: "/delivery-status" });
 			const brief = rpc.records.slice(briefCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify")?.message;
-			assert.match(brief, /当前阶段：等待方案确认\n下一步：等待当前任务结束，再核对结果。\n当前任务：只读（运行中）/);
+			assert.match(brief, /当前阶段：等待方案确认\n下一步：等待当前任务收尾，再核对检查结论。\n当前任务：只读（运行中）/);
 			assert.doesNotMatch(brief, /读取 input.txt|原始子 Session|工作区：|沿用 Pi 的工具/);
 			assert.equal(brief.split("\n").length, 5);
 			const statusCursor = rpc.records.length;
