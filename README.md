@@ -221,6 +221,8 @@ node --import tsx test/support/run-tests.ts \
 
 这套流程核对自己的批准、任务交接和检查证据，**不会接管普通工具的权限**。修改范围和子 Agent 的职责仍需 AI 遵守，不能据此保证任何工具都无法越界或同时写文件。审查子虽然继承普通写入工具，但默认只检查和报告；源码修复由父 Pi 或开发子 Agent 负责。原插件自己的拒绝仍有效；后台进程由原工具和项目脚本负责，交付包不保证它们全部停止。子会话按配置重建工具，无法复制的临时插件能力会明确报错；退出时也不保证其他插件的内部状态全部还原。
 
+**环境边界**：支持标准 Pi 工具集（`read`/`bash`/`write`/`edit` 等），以及 `@howaboua/pi-codex-conversion` 的 **Structured 适配器**（`executionMode: normal`，即 `exec_command` / `apply_patch` / `write_stdin` / `view_image` 那套工具，没有独立的 `read`/`edit`/`write`）。该插件的 **Code Mode**（只暴露 `exec`/`wait`）与 **Notebook Mode** 不在支持范围内；工具集不符时子会话交接会明确报错，不会静默降级。
+
 | 需要了解 | 阅读 |
 |---|---|
 | 本机工具和 Structured 配置 | [接入说明](docs/技术方案.md#section-14)（第 14 节） |
@@ -230,5 +232,6 @@ node --import tsx test/support/run-tests.ts \
 | AI 的具体协作规则与推理级别 | [adaptive-delivery Skill](skills/adaptive-delivery/SKILL.md) |
 | 目前做到了哪一步，有哪些实际案例和测试记录 | [实施计划](docs/实施计划.md#section-13) |
 | 本地运行项目测试 | [开发验证](docs/技术方案.md#section-14-3)（第 14.3 节） |
+| 真实终端手动验证（PTY 脚本） | [test/demo/pty](test/demo/pty/README.md) |
 
 本项目基于标准 Pi 的公开 API，不依赖或包装 `pi-subagents`。
