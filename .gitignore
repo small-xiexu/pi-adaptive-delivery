@@ -3,3 +3,7 @@ coverage/
 *.tgz
 .DS_Store
 .idea/
+
+# Python 缓存（真机 PTY 验证脚本）
+__pycache__/
+*.pyc
