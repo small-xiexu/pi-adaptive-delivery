@@ -66,9 +66,8 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session.messages));
 		return row.message;
 	};
-	const approve = async (stage: string, paths: string[], inputs: string[] = [], _legacyValidationCommands: string[] = [], _legacyRevisionOf?: string, body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
-		const latest = sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "design") as any;
-		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
+	const approve = async (stage: string, paths: string[], body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
+		const documentStrategy = paths.length ? "reuse" : "none";
 		// 落盘策略下批准前要求规划文档真实存在；夹具先把声明路径写成真实文件。
 		if (stage === "design" && paths.length) {
 			const target = path.join(fixture.cwd, paths[0]!);
@@ -77,12 +76,10 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		}
 		return call("delivery_approval", { stage, body, documentStrategy,
 			...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}),
-			paths, inputs });
+			paths });
 	};
 	const prepare = async () => {
-		for (const [stage, paths] of [["design", ["plan.md"]], ["implementation", ["src"]]] as const) {
-			assert.equal((await approve(stage, [...paths])).isError, false);
-		}
+		assert.equal((await approve("design", ["plan.md"])).isError, false);
 	};
 	const audit = async () => (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: process.pid, ui: "simulated", child: "standard-cli" }));

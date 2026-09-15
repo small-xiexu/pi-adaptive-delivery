@@ -21,9 +21,9 @@ test("Structured 环境的开发和审查仍使用两个职责子 Agent", { time
 	await mkdir(path.join(h.cwd, "src"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
 	await h.prepare();
-	const developed = await h.call("delivery_develop", { task: "把 value 修改为 2，并用 Structured 工具读取确认。" });
+	const developed = await h.call("delivery_develop", { task: "把 value 修改为 2，并用 Structured 工具读取确认。", paths: ["src"], inputs: [] });
 	assert.equal(developed.isError, false, JSON.stringify(developed));
-	const reviewed = await h.call("delivery_review", { task: "独立检查实际差异，并运行必要的测试或编译命令。" });
+	const reviewed = await h.call("delivery_review", { task: "独立检查实际差异，并运行必要的测试或编译命令。", paths: ["src"], inputs: [] });
 	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	assert.ok((reviewed.details as any).candidate.digest);

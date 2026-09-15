@@ -148,7 +148,7 @@ test("demo：真实 demo 项目走完整交付流程并打印交互原文", { ti
 	assert.equal((firstDesign.details as { approved: boolean }).approved, false);
 	ok("意见轮是否误启动开发委派", (await h.audit()).some((row) => row.child) ? "是（异常）" : "否");
 
-	capture.planned.push({ kind: "choice", label: "确认方案" });
+	capture.planned.push({ kind: "choice", label: "确认方案并开始实施" });
 	const design = await h.call("delivery_approval", { stage: "design", body: designBody("注意：非数字折扣暂不处理（待确认）。"), documentStrategy: "reuse", technicalPlanPath: "plan.md", implementationPlanPath: "plan.md", paths: ["plan.md"] });
 	show("第二轮方案确认面板（原文）", capture.panels.at(-2)!.lines);
 	show("工具结果（确认方案）", [brief(String((design.content[0] as { text: string }).text), 400)]);
@@ -157,16 +157,8 @@ test("demo：真实 demo 项目走完整交付流程并打印交互原文", { ti
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	show("确认后自动衔接产生的会话尾部", h.sm.getBranch().slice(-4).map((row) => row.type === "message" ? `${row.message.role}：${brief(JSON.stringify((row.message as { content?: unknown }).content), 160)}` : `${row.type}/${(row as { customType?: string }).customType ?? ""}`));
 
-	section("4 · 实施确认");
-	capture.planned.push({ kind: "choice", label: "确认实施" });
-	const implementation = await h.call("delivery_approval", { stage: "implementation", body: "步骤：改 src/value.js 的常量；运行 node inputs/command.cjs。\n停止条件：测试仍失败或需要改接口时暂停。", documentStrategy: "reuse", paths: ["src"] });
-	show("实施确认面板（原文）", capture.panels.at(-2)!.lines);
-	show("工具结果（确认实施）", [brief(String((implementation.content[0] as { text: string }).text), 400)]);
-	assert.equal(implementation.isError, false);
-	await h.session.waitForIdle();
-
-	section("5 · 委派开发子 Agent（真实 CLI 子进程 + 项目真实检查）");
-	const develop = await h.call("delivery_develop", { task: "把 src/value.js 的 value 改为 2，运行项目已有检查确认通过。" });
+	section("4 · 委派开发子 Agent（真实 CLI 子进程 + 项目真实检查）");
+	const develop = await h.call("delivery_develop", { task: "把 src/value.js 的 value 改为 2，运行项目已有检查确认通过。", paths: ["src"], inputs: [] });
 	show("开发结果", [brief(String((develop.content[0] as { text: string }).text), 800)]);
 	show("结果详情", [`status=${(develop.details as { progress?: { status: string } }).progress?.status}`, `pid=${(develop.details as { pid?: number }).pid}`, `子 Session=${(develop.details as { childSessionFile?: string }).childSessionFile}`]);
 	ok("改动后的 src/value.js", JSON.stringify(await readFile(path.join(h.cwd, "src/value.js"), "utf8")));
@@ -174,13 +166,13 @@ test("demo：真实 demo 项目走完整交付流程并打印交互原文", { ti
 	assert.equal(develop.isError, false);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 
-	section("6 · 独立审查（真实 diff 制品 + 主动检查）");
-	const review = await h.call("delivery_review", { task: "独立核对需求与 src/value.js 实际差异，主动运行项目检查并报告问题。" });
+	section("5 · 独立审查（真实 diff 制品 + 主动检查）");
+	const review = await h.call("delivery_review", { task: "独立核对需求与 src/value.js 实际差异，主动运行项目检查并报告问题。", paths: ["src"], inputs: [] });
 	show("审查结果", [brief(String((review.content[0] as { text: string }).text), 700)]);
 	show("审查详情", [`候选=${(review.details as { candidate?: { digest: string } }).candidate?.digest}`, `差异制品=${(review.details as { diffFile?: string }).diffFile}`, `状态=${(review.details as { progress?: { status: string } }).progress?.status}`]);
 	assert.equal(review.isError, false);
 
-	section("7 · 父侧独立核对项目检查");
+	section("6 · 父侧独立核对项目检查");
 	const after = projectCheck(h.cwd);
 	show("改动后检查", [`$ node inputs/command.cjs → 退出码 ${after.code}`, brief(after.output, 400)]);
 	assert.equal(after.code, 0);

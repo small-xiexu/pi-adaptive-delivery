@@ -165,9 +165,18 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 			let executionSignal = operation;
 			let dialogs: ReturnType<typeof createChildDialogs> | undefined;
 			try {
-				const grant = await approvals.readImplementationApproval(ctx, operation);
+				const grant = await approvals.readApproval(ctx, operation);
+				const rawPaths = input.paths ?? [], rawInputs = input.inputs ?? [];
+				if (rawPaths.some((value) => !value.trim()) || rawInputs.some((value) => !value.trim())) throw new Error("开发或审查路径不能是空白字符串");
+				const paths = rawPaths.map((value) => path.resolve(ctx.cwd, value));
+				const inputs = rawInputs.map((value) => path.resolve(ctx.cwd, value));
+				if (!paths.length) throw new Error("本次开发或审查必须提供非空 paths；实施计划由 AI 内部维护，不再通过第二次确认声明范围");
+				const outside = (value: string) => { const relative = path.relative(grant.workspace.workspacePath, value); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); };
+				if ([...paths, ...inputs].some(outside)) throw new Error("开发或审查路径必须在当前 worktree 内");
+				const overlaps = (left: string, right: string) => { const relative = path.relative(left, right); return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`)); };
+				if ([...paths, ...inputs].some((candidate) => grant.planningPaths.some((planning) => overlaps(planning, candidate) || overlaps(candidate, planning)))) throw new Error("开发或审查路径不能包含父维护规划文档");
 				state.approvalId = grant.approvalId;
-				state.designApprovalId = grant.designApprovalId;
+				state.designApprovalId = grant.approvalId;
 				const running = executionSignal = AbortSignal.any([operation, grant.signal]);
 				const records = await nativeEntries(state, ctx);
 				const call = records.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
@@ -187,7 +196,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				state.owner = { ...acquired.record.owner };
 				const parent = state.parent = { ...state.owner };
 				if (name === REVIEW_TOOL) {
-					const scope: CandidateScope = { workspace: grant.workspace, readPaths: grant.inputs, writePaths: grant.paths, protectedPaths: [...grant.planningPaths, sessionFile, path.dirname(stateRoot)] };
+					const scope: CandidateScope = { workspace: grant.workspace, readPaths: inputs, writePaths: paths, protectedPaths: [...grant.planningPaths, sessionFile, path.dirname(stateRoot)] };
 					const candidate = await captureCandidate(scope, running);
 					const artifact = await prepareReview(scope, candidate);
 					const reviewTask = [
@@ -195,17 +204,17 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						"主动识别项目已有的测试、编译、lint 或其他适合本任务的检查并实际运行，记录命令和真实结果；没有运行不能声称通过。",
 						"沿用父 Pi 的全部普通工具和权限；职责是独立检查、运行检查并报告问题，默认不修改源码。发现问题交回父 Pi，由父 Pi 决定直接修复或重新委派开发；不批准、不继续委派。",
 						`已批准方案：${grant.designBody}`,
-						`已批准实施说明：${grant.implementationBody}`,
+						`内部实施计划由父会话维护；本次节点：${input.task}`,
 						`候选：${candidate.digest}`,
-						`代码路径：${JSON.stringify(grant.paths)}`,
+						`代码路径：${JSON.stringify(paths)}`,
 						`父维护的规划文档：${JSON.stringify(grant.planningPaths)}（本次设计确认声明的父维护文档，不在你的修改范围，出现在工作区不算越界改动；但文档描述与实际代码是否一致仍要核对）`,
-						`额外审查输入：${JSON.stringify(grant.inputs)}`,
+						`额外审查输入：${JSON.stringify(inputs)}`,
 						`审查证据：${JSON.stringify({ reviewDirectory: artifact.directory, diffFile: artifact.diffFile })}`,
 						`差异基线：${artifact.baseHead ?? "无 HEAD，空基线"}；before/after 为原始 Git blob/当前文件副本。`,
 						`审查重点：${input.task}`,
 					].join("\n\n");
 					const result = await delegateReadOnly({ ...input, readPaths: [...(input.readPaths ?? []), artifact.directory], task: reviewTask }, running,
-						(data) => { if (data.phase === "started") state.readonlyStarted = true; state.readonlyReference = snapshot({ ...data, approvalId: grant.approvalId, designApprovalId: grant.designApprovalId, reviewDirectory: artifact.directory }); pi.appendEntry(DELEGATION_ENTRY, state.readonlyReference); }, update, ctx, progress, "review");
+						(data) => { if (data.phase === "started") state.readonlyStarted = true; state.readonlyReference = snapshot({ ...data, approvalId: grant.approvalId, designApprovalId: grant.approvalId, reviewDirectory: artifact.directory }); pi.appendEntry(DELEGATION_ENTRY, state.readonlyReference); }, update, ctx, progress, "review");
 					const finalCandidate = await captureCandidate(scope, running);
 					const finalArtifact = finalCandidate.digest === candidate.digest ? artifact : await prepareReview(scope, finalCandidate);
 					state.review = { result, artifact: finalArtifact, candidate: finalCandidate };
@@ -219,21 +228,21 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					progress.agent({ provider: child.model!.provider, id: child.model!.id, thinking: child.thinkingLevel, reason: input.selectionReason });
 					if (data.owner?.pid !== rpc.process.pid || data.owner?.sessionId !== child.sessionId || data.owner?.runId !== input.id) throw new Error("子 writer 身份未核实");
 					const childOwner = snapshot(data.owner) as WriterLeaseOwner;
-					await state.leases.handoff(state.lease, parent, childOwner, async () => { const latest = await approvals.readImplementationApproval(ctx, childSignal); if (latest.approvalId !== grant.approvalId) throw new Error("实施授权已变化"); current(state, ctx); }, childSignal);
+					await state.leases.handoff(state.lease, parent, childOwner, async () => { const latest = await approvals.readApproval(ctx, childSignal); if (latest.approvalId !== grant.approvalId) throw new Error("方案授权已变化"); current(state, ctx); }, childSignal);
 					state.owner = childOwner;
-					await rpc.control(CHILD_ARM, input.entryPath, childSignal, JSON.stringify({ lease: state.lease, owner: state.owner!, parent, paths: grant.paths, inputs: grant.inputs, protectedPaths: [...grant.planningPaths, sessionFile] } satisfies ChildGrant));
-					pi.appendEntry(DEVELOPMENT_ENTRY, { id: input.id, phase: "started", lease: state.lease, childSessionFile: child.sessionFile, approvalId: grant.approvalId, designApprovalId: grant.designApprovalId, agent: progress.snapshot().agent });
+					await rpc.control(CHILD_ARM, input.entryPath, childSignal, JSON.stringify({ lease: state.lease, owner: state.owner!, parent, paths, inputs, protectedPaths: [...grant.planningPaths, sessionFile] } satisfies ChildGrant));
+					pi.appendEntry(DEVELOPMENT_ENTRY, { id: input.id, phase: "started", lease: state.lease, childSessionFile: child.sessionFile, approvalId: grant.approvalId, designApprovalId: grant.approvalId, agent: progress.snapshot().agent });
 					state.taskSent = true;
 					progress.phase("运行中", "开发子任务已接收 writer", child.sessionFile);
 					const developmentTask = [
 						"开发子任务。沿用父 Pi 原有工具和权限，完成批准范围内的实现；必要时主动运行项目测试或编译检查，但不要把自检当成独立审查。",
 						"不要修改父规划文档，不继续委派，不执行未授权的外部写入。",
 						`本机工作目录：${input.cwd}`,
-						`已批准开发路径：${JSON.stringify(grant.paths)}`,
+						`本次开发路径：${JSON.stringify(paths)}`,
 						`父维护的规划文档（不要修改）：${JSON.stringify(grant.planningPaths)}`,
-						`额外审查输入：${JSON.stringify(grant.inputs)}`,
+						`额外审查输入：${JSON.stringify(inputs)}`,
 						`已批准方案：${grant.designBody}`,
-						`已批准实施说明：${grant.implementationBody}`,
+						`内部实施计划由父会话维护；本次节点：${input.task}`,
 						`本次任务：${input.task}`,
 					].join("\n\n");
 					await Promise.all([rpc.waitSettled(childSignal), rpc.request({ type: "prompt", message: developmentTask }, childSignal)]);

@@ -65,8 +65,8 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。Pi 的交付命令（\`/delivery-shape\`、\`/delivery-exit\`、\`/delivery-unlock\` 等）由用户命令入口执行，不由模型执行也不会因模型回复而生效：如果用户消息里出现命令名、尤其是没有前导斜杠（例如单独一条 \`delivery-exit\`），说明该命令没有执行。此时不要声称已启用、已退出或已批准，要说明该命令未生效，提示用户等当前执行结束后重新输入 \`/命令\`，并可用 \`/delivery-status\` 核对。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
-				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守批准范围，不修改父规划文档、不批准或继续委派。"
-					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n简单任务使用短方案和短实施说明：只写目标、范围、必要假设、步骤、检查和停止条件；不落盘时 design.paths 传 []，实施确认后由父 Pi 直接修改并检查。只有复杂任务或确有独立视角价值时才委派。需要持续维护时再沿用已有方案/台账；Markdown 编辑使用父文档工具并保留用户内容，每回合一次变更，等待原生终态后再继续。方案确认和实施确认仍独立，实施必须列明可写范围。委派时按工作场景、复杂度和风险选择推理级别，不另选模型。")
+				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守本次节点范围，不修改父规划文档、不批准或继续委派。"
+					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n方案确认后由 AI 内部维护实施计划：简单任务由父 Pi 直接修改并检查，复杂任务按需委派。每次委派明确提供当前 paths 和 inputs；范围内调整不重复请求确认。需要持续维护时沿用已有方案/台账；Markdown 编辑使用父文档工具并保留用户内容，每回合一次变更。委派时按工作场景、复杂度和风险选择推理级别，不另选模型。")
 				+ (!child && ctx.model ? `\n子任务固定继承父 Pi 当前模型 ${ctx.model.provider}/${ctx.model.id}；可选推理级别：${getSupportedThinkingLevels(ctx.model).join("、")}。省略 thinking 继承父当前级别；父切换模型后，新任务跟随，已启动的任务保持原模型。` : ""),
 		};
 	});
@@ -109,23 +109,23 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	pi.registerTool({ name: REVIEW_TOOL, label: "独立候选审查",
 		...taskRenderers("审查", openTask),
 		description: "沿独立子路径检查和审查批准目标、当前代码、实际差异，并主动运行项目测试、编译或 lint。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险；工具自动附带原批准正文、代码路径及实际差异，无须重述全部需求，不以实现者总结代替证据" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险" }), paths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, description: "本次审查涉及的源码、配置或测试路径；必须位于当前 worktree 内" }), inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "纳入候选核对的只读输入路径" })), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始审查");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
-			return developer.review({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), parentSessionId: ctx.sessionManager.getSessionId(),
+			return developer.review({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), paths: input.paths, inputs: input.inputs, parentSessionId: ctx.sessionManager.getSessionId(),
 				...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
 				(message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
 		},
 	});
 	pi.registerTool({ name: DEVELOPMENT_TOOL, label: "开发文件委派",
 		...taskRenderers("开发", openTask),
-		description: "将一次本机开发任务交给独立标准 Pi。要求本轮父 TUI 的方案与实施确认；继承父已启用的文件、Shell、联网及插件工具，沿用原实现与原检查。子任务须遵守批准范围、不修改父规划文档、不递归委派；普通工具不受本 Package 路径拦截。Pi 进程与原生工具终态落盘后交回交付 writer，结果仍需核实。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据；工具自动附带已批准方案、实施正文、路径及命令，无须再次抄写或复制完整父历史" }), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
+		description: "将一次本机开发任务交给独立标准 Pi。要求本轮父 TUI 的方案确认，并在 paths 中提供本节点范围；继承父已启用的文件、Shell、联网及插件工具。子任务须遵守范围、不修改父规划文档、不递归委派；普通工具不受本 Package 路径拦截。Pi 进程与原生工具终态落盘后交回交付 writer，结果仍需核实。",
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据" }), paths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, description: "本次开发允许修改的源码、配置或测试路径；必须位于当前 worktree 内" }), inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "纳入候选核对的只读输入路径" })), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未委派");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
-			return developer.execute({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), parentSessionId: ctx.sessionManager.getSessionId(),
+			return developer.execute({ id, task: input.task, cwd: workspace.cwdPath, entryPath, readPaths: readPaths(ctx), paths: input.paths, inputs: input.inputs, parentSessionId: ctx.sessionManager.getSessionId(),
 				...selectChildAgent(pi, ctx, input.agent), toolInput: input, environment: environment(promptOptions), projectTrusted: ctx.isProjectTrusted() }, signal, ctx,
 				(message, progress) => update?.({ content: [{ type: "text", text: message }], details: { progress } }));
 		},
@@ -225,9 +225,8 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const inherited = diagnostic ? inheritedTools(pi, entryPath).map((tool) => tool.name) : [];
 				const executing = running.filter((task) => !task.endedAt);
 				const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
-				let stage = approvals.confirmedStage === "implementation" ? "实施已确认" : approvals.confirmedStage === "design" ? "等待实施确认" : "等待方案确认";
-				let next = approvals.confirmedStage === "implementation" ? "核对实际改动、检查命令和审查结果。"
-					: approvals.confirmedStage === "design" ? "补充修改范围和验证方式，再提交实施确认。" : "整理方案并调用 delivery_approval 提交确认；中断后用 /delivery-resume 继续审阅。";
+				let stage = approvals.confirmedStage === "design" ? "实施进行中" : "等待方案确认";
+				let next = approvals.confirmedStage === "design" ? "按内部实施计划核对实际改动、检查命令和审查结果。" : "整理方案并调用 delivery_approval 确认；中断后用 /delivery-resume 继续审阅。";
 				if (approvals.pending) next = "在当前审阅面板选择确认、提出意见或暂停。";
 				if (executing.length) next = "等待当前任务收尾，再核对检查结论。";
 				else if (writer.fault || developer.fault) { stage = "需要核对未收尾的执行"; next = "用 /delivery-status details 查看证据；确认残留后用 /delivery-unlock 清理。"; }

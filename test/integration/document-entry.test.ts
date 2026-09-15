@@ -146,20 +146,28 @@ test("真实 Pi 在方案批准回合结束后自动触发实施准备回合", {
 	const result = await h.approve("design", []);
 	assert.equal(result.isError, false, JSON.stringify(result));
 	await h.session.waitForIdle();
-	assert.ok(h.contexts.some((messages) => JSON.stringify(messages).includes("当前方案已由用户明确确认")), JSON.stringify(h.contexts));
+	assert.ok(h.contexts.some((messages) => JSON.stringify(messages).includes("方案已由用户确认并授权开始实施")), JSON.stringify(h.contexts));
 	assert.ok(!h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "implementation"));
 });
 
-test("真实 Pi 可沿自动衔接回合提交实施确认", { timeout: 40_000 }, async (t) => {
+test("一次确认后父 Pi 创建内部台账、修改并检查，台账更新不产生第二份批准", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
-	h.setFollowups([[{ type: "toolCall", id: randomUUID(), name: "delivery_approval", arguments: {
-		stage: "implementation", body: "自动衔接生成的实施步骤", documentStrategy: "none", paths: ["src"], inputs: [],
-	} }]]);
-	const result = await h.approve("design", []);
+	await h.call(documentWrite, { path: "design.md", content: "# 方案\n导出 value = 2，Node 断言通过。" });
+	h.setFollowups([
+		[{ type: "toolCall", id: randomUUID(), name: documentWrite, arguments: { path: "plan.md", content: "进行中：导出 value\n待完成：Node 断言" } }],
+		[{ type: "toolCall", id: randomUUID(), name: "write", arguments: { path: "value.cjs", content: "exports.value = 2;\n" } }],
+		[{ type: "toolCall", id: randomUUID(), name: "bash", arguments: { command: 'node -e \'require("node:assert/strict").equal(require("./value.cjs").value, 2)\'' } }],
+		[{ type: "toolCall", id: randomUUID(), name: documentEdit, arguments: { path: "plan.md", edits: [{ oldText: "进行中：导出 value\n待完成：Node 断言", newText: "已完成：导出 value\n证据：Node 断言退出 0" }] } }],
+	]);
+	const result = await h.call("delivery_approval", { stage: "design", body: "导出 value = 2，以 Node 断言验收。", documentStrategy: "new", paths: ["design.md", "plan.md"], technicalPlanPath: "design.md", implementationPlanPath: "plan.md" });
 	assert.equal(result.isError, false, JSON.stringify(result));
 	const approvals = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval");
-	assert.equal(approvals.length, 2, JSON.stringify(h.sm.getBranch()));
-	assert.ok(h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "implementation"));
+	assert.equal(approvals.length, 1);
+	assert.equal(h.choices.length, 1);
+	assert.equal(await readFile(path.join(h.cwd, "value.cjs"), "utf8"), "exports.value = 2;\n");
+	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "已完成：导出 value\n证据：Node 断言退出 0");
+	assert.equal(await h.readLease(), undefined);
+	assert.ok(!h.sm.getBranch().some((row) => row.type === "message" && row.message.role === "toolResult" && row.message.isError));
 });
 
 test("显式进入后的 reload 和重开保留交付入口及普通工具，旧批准不恢复", async (t) => {
@@ -167,7 +175,7 @@ test("显式进入后的 reload 和重开保留交付入口及普通工具，旧
 	await h.call(documentWrite, { path: "plan.md", content: "原始规划" });
 	await h.approve();
 	await h.session.reload();
-	assert.equal((await h.approve("implementation", ["src"])).isError, true);
+	assert.equal((await h.call("delivery_develop", { task: "重载后不能沿用旧方案确认", paths: ["src"], inputs: [] })).isError, true);
 	assert.ok(h.session.getActiveToolNames().includes("write"));
 	await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 	const reopened = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
@@ -306,7 +314,7 @@ test("无规划文档的真实 SDK 方案反馈、暂停和重载恢复仅使用
 	assert.equal((first.details as any).feedback, "保留原接口，只调整参数值");
 	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length, 0);
 	await h.session.reload();
-	assert.equal((await h.approve("implementation", ["src"])).isError, true);
+	assert.equal((await h.call("delivery_develop", { task: "恢复前不能开发", paths: ["src"], inputs: [] })).isError, true);
 	h.setSelect(async (_title, items) => items[0]);
 	const resumed = reviewCall("V3：核对现场后修正参数，接口保持", []);
 	h.setFollowups([[resumed]]);
@@ -317,12 +325,11 @@ test("无规划文档的真实 SDK 方案反馈、暂停和重载恢复仅使用
 	assert.ok(result?.type === "message" && result.message.role === "toolResult", JSON.stringify(h.notices));
 	assert.equal(result.message.isError, false);
 	assert.equal((result.message.details as any).approved, true);
-	assert.equal((await h.approve("implementation", ["src"])).isError, false);
 	const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 	const designs = rows.filter((row) => row.customType === "delivery-approval-proposal" && row.data.stage === "design");
 	assert.deepEqual(designs.map((row) => row.data.paths), [[], [], []]);
 	const approved = rows.filter((row) => row.customType === "delivery-approval");
-	assert.equal(approved.length, 2);
+	assert.equal(approved.length, 1);
 	assert.equal(approved[0].data.proposalId, designs[2].data.id);
 	assert.ok(h.contexts.some((messages) => messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes("V2：保留接口，只修参数"))));
 	assert.ok(!rows.some((row) => ["read", documentWrite, documentEdit].includes(row.message?.toolName)));
@@ -377,7 +384,6 @@ test("正式入口默认创建及持续编辑，文档写入无审批，进度�
 	assert.equal(await h.readLease(), undefined);
 	assert.equal(h.choices.length, 0);
 	assert.equal((await h.approve()).isError, false);
-	assert.equal((await h.approve("implementation", ["src"])).isError, false);
 	const approved = structuredClone(h.sm.getEntries().filter((row) => row.type === "custom"));
 	await writeFile(path.join(h.cwd, "plan.md"), "任意正文\n进度：待验证\n用户补充\n");
 	assert.equal((await h.call(documentEdit, { path: "plan.md", edits: [{ oldText: "进度：待验证", newText: "进度：已验证" }] })).isError, false);
@@ -386,7 +392,7 @@ test("正式入口默认创建及持续编辑，文档写入无审批，进度�
 	assert.deepEqual(h.sm.getEntries().filter((row) => row.type === "custom"), approved);
 	const disk = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 	assert.deepEqual(disk.filter((row) => row.type === "custom"), approved);
-	assert.equal(h.choices.length, 2, "只有方案与实施确认");
+	assert.equal(h.choices.length, 1, "只有一次方案确认");
 });
 
 test("交付文档工具拒绝源码、越界与 Git，普通文件和 Shell 沿用 Pi", async (t) => {
@@ -420,19 +426,18 @@ for (const name of [documentWrite, documentEdit]) for (const phase of ["startup"
 	await assert.rejects(access(path.join(h.cwd, "forbidden.txt")), { code: "ENOENT" });
 });
 
-for (const boundary of ["paused-design", "design", "implementation", "reload", "tree"]) {
-	test(`正式入口 ${boundary} 后仍可编辑文档，不恢复实施批准`, async (t) => {
+for (const boundary of ["paused-design", "design", "reload", "tree"]) {
+	test(`正式入口 ${boundary} 后仍可编辑文档，不恢复开始实施权限`, async (t) => {
 		const h = await host(t);
 		await h.call(documentWrite, { path: "plan.md", content: "用户段落\n" });
 		if (boundary === "paused-design") h.setSelect(async () => undefined);
 		assert.equal((await h.approve()).isError, false);
-		if (boundary === "implementation" || boundary === "reload" || boundary === "tree") await h.approve("implementation", ["src"]);
 		if (boundary === "reload") await h.session.reload();
 		if (boundary === "tree") await h.session.navigateTree(h.sm.getEntries()[0]!.id, { summarize: false });
 		const dialogs = h.choices.length;
 		assert.equal((await h.call(documentEdit, { path: "plan.md", edits: [{ oldText: "用户段落", newText: "用户段落\n补充证据" }] })).isError, false);
 		assert.equal(h.choices.length, dialogs);
-		if (boundary !== "implementation") assert.equal((await h.call("delivery_develop", { task: "不能沿旧批准写源码" })).isError, true);
+		if (boundary !== "design") assert.equal((await h.call("delivery_develop", { task: "不能沿旧批准写源码", paths: ["src"], inputs: [] })).isError, true);
 		assert.equal(await h.readLease(), undefined);
 		assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "用户段落\n补充证据\n");
 	});

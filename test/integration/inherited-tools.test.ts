@@ -32,10 +32,10 @@ export default function(pi) {
 	assert.match(JSON.stringify(blocked.content), /ORIGINAL_PLUGIN_DENIED/);
 	assert.equal((await h.call("write", { path: "original.txt", content: "原工具\n" })).isError, false);
 	assert.equal((await h.call("bash", { command: "printf ORIGINAL_SHELL" })).isError, false);
-	assert.equal((await h.call("delivery_develop", { task: "尚未取得交付批准" })).isError, true, "交付入口本身仍要求两次确认");
+	assert.equal((await h.call("delivery_develop", { task: "尚未取得交付批准", paths: ["src"], inputs: [] })).isError, true, "交付入口本身仍要求方案确认");
 	const analysis = await h.call("delivery_readonly", { task: "fixture-inherited-tools：核对联网工具与原插件检查" });
 	await h.prepare();
-	const development = await h.call("delivery_develop", { task: "fixture-inherited-tools：开发阶段也可查资料" });
+	const development = await h.call("delivery_develop", { task: "fixture-inherited-tools：开发阶段也可查资料", paths: ["src"], inputs: [] });
 	for (const result of [analysis, development]) {
 		assert.equal(result.isError, false, JSON.stringify(result));
 		assert.equal((result.details as any).progress.status, "已完成");

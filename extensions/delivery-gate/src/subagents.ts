@@ -303,6 +303,8 @@ export interface ChildTask {
 	environment: ReadOnlyEnvironment;
 	projectTrusted: boolean;
 	readPaths?: string[];
+	paths?: string[];
+	inputs?: string[];
 }
 
 export async function startChild(input: ChildTask, kind: "readonly" | "development"): Promise<ChildRpc> {

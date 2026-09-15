@@ -90,7 +90,7 @@ for (const kind of ["once", "exhausted", "disabled"]) test(`真实开发 CLI 子
 	const h = await createDevelopmentHost(t, `stream-retry-${kind}`);
 	if (kind === "disabled") h.session.setAutoRetryEnabled(false);
 	await h.prepare();
-	const result = await h.call("delivery_develop", { task: "创建、编辑并读回 src/value.js，断流后沿原记录继续。" });
+	const result = await h.call("delivery_develop", { task: "创建、编辑并读回 src/value.js，断流后沿原记录继续。", paths: ["src"], inputs: [] });
 	assert.equal(result.isError, kind !== "once", JSON.stringify(result));
 	const ref = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-development") as any;
 	const rows = await disk(ref.data.childSessionFile);
@@ -102,7 +102,7 @@ for (const kind of ["once", "exhausted", "disabled"]) test(`真实开发 CLI 子
 	assert.equal(exit.data.development.clean, true);
 	assert.throws(() => process.kill(exit.data.pid, 0), { code: "ESRCH" });
 	assert.equal(await h.readLease(), undefined, h.notices.join("\n"));
-	assert.equal(h.choices.length, 2);
+	assert.equal(h.choices.length, 1);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), `export const value = ${kind !== "once" ? 1 : 2};\n`);
 	await assert.rejects(access(path.join(h.cwd, "src/incomplete.txt")), { code: "ENOENT" });
 });
@@ -128,7 +128,7 @@ test("真实开发 CLI 子退避中取消，不再编辑且正常交回 writer",
 		await writeFile(file, JSON.stringify(settings));
 	});
 	await h.prepare();
-	const run = h.call("delivery_develop", { task: "创建文件，在重试等待期间取消" });
+	const run = h.call("delivery_develop", { task: "创建文件，在重试等待期间取消", paths: ["src"], inputs: [] });
 	const deadline = Date.now() + 15_000;
 	while (!(await h.audit()).some((row) => row.child && row.phase === "stream-error")) {
 		assert.ok(Date.now() < deadline, "未观察到子断流");

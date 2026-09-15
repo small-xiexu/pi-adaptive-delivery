@@ -41,7 +41,7 @@ test("方案先阅读，按需输入意见；空提交和查看详情不批准�
 });
 
 test("确认面板窄屏换行保留中文和长正文末尾", () => {
-	const panel = new DeliveryPanel("实施确认", "修改 src/features/日期格式化函数，并保留验收记录 END_OF_PLAN", "", [], tui, plainTheme, () => {});
+	const panel = new DeliveryPanel("执行详情", "修改 src/features/日期格式化函数，并保留验收记录 END_OF_PLAN", "", [], tui, plainTheme, () => {});
 	for (const width of [20, 40, 80]) {
 		const lines = panel.render(width);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
@@ -78,7 +78,7 @@ test("方案默认稍后再看，鼠标可打开意见，Esc 返回保留草稿�
 	panel.handleInput("\x1b");
 	lines = panel.render(80);
 	panel.handleMouse(mouse("click", lines.findIndex((line) => line.includes("确认方案"))));
-	assert.equal(results[2], "确认方案");
+	assert.equal(results[2], "确认方案并开始实施");
 	panel.handleInput("\x1b");
 	assert.equal(results[3], undefined);
 });
@@ -116,7 +116,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的
 	} finally { renderer.stop(); }
 });
 
-for (const accept of ["确认实施"]) test(`${accept} 在上但默认回车不批准，滚动和查看详情不改变选择`, () => {
+for (const accept of ["确认执行"]) test(`${accept} 在上但默认回车不批准，滚动和查看详情不改变选择`, () => {
 	const results: unknown[] = [];
 	const panel = new DeliveryPanel("批准", "简短说明\n".repeat(100), "完整命令\n".repeat(80) + "最后一个条件", [accept, "暂不批准"], tui, plainTheme, (value) => results.push(value), 1);
 	for (const width of [20, 80]) {
@@ -155,7 +155,7 @@ test("确认面板适应窄终端；显示不下时仍可退出，不能选择�
 		const results: unknown[] = [];
 		const notice = "确认后在本机开发、验收和返工；Shell 使用你的权限，不受文件路径隔离。\n提交、推送、PR、发布、部署、生产及其他外部写入需另行授权。";
 		const panel = stage === "design" ? new DesignReviewPanel("改法\n".repeat(100), "详情", screen as TUI, plainTheme, (value) => results.push(value), notice)
-			: new DeliveryPanel("实施确认", "步骤\n".repeat(100), "详情", ["确认实施", "暂不批准"], screen as TUI, plainTheme, (value) => results.push(value), 1, notice);
+			: new DeliveryPanel("执行详情", "步骤\n".repeat(100), "详情", ["确认执行", "暂不执行"], screen as TUI, plainTheme, (value) => results.push(value), 1, notice);
 		for (const rows of [10, 20, 32, 60]) for (const width of [20, 40, 80, 110]) {
 			screen.terminal.rows = rows;
 			const lines = panel.render(width);
@@ -312,7 +312,7 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	assert.match(panel.render(100).join("\n"), /代码审查需要检查权限边界/);
 });
 
-test("子任务按实施批准批次展示阶段和尝试次数", () => {
+test("子任务按方案授权批次展示阶段和尝试次数", () => {
 	const call = (id: string, name: string, task: string) => ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: { task } }] } });
 	const result = (id: string) => ({ type: "message", message: { role: "toolResult", toolCallId: id, content: [{ type: "text", text: "done" }], isError: false, details: { progress: { status: "已完成", endedAt: Date.now() } } } });
 	const ref = (id: string, approvalId: string) => ({ type: "custom", customType: "delivery-development", data: { id, approvalId, designApprovalId: "design-1" } });

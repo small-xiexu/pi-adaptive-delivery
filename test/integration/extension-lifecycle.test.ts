@@ -170,7 +170,7 @@ for (const stage of ["documents", "design", "implementation", "combined"]) {
 		const result = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_approval");
 		assert.ok(result);
 		assert.equal(result.isError, true);
-		assert.match(JSON.stringify(result.result), ["documents", "combined"].includes(stage) ? /stage: must be equal to one of the allowed values/ : /真实 TUI/);
+		assert.match(JSON.stringify(result.result), ["documents", "implementation", "combined"].includes(stage) ? /stage: must be equal to one of the allowed values/ : /真实 TUI/);
 		assert.ok(!rpc.records.some((record) => record.type === "extension_ui_request" && ["select", "confirm"].includes(record.method)));
 		const log = await readFile(state.sessionFile, "utf8");
 		assert.ok(!log.includes('"customType":"delivery-approval"'));

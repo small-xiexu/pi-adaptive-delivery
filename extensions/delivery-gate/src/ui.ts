@@ -62,7 +62,7 @@ export class DesignReviewPanel {
 		private readonly theme: Theme, private readonly done: (result: DesignReviewResult) => void, readonly notice = "",
 		options: ApprovalReviewOptions = {}) {
 		this.title = options.title ?? "方案审阅";
-		this.acceptLabel = options.acceptLabel ?? "确认方案";
+		this.acceptLabel = options.acceptLabel ?? "确认方案并开始实施";
 		this.feedbackLabel = options.feedbackLabel ?? "提出修改意见";
 		this.pauseLabel = options.pauseLabel ?? "稍后再看";
 		this.subtitle = options.subtitle ?? "";
