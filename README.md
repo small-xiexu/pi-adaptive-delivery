@@ -12,7 +12,7 @@
 
 **开发和审查子 Agent 都继承主 Pi 已启用的全部普通工具及原有权限检查。** 包括读写、编辑、Shell、联网和插件工具，审查角色也不禁用 `write/edit/apply_patch`。角色分工由任务提示词说明：开发负责实现，审查负责独立检查和报告问题。
 
-[完整流程](#完整流程) · [快速开始](#快速开始) · [协作时序](#协作时序) · [命令速查](#命令速查) · [开发验证](#开发验证)
+[完整流程](#完整流程) · [快速开始](#快速开始) · [协作时序](#协作时序) · [命令速查](#命令速查) · [使用边界](#使用边界)
 
 ## 完整流程
 
@@ -140,7 +140,7 @@ sequenceDiagram
     end
 ```
 
-父 Pi 或开发子 Agent 完成修改后，仍要核对最终代码并运行项目已有检查。高风险或需要第二视角的任务再调用审查子 Agent；审查发现的问题由主 Pi 核对处理。原来约定范围内的问题可以继续修，想多改其他地方或改变检查方式，就要重新请你确认。缺少环境、权限或无法确认执行结果时，会暂停并说明原因。提交、推送和发布也要另行取得你的授权。
+父 Pi 或开发子 Agent 完成修改后，仍要核对最终代码并运行项目已有检查。高风险或需要第二视角的任务再调用审查子 Agent；审查发现的问题由主 Pi 核对处理。原来约定范围内的问题可以继续修，想多改其他地方或改变检查方式，就要重新请你确认。缺少环境、权限或无法确认执行结果时，会暂停并说明原因。
 
 子 Agent 的主状态只有三种：**运行中、已完成、异常退出**。工具调用失败是过程记录，不是子 Agent 失败：检索未匹配、编辑后修正和检查未通过都会留在详情里，卡片不会把它们提升为主状态，也不会自行宣布问题已解决。结果正文先给子 Agent 的结论，失败记录附在正文之后并明确“可能是检查未通过，也可能是命令或检索失败”；具体调用、返回摘要和原始记录位置保留在详情中，由主 Pi 核对后说明原因与影响。
 
@@ -193,52 +193,11 @@ sequenceDiagram
 
 模型长时间没有响应时，交付流程会中断这次请求并自动继续（默认超过 120 秒没有任何内容增量即判定为停顿，每个回合最多自动恢复两次，界面会明确提示）；工具执行期间不计时，长时间运行的命令不会被误判。**该机制只在交付流程内生效**（`/delivery-shape` 之后，含它派出的开发和审查子会话）；普通会话不受影响，遇到停顿仍由 Pi 自身处理。
 
-任务完成后，你明确要求提交代码，Pi 会核对差异和验证结果，再用普通工具完成已授权的本地提交，无须为了提交现有改动重走方案和实施确认。工具缺失时先用 `/delivery-exit` 恢复；提交不会自动推送或发布。
+## 使用边界
 
-## 开发验证
+当前版本面向标准 Pi 的 Git 项目使用，已在 macOS、Pi `0.85.1`、Node `25.2.1` 环境验证。Package 不改变普通 Pi 会话的使用方式，也不自动启用交付流程。Structured 环境需要使用 `executionMode: "normal"`，Code Mode 和 Notebook Mode 不在当前支持范围内。
 
-以下命令在本仓库运行，需要先安装项目依赖。默认测试不额外禁网，使用临时 Git、临时 HOME/agent dir、空凭证和 fake provider；不调用真实模型，也不读取用户凭证。
-
-```sh
-npm run typecheck
-npm run test:all
-git diff --check
-```
-
-`test:all` 包含单元、集成和 E2E 测试。两个完整流程 demo（均不在 `test:all` 内；真实模型那个会发起真实 Provider 调用并产生费用）：
-
-```sh
-# 1) 隔离 fake provider：无需凭证，不调用真实模型
-node --import tsx test/support/run-tests.ts test/demo/full-flow.test.ts
-
-# 2) 真实模型：临时 agent dir 只符号链接你的 auth.json，不复制凭证
-node --import tsx test/demo/real-model.ts
-
-# 3) 真实模型完整流程：两次确认 → 委派开发 → 独立审查 → 返工与复审 → 退出
-#    加 DEMO_STRUCTURED=1 则在 pi-codex-conversion 的 Structured 环境下跑同一套流程
-node --import tsx test/demo/real-model-full.ts
-```
-
-使用 `pi-codex-conversion` 时，再按已安装插件的实际路径运行 Structured 专项（由 Pi 安装的 npm 插件通常在 `~/.pi/agent/npm/node_modules/` 下；已在本机 `@howaboua/pi-codex-conversion 3.0.31` 上验证通过）：
-
-```sh
-node --import tsx test/support/run-tests.ts \
-  --adapter "$HOME/.pi/agent/npm/node_modules/@howaboua/pi-codex-conversion" \
-  test/structured/flow.test.ts
-```
-
-测试缺少项目依赖或本机工具时应报告实际错误，不自动安装依赖或跳过场景。验证结果和临时测试制品以[实施计划](docs/实施计划.md)为准；fake provider 和模拟批准只能验证工具链路，不能代表真实模型质量或完整终端体验。
-
-### 发布新版本（维护者）
-
-1. 同步版本：`npm version <版本> --no-git-tag-version`（会同时更新 `package.json` 与 `package-lock.json`），并改 `docs/技术方案.md` 与 `README.md` 里的“当前版本”表述；历史记录不改写。
-2. 跑 `npm run typecheck`、`npm run test:all`、`git diff --check`，再 `git push`。
-3. 在**有 TTY 的终端**里执行 `npm publish`。账号使用 security key / 扫码类 2FA 时，CLI 只接受 6 位 TOTP 的 `--otp`；此时改为在 TTY 里运行，npm 会给出网页授权链接（`Authenticate your account at: …`），在浏览器确认后自动继续。发布必须由用户本人授权。
-4. 复核：`npm view pi-adaptive-delivery version dist-tags`，并确认 `dist.shasum` 与本地 `npm pack` 输出一致；必要时下载 tarball 检查关键文件（如 `extensions/delivery-gate/src/stall-watch.ts`）确实在包内。
-
-## 当前边界与进一步阅读
-
-当前版本已在**真实终端**上分别用标准工具集与 `pi-codex-conversion` 的 Structured 适配器跑完完整交付流程（两次确认 → 委派开发 → 独立审查 → 返工与复审 → `/delivery-exit`），并在真实模型 + 真实网关上验证了停顿自动恢复；测试与真机验证的完整证据统一见[实施计划](docs/实施计划.md)第 13 节。**仍待观察的是使用层面的问题：AI 是否会为小任务多写文档、长业务流程能否一次顺利交付**——这类只能靠真实项目持续试用。
+交付流程会核对批准、任务交接和检查证据，但不会替代 Pi 或其他插件的权限系统。开发和审查角色的职责由任务上下文约定；后台进程、项目依赖和外部工具仍由原有环境负责。遇到工具缺失、环境不一致或无法确认执行结果时，流程会暂停并说明原因。
 
 这套流程核对自己的批准、任务交接和检查证据，**不会接管普通工具的权限**。修改范围和子 Agent 的职责仍需 AI 遵守，不能据此保证任何工具都无法越界或同时写文件。审查子虽然继承普通写入工具，但默认只检查和报告；源码修复由父 Pi 或开发子 Agent 负责。原插件自己的拒绝仍有效；后台进程由原工具和项目脚本负责，交付包不保证它们全部停止。子会话按配置重建工具，无法复制的临时插件能力会明确报错；退出时也不保证其他插件的内部状态全部还原。
 
@@ -252,7 +211,6 @@ node --import tsx test/support/run-tests.ts \
 | 中断后怎样查看记录，继续处理 | [进度与中断恢复](docs/技术方案.md#section-11)（第 11 节） |
 | AI 的具体协作规则与推理级别 | [adaptive-delivery Skill](skills/adaptive-delivery/SKILL.md) |
 | 目前做到了哪一步，有哪些实际案例和测试记录 | [实施计划](docs/实施计划.md#section-13) |
-| 本地运行项目测试 | [开发验证](docs/技术方案.md#section-14-3)（第 14.3 节） |
-| 真实终端手动验证（PTY 脚本） | [test/demo/pty](test/demo/pty/README.md) |
+| 运行机制与验证说明 | [本机接入与开发验证](docs/技术方案.md#section-14)（第 14 节） |
 
 本项目基于标准 Pi 的公开 API，不依赖或包装 `pi-subagents`。
