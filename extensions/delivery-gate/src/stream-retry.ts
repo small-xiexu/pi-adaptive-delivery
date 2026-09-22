@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Pi 0.85.1 未将该错误识别为可重试；只补充说明，调度与取消仍由原生流程负责。
+// Pi 0.87.0 仍未将该错误识别为可重试；只补充说明，调度与取消仍由原生流程负责。
 export function installStreamRetry(pi: ExtensionAPI): void {
 	pi.on("message_end", ({ message }) => {
 		if (message.role !== "assistant" || message.stopReason !== "error" || message.errorMessage !== "stream_read_error") return;

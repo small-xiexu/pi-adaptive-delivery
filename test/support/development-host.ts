@@ -12,6 +12,22 @@ import { approvalUI } from "./delivery-ui.ts";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
+// createAgentSession 读取进程级环境；同一测试进程内的开发宿主必须串行占用它。
+let environmentTail = Promise.resolve();
+
+async function acquireEnvironment(): Promise<() => void> {
+	const previous = environmentTail;
+	let release!: () => void;
+	environmentTail = new Promise<void>((resolve) => { release = resolve; });
+	await previous;
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		release();
+	};
+}
+
 // 文件开发与本机命令共用同一个 SDK 父/模拟选择、真实 CLI 子宿主。
 export async function createDevelopmentHost(t: TestContext, scenario = "normal", configure?: (pi: ExtensionAPI) => void,
 	configureFixture?: (fixture: Awaited<ReturnType<typeof createPiFixture>>) => Promise<void>, activate = true) {
@@ -19,72 +35,90 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 	await fixture.rpc.send("get_state");
 	await fixture.rpc.stop();
 	await configureFixture?.(fixture);
+	const releaseEnvironment = await acquireEnvironment();
 	const originalEnv = { ...process.env };
-	Object.assign(process.env, testEnvironment(fixture.root), { ADAPTIVE_FIXTURE_SCENARIO: `development-${scenario}` });
-	if (scenario === "separate-git") execFileSync("git", ["init", "--quiet", "--separate-git-dir", "metadata"], { cwd: fixture.cwd });
-	const settingsManager = SettingsManager.create(fixture.cwd, fixture.agentDir);
-	let api!: ExtensionAPI;
-	const resourceLoader = new DefaultResourceLoader({ cwd: fixture.cwd, agentDir: fixture.agentDir, settingsManager,
-		extensionFactories: [(pi) => { api = pi; configure?.(pi); }] });
-	await resourceLoader.reload();
-	assert.deepEqual(resourceLoader.getExtensions().errors, []);
-	const modelRuntime = await ModelRuntime.create({ authPath: path.join(fixture.agentDir, "auth.json"), modelsPath: path.join(fixture.agentDir, "models.json") });
-	const sm = SessionManager.create(fixture.cwd, path.join(fixture.root, "parent-sessions"));
-	const { session } = await createAgentSession({ cwd: fixture.cwd, agentDir: fixture.agentDir, settingsManager, resourceLoader, modelRuntime, sessionManager: sm });
-	initTheme("dark");
-	const notices: string[] = [];
-	const choices: string[] = [];
-	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[0]; };
-	let custom = approvalUI((...args) => select(...args));
-	let confirm: ExtensionUIContext["confirm"] = async () => true;
-	let input: ExtensionUIContext["input"] = async () => "fixture-answer";
-	t.after(async () => {
-		try { await session.abort(); await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); }
-		finally {
-			session.dispose();
-			for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
-			Object.assign(process.env, originalEnv);
+	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+	let cleaned = false;
+	const restoreEnvironment = () => {
+		for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
+		Object.assign(process.env, originalEnv);
+	};
+	const cleanup = async () => {
+		if (cleaned) return;
+		cleaned = true;
+		try {
+			if (session) {
+				await session.abort();
+				await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+			}
+		} finally {
+			try { session?.dispose(); }
+			finally { restoreEnvironment(); releaseEnvironment(); }
 		}
-	});
-	await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session.reload() } as ExtensionCommandContextActions, abortHandler: () => { session.clearQueue(); void session.abort(); },
-		uiContext: { ...session.extensionRunner.getUIContext(), select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args),
-		custom: (...args: Parameters<ExtensionUIContext["custom"]>) => custom(...args),
-		confirm: (...args: Parameters<ExtensionUIContext["confirm"]>) => confirm(...args), input: (...args: Parameters<ExtensionUIContext["input"]>) => input(...args),
-		notify: (text: string) => { notices.push(text); } } as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
-	const model = modelRuntime.getModel("adaptive-fixture", "fake");
-	assert.ok(model);
-	await session.setModel(model);
-	if (activate) await session.prompt("/delivery-shape");
-	const workspace = await resolveWorkspaceIdentity(fixture.cwd);
-	const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
-	const call = async (name: string, args: Record<string, unknown>) => {
-		const id = randomUUID();
-		await session.prompt(`/fixture-next-tool ${JSON.stringify({ type: "toolCall", id, name, arguments: args })}`);
-		await session.prompt("执行本轮隔离测试");
-		await session.waitForIdle();
-		const row = sm.getBranch().findLast((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id);
-		assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session.messages));
-		return row.message;
 	};
-	const approve = async (stage: string, paths: string[], body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
-		const documentStrategy = paths.length ? "reuse" : "none";
-		// 落盘策略下批准前要求规划文档真实存在；夹具先把声明路径写成真实文件。
-		if (stage === "design" && paths.length) {
-			const target = path.join(fixture.cwd, paths[0]!);
-			await mkdir(path.dirname(target), { recursive: true });
-			await writeFile(target, "# 规划文档\n").catch(() => {});
-		}
-		return call("delivery_approval", { stage, body, documentStrategy,
-			...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}),
-			paths });
-	};
-	const prepare = async () => {
-		assert.equal((await approve("design", ["plan.md"])).isError, false);
-	};
-	const audit = async () => (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
-	t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: process.pid, ui: "simulated", child: "standard-cli" }));
-	return { ...fixture, session, sm, api, notices, choices, call, approve, prepare, audit, readLease: () => leases.read(workspace.key),
-		setSelect: (value: typeof select) => { select = value; }, setConfirm: (value: typeof confirm) => { confirm = value; },
-		setCustom: (value: typeof custom) => { custom = value; },
-		setInput: (value: typeof input) => { input = value; } };
+	t.after(cleanup);
+	try {
+		Object.assign(process.env, testEnvironment(fixture.root), { ADAPTIVE_FIXTURE_SCENARIO: `development-${scenario}` });
+		if (scenario === "separate-git") execFileSync("git", ["init", "--quiet", "--separate-git-dir", "metadata"], { cwd: fixture.cwd });
+		const settingsManager = SettingsManager.create(fixture.cwd, fixture.agentDir);
+		let api!: ExtensionAPI;
+		const resourceLoader = new DefaultResourceLoader({ cwd: fixture.cwd, agentDir: fixture.agentDir, settingsManager,
+			extensionFactories: [(pi) => { api = pi; configure?.(pi); }] });
+		await resourceLoader.reload();
+		assert.deepEqual(resourceLoader.getExtensions().errors, []);
+		const modelRuntime = await ModelRuntime.create({ authPath: path.join(fixture.agentDir, "auth.json"), modelsPath: path.join(fixture.agentDir, "models.json") });
+		const sm = SessionManager.create(fixture.cwd, path.join(fixture.root, "parent-sessions"));
+		({ session } = await createAgentSession({ cwd: fixture.cwd, agentDir: fixture.agentDir, settingsManager, resourceLoader, modelRuntime, sessionManager: sm }));
+		initTheme("dark");
+		const notices: string[] = [];
+		const choices: string[] = [];
+		let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[0]; };
+		let custom = approvalUI((...args) => select(...args));
+		let confirm: ExtensionUIContext["confirm"] = async () => true;
+		let input: ExtensionUIContext["input"] = async () => "fixture-answer";
+		await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session!.reload() } as ExtensionCommandContextActions, abortHandler: () => { session!.clearQueue(); void session!.abort(); },
+			uiContext: { ...session.extensionRunner.getUIContext(), select: (...args: Parameters<ExtensionUIContext["select"]>) => select(...args),
+			custom: (...args: Parameters<ExtensionUIContext["custom"]>) => custom(...args),
+			confirm: (...args: Parameters<ExtensionUIContext["confirm"]>) => confirm(...args), input: (...args: Parameters<ExtensionUIContext["input"]>) => input(...args),
+			notify: (text: string) => { notices.push(text); } } as unknown as ExtensionUIContext, onError: (error) => notices.push(error.error) });
+		const model = modelRuntime.getModel("adaptive-fixture", "fake");
+		assert.ok(model);
+		await session.setModel(model);
+		if (activate) await session.prompt("/delivery-shape");
+		const workspace = await resolveWorkspaceIdentity(fixture.cwd);
+		const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
+		const call = async (name: string, args: Record<string, unknown>) => {
+			const id = randomUUID();
+			await session!.prompt(`/fixture-next-tool ${JSON.stringify({ type: "toolCall", id, name, arguments: args })}`);
+			await session!.prompt("执行本轮隔离测试");
+			await session!.waitForIdle();
+			const row = sm.getBranch().findLast((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id);
+			assert.ok(row?.type === "message" && row.message.role === "toolResult", JSON.stringify(session!.messages));
+			return row.message;
+		};
+		const approve = async (stage: string, paths: string[], body = `APPROVED_${stage.toUpperCase()}_BODY`) => {
+			const documentStrategy = paths.length ? "reuse" : "none";
+			// 落盘策略下批准前要求规划文档真实存在；夹具先把声明路径写成真实文件。
+			if (stage === "design" && paths.length) {
+				const target = path.join(fixture.cwd, paths[0]!);
+				await mkdir(path.dirname(target), { recursive: true });
+				await writeFile(target, "# 规划文档\n").catch(() => {});
+			}
+			return call("delivery_approval", { stage, body, documentStrategy,
+				...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}),
+				paths });
+		};
+		const prepare = async () => {
+			assert.equal((await approve("design", ["plan.md"])).isError, false);
+		};
+		const audit = async () => (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+		t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: process.pid, ui: "simulated", child: "standard-cli" }));
+		return { ...fixture, session, sm, api, notices, choices, call, approve, prepare, audit, readLease: () => leases.read(workspace.key),
+			setSelect: (value: typeof select) => { select = value; }, setConfirm: (value: typeof confirm) => { confirm = value; },
+			setCustom: (value: typeof custom) => { custom = value; },
+			setInput: (value: typeof input) => { input = value; } };
+	} catch (error) {
+		await cleanup();
+		throw error;
+	}
 }

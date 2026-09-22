@@ -194,8 +194,8 @@ await turn(requirement);
 for (let index = 0; index < maxTurns; index++) {
 	if (Date.now() > deadline) { say(`\n⚠ 超出时间预算，停止驱动（${remaining()}）`); break; }
 	const dirty = spawnSync("/usr/bin/git", ["status", "--porcelain=v1"], { cwd, encoding: "utf8" }).stdout.trim().length > 0;
-	const settled = approvals() >= 2 && (delegations() > 0 || dirty);
-	if (settled && !(await leases.read(workspace.key))) { say("\n①两次确认完成、改动就位且 writer 已交回，停止驱动。"); break; }
+	const settled = approvals() >= 1 && (delegations() > 0 || dirty);
+	if (settled && !(await leases.read(workspace.key))) { say("\n①方案确认完成、改动就位且 writer 已交回，停止驱动。"); break; }
 	const before = sm.getBranch().length;
 	await turn(index % 3 === 1 ? "/delivery-run" : "/delivery-plan");
 	if (sm.getBranch().length === before) { say("（模型没有继续推进，停止驱动）"); break; }
@@ -209,7 +209,7 @@ const after = check();
 say(`$ node inputs/command.cjs → 退出码 ${after.code}`);
 const gitStatus = spawnSync("/usr/bin/git", ["status", "--porcelain=v1"], { cwd, encoding: "utf8" }).stdout.trim();
 say(`git status：\n${gitStatus || "（干净）"}`);
-say(`二次确认记录：${approvals()} · 委派记录：${delegations()} · 残留 lease：${(await leases.read(workspace.key)) ? "有" : "无"}`);
+say(`方案确认记录：${approvals()} · 委派记录：${delegations()} · 残留 lease：${(await leases.read(workspace.key)) ? "有" : "无"}`);
 say(`子会话：${sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-delegation").length} 条委派记录`);
 say(`交互替身代答：${dialogs.length ? [...new Set(dialogs)].join("；") : "无"}`);
 for (const panel of panels) { section(`面板原文：${panel.title}`); for (const line of panel.lines) say(line); }

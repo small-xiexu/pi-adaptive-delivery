@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structured 环境 + 真机终端的完整交付流程验证（跑两次确认、开发、审查、返工、退出）。
+"""Structured 环境 + 真机终端的完整交付流程验证（一次方案确认并开始实施、开发、审查、返工、退出）。
 
 用法：
     python3 test/demo/pty/structured-full.py [隔离根目录]
@@ -183,10 +183,7 @@ try:
         raise SystemExit(0)
     log("=== 方案审阅面板 ===\n" + screen())
     accept("方案审阅")
-    wait_for(r"实施确认", timeout=480, note="实施确认面板")
-    log("=== 实施确认面板 ===\n" + screen())
-    accept("实施确认")
-    log("=== 已两次确认，进入实施 ===")
+    log("=== 已确认方案并开始实施 ===")
     driver.wait_quiet(90, timeout=2400)      # 开发 + 审查跑完且正文静止
     log("=== 正文静止后的屏幕 ===\n" + screen())
     heart("回合结束")

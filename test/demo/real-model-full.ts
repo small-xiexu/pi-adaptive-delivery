@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 真实模型全流程验证：真实 SDK 父会话 + 真实子 Pi CLI + 真实项目检查 + 真实 writer lease。
-// 覆盖：拷问式对齐 → 两阶段落盘 → 意见轮 → 两次确认 → 开发 → 注入缺陷 → 审查报缺陷 →
+// 覆盖：拷问式对齐 → 规划文档落盘 → 意见轮 → 一次方案确认并开始实施 → 开发 → 注入缺陷 → 审查报缺陷 →
 //       返工（按新默认规则）→ 状态/任务弹层 → 残留 lease → 退出被拒 → /delivery-unlock → 正常退出。
 // 认证由 Pi 自己从符号链接的 auth.json 读取；本脚本不读取、不复制、不打印任何凭证。
 // 用法：node --import tsx test/demo/real-model-full.ts

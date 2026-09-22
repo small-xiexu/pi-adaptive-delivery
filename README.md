@@ -21,16 +21,15 @@
 ```mermaid
 flowchart TD
     A[普通使用 Pi] -->|/delivery-shape 你的需求| B[说清需求，一起讨论方案]
-    B --> C[你确认方案]
-    C --> D[说明怎么改、业务行为与验收标准]
-    D --> E[你确认方案并开始实施]
-    E --> F[AI 内部拆解计划；父 Pi 直接完成简单任务或委派开发]
-    F --> V[父 Pi 或审查子 Agent 运行项目检查]
-    V -->|完成| G[高风险任务按需独立审查，主 Pi 核对结果]
-    V -->|没有通过，修改后再检查| F
-    G -->|还有需要修改的问题| F
-    G -->|检查完成，问题已处理| H[交付改动和检查结果]
-    H -->|/delivery-exit| A
+    B --> C[说明怎么改、业务行为与验收标准]
+    C --> D[你确认方案并开始实施]
+    D --> E[AI 内部拆解计划；父 Pi 直接完成简单任务或委派开发]
+    E --> V[父 Pi 或审查子 Agent 运行项目检查]
+    V -->|完成| F[高风险任务按需独立审查，主 Pi 核对结果]
+    V -->|没有通过，修改后再检查| E
+    F -->|还有需要修改的问题| E
+    F -->|检查完成，问题已处理| G[交付改动和检查结果]
+    G -->|/delivery-exit| A
 ```
 
 你主要确认一次技术方案。例如，修复“空列表导致页面报错”：
@@ -94,7 +93,7 @@ pi remove  npm:pi-adaptive-delivery -l     # 卸载（全局安装时去掉 -l�
 
    也可以先输入 `/delivery-shape`，再直接聊天描述需求。如果 Pi 已经开着，等当前任务结束后用 `/reload` 加载扩展包。
 
-目前验证过的组合是 **macOS、Pi 0.85.1、Node 25.2.1**，其他平台和版本还没验证。使用 `pi-codex-conversion` 的用户，先按[Structured 接入说明](docs/技术方案.md)（第 14.2 节）配置加载顺序。升级 Package 或修改 `.pi/settings.json` 后，如果 Pi 已在运行，等当前任务收尾再用 `/reload`；如果交付任务已结束并要回到普通使用，使用 `/delivery-exit`。
+目前自动化验证过的基础组合是 **macOS、Pi 0.87.0、Node 25.2.1**，其他平台和版本还没验证。Structured 定向矩阵中，`pi-codex-conversion 3.0.35 + Pi 0.87.0` 和 `3.0.25 + Pi 0.87.0` 的最小开发/审查流程均通过；`3.0.25` 不提供 `3.0.26` 起新增的可选 `developer-message` API，本 Package 当前流程不调用它。其他适配器和 CLI 组合不据此宣称支持。父 Pi 与子 Pi CLI 必须使用同一套安装和版本；升级后请重启已运行的 Pi，避免父 SDK 与 `PATH` 解析出的子 CLI 混用。使用 `pi-codex-conversion` 的用户，先按[Structured 接入说明](docs/技术方案.md)（第 14.2 节）配置加载顺序。升级 Package 或修改 `.pi/settings.json` 后，如果 Pi 已经开着，等当前任务收尾再用 `/reload`；如果交付任务已结束并要回到普通使用，使用 `/delivery-exit`。
 
 ## 协作时序
 
@@ -193,13 +192,13 @@ sequenceDiagram
 
 ## 使用边界
 
-当前版本面向标准 Pi 的 Git 项目使用，已在 macOS、Pi `0.85.1`、Node `25.2.1` 环境验证。Package 不改变普通 Pi 会话的使用方式，也不自动启用交付流程。Structured 环境需要使用 `executionMode: "normal"`，Code Mode 和 Notebook Mode 不在当前支持范围内。
+当前版本面向标准 Pi 的 Git 项目使用，已在 macOS、Pi `0.87.0`、Node `25.2.1` 环境验证。Package 不改变普通 Pi 会话的使用方式，也不自动启用交付流程。Structured 环境需要使用 `executionMode: "normal"`，Code Mode 和 Notebook Mode 不在当前支持范围内；父 Pi 与按 `PATH` 启动的子 CLI 版本不一致时会保持失败关闭。
 
 交付流程会核对批准、任务交接和检查证据，但不会替代 Pi 或其他插件的权限系统。开发和审查角色的职责由任务上下文约定；后台进程、项目依赖和外部工具仍由原有环境负责。遇到工具缺失、环境不一致或无法确认执行结果时，流程会暂停并说明原因。
 
 这套流程核对自己的批准、任务交接和检查证据，**不会接管普通工具的权限**。修改范围和子 Agent 的职责仍需 AI 遵守，不能据此保证任何工具都无法越界或同时写文件。审查子虽然继承普通写入工具，但默认只检查和报告；源码修复由父 Pi 或开发子 Agent 负责。原插件自己的拒绝仍有效；后台进程由原工具和项目脚本负责，交付包不保证它们全部停止。子会话按配置重建工具，无法复制的临时插件能力会明确报错；退出时也不保证其他插件的内部状态全部还原。
 
-**环境边界**：支持标准 Pi 工具集（`read`/`bash`/`write`/`edit` 等），以及 `@howaboua/pi-codex-conversion` 的 **Structured 适配器**（`executionMode: normal`，即 `exec_command` / `apply_patch` / `write_stdin` / `view_image` 那套工具，没有独立的 `read`/`edit`/`write`）。该插件的 **Code Mode**（只暴露 `exec`/`wait`）与 **Notebook Mode** 不在支持范围内；工具集不符时子会话交接会明确报错，不会静默降级。
+**环境边界**：支持标准 Pi 工具集（`read`/`bash`/`write`/`edit` 等），以及当前矩阵已验证的 `@howaboua/pi-codex-conversion` **Structured 适配器**（`executionMode: normal`，即 `exec_command` / `apply_patch` / `write_stdin` / `view_image` 那套工具，没有独立的 `read`/`edit`/`write`）。该插件的 **Code Mode**（只暴露 `exec`/`wait`）与 **Notebook Mode** 不在支持范围内；工具集或父子基础环境不符时子会话交接会明确报错，不会静默降级。
 
 | 需要了解 | 阅读 |
 |---|---|

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { inheritedTools, installPolicy } from "../../extensions/delivery-gate/src/policy.ts";
+import { CAPABILITY_NOTICE, inheritedTools, installPolicy } from "../../extensions/delivery-gate/src/policy.ts";
+
+test("运行提示与一次方案确认契约一致", () => {
+	assert.match(CAPABILITY_NOTICE, /方案确认后立即授权本轮实施/);
+	assert.match(CAPABILITY_NOTICE, /不另设第二次确认/);
+	assert.doesNotMatch(CAPABILITY_NOTICE, /方案与实施仍分别确认/);
+});
 
 function host() {
 	const handlers = new Map<string, Function>();

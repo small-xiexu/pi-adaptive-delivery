@@ -5,7 +5,7 @@ import { DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./parent-writer.ts";
 import { DEVELOPMENT_TOOL, REVIEW_TOOL } from "./development.ts";
 import { GIT_STATUS_TOOL } from "./workspace.ts";
 
-export const CAPABILITY_NOTICE = "交付已启用：保留 Pi 原有工具与权限检查，联网查资料、文件、Shell 和插件能力不按角色删减。方案与实施仍分别确认，交付委派和 writer 交接只管理本 Package 的开发与审查调用。普通工具不由交付 writer 接管。父负责讨论与协调，开发子按任务实现，审查子主动运行测试并独立检查；两者都应遵守用户授权，不能因工具可用就擅自写入、递归委派或执行外部操作。旧批准不自动恢复，完成结论须有当前候选证据。";
+export const CAPABILITY_NOTICE = "交付已启用：保留 Pi 原有工具与权限检查，联网查资料、文件、Shell 和插件能力不按角色删减。方案确认后立即授权本轮实施，实施计划由父 Pi 内部维护，不另设第二次确认。交付委派和 writer 交接只管理本 Package 的开发与审查调用。普通工具不由交付 writer 接管。父负责讨论与协调，开发子按任务实现，审查子主动运行测试并独立检查；两者都应遵守用户授权，不能因工具可用就擅自写入、递归委派或执行外部操作。旧批准不自动恢复，完成结论须有当前候选证据。";
 
 // 子任务继承父实际启用的工具；交付协调工具属于父会话，不是项目原有能力。
 export function inheritedTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">, entryPath: string) {

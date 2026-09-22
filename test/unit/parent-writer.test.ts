@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SessionManager, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, JsonObject, ToolResultMessage } from "@earendil-works/pi-ai";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "../../extensions/delivery-gate/src/parent-writer.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
@@ -41,7 +41,10 @@ async function host(existing?: string) {
 		sm.appendMessage(assistant([{ type: "toolCall", id, name: DOCUMENT_WRITE_TOOL, arguments: input }]));
 		const run = writer.write(id, input, signal, ctx);
 		const outcome = run.then((result) => ({ ...result, isError: false }), (error) => ({ content: [{ type: "text" as const, text: error.message }], details: {}, isError: true }));
-		const message = async (): Promise<ToolResultMessage> => ({ role: "toolResult", toolCallId: id, toolName: DOCUMENT_WRITE_TOOL, ...await outcome, timestamp: Date.now() });
+		const message = async (): Promise<ToolResultMessage<JsonObject>> => {
+			const result = await outcome;
+			return { role: "toolResult", toolCallId: id, toolName: DOCUMENT_WRITE_TOOL, ...result, details: result.details as JsonObject, timestamp: Date.now() };
+		};
 		return { id, run, message, persist: async () => { const result = await message(); sm.appendMessage(result); return result; } };
 	};
 	return { root, cwd, sm, pi, ctx, writer, begin, event, notices, workspace, leases, leaseFile,
@@ -64,7 +67,7 @@ test("父 writer 绑定本次调用，原生结果落盘后释放并允许下一
 	const input = { path: "plan.md", edits: [{ oldText: "更新", newText: "再次更新" }] };
 	h.sm.appendMessage(assistant([{ type: "toolCall", id, name: DOCUMENT_EDIT_TOOL, arguments: input }]));
 	const result = await h.writer.edit(id, input, undefined, h.ctx);
-	h.sm.appendMessage({ role: "toolResult", toolCallId: id, toolName: DOCUMENT_EDIT_TOOL, ...result, isError: false, timestamp: Date.now() });
+		h.sm.appendMessage({ role: "toolResult", toolCallId: id, toolName: DOCUMENT_EDIT_TOOL, ...result, details: result.details as any, isError: false, timestamp: Date.now() } as any);
 	await h.event("turn_end");
 	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "再次更新");
 	assert.equal(await h.readLease(), undefined);

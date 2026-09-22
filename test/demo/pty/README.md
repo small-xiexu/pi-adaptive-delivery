@@ -5,7 +5,7 @@
 | 文件 | 作用 |
 |---|---|
 | `session.py` | 可复用底座：PTY 会话 + 终端屏幕模拟、隔离 agent dir、demo 仓库生成 |
-| `structured-full.py` | Structured 环境（`@howaboua/pi-codex-conversion`）下的完整流程：两次确认 → 委派开发 → 独立审查 → 返工 → 复审 → `/delivery-status` → `/delivery-tasks` → `/delivery-exit` |
+| `structured-full.py` | Structured 环境（`@howaboua/pi-codex-conversion`）下的完整流程：一次方案确认并开始实施 → 委派开发 → 独立审查 → 返工 → 复审 → `/delivery-status` → `/delivery-tasks` → `/delivery-exit` |
 | `gateway-proxy.mjs` | 停顿注入：第 1 个请求只发响应头后沉默，其余原样转发真网关，用于验证看门狗 |
 
 ## 运行

@@ -297,7 +297,7 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	sm.appendCustomEntry("delivery-development", { id: "a", agent, childSessionFile: path.join(root, "child.jsonl") });
 	assert.deepEqual(taskDetails({ sessionManager: sm }, [])[0]!.agent, agent);
 	sm.appendMessage({ role: "toolResult", toolCallId: "a", toolName: tool.name, isError: false,
-		content: [{ type: "text", text: "过程记录：原记录第 3 行，rg missing input.txt 返回 code 1" }], details: { progress: progress.snapshot() }, timestamp: Date.now() });
+		content: [{ type: "text", text: "过程记录：原记录第 3 行，rg missing input.txt 返回 code 1" }], details: { progress: progress.snapshot() } as any, timestamp: Date.now() });
 	progress.agent({ ...agent, thinking: "low", reason: "过时进度" });
 	const reopened = SessionManager.open(sm.getSessionFile()!);
 	const task = taskDetails({ sessionManager: reopened }, [progress.snapshot()])[0]!;

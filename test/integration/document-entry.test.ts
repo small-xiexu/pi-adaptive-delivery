@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContextActions, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream, type Context, type ToolCall } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, type Context, type ToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
@@ -44,7 +44,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 				streamSimple(model, context) {
 					const stream = createAssistantMessageEventStream();
 					contexts.push(structuredClone(context.messages));
-					prompts.push(context.systemPrompt ?? "");
+					prompts.push(getCurrentSystemPrompt(context.messages));
 					const content = calls.length ? calls : followups.shift() ?? [];
 					calls = [];
 					queueMicrotask(() => {
@@ -80,7 +80,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	if (activate) await session.prompt("/delivery-shape");
 	const workspace = await resolveWorkspaceIdentity(cwd);
 	const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
-	const call = async (name: string, args: Record<string, unknown>) => {
+	const call = async (name: string, args: ToolCall["arguments"]) => {
 		const id = randomUUID();
 		calls = [{ type: "toolCall", id, name, arguments: args }];
 		await session.prompt("执行本轮测试调用");
@@ -94,7 +94,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
 		return call("delivery_approval", { stage, body: `待确认正文 ${stage}`, documentStrategy, ...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}), paths });
 	};
-	t.diagnostic(JSON.stringify({ root, sdk: "0.85.1", ui: "simulated" }));
+	t.diagnostic(JSON.stringify({ root, sdk: "0.87.0", ui: "simulated" }));
 	return { root, cwd, sm, session, api, notices, choices, call, approve, contexts, prompts, readLease: () => leases.read(workspace.key),
 		setFollowups: (steps: ToolCall[][]) => { followups = steps; },
 		setFeedback: (callback: typeof feedback) => { feedback = callback; },

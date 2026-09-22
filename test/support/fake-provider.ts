@@ -4,8 +4,7 @@ import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { createAssistantMessageEventStream, type AssistantMessage, type ToolCall } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type ToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -20,13 +19,17 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	const isChild = () => Boolean(process.env.PI_ADAPTIVE_DELIVERY_CHILD);
 	let dialogAsked = false;
 	let nextTool: ToolCall | undefined;
-	let developerSent = false;
 	let streamFailures = 0;
 	let streamError: { message: string; remaining: number; afterTools: number } | undefined;
 	const audit = (phase: string, details: Record<string, unknown> = {}) => appendFileSync(
 		path.join(process.env.PI_CODING_AGENT_DIR!, "fixture-events.jsonl"),
 		`${JSON.stringify({ pid: process.pid, child: isChild(), phase, scenario, ...details })}\n`,
 	);
+	const contextView = (context: TranscriptContext) => ({
+		messages: context.messages,
+		systemPrompt: getCurrentSystemPrompt(context.messages),
+		tools: getCurrentTools(context.messages),
+	});
 	const replaceTool = (name: string) => pi.registerTool({
 		name, label: "测试覆盖", description: "不能继承原实现的权限",
 		parameters: Type.Object({ path: Type.Optional(Type.String()), task: Type.Optional(Type.String()) }),
@@ -36,7 +39,6 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		},
 	});
 	pi.on("session_start", (_event, ctx) => {
-		developerSent = false;
 		audit("start", { sessionId: ctx.sessionManager.getSessionId(), commands: pi.getCommands().map((command) => command.name),
 			tools: pi.getAllTools().map((tool) => tool.name) });
 		if (isChild() && scenario === "missing-tools") pi.setActiveTools([]);
@@ -50,16 +52,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", () => {
 		if (isChild() && scenario === "corrupt") writeSync(1, "fixture: invalid JSONL\n");
 	});
+	// Keep the fixture on the common Structured contract; optional adapter exports are version-specific.
 	pi.on("before_agent_start", async (event) => {
-		if (structured && !developerSent) {
-			const command = pi.getCommands().find((item) => item.name === "codex");
-			if (command?.sourceInfo.path) {
-				const { trySendCodexDeveloperMessage } = await import(pathToFileURL(command.sourceInfo.path).href);
-				const accepted = trySendCodexDeveloperMessage(pi, isChild() ? "STRUCTURED_CHILD_CONTEXT_PROOF" : "STRUCTURED_PARENT_CONTEXT_PROOF", { triggerTurn: false });
-				audit("codex-developer-message", { accepted });
-				developerSent = true;
-			}
-		}
 		if (environment || development) {
 			audit("environment-before-agent");
 			return { systemPrompt: `${event.systemPrompt}\nCONFIGURED_BEFORE_AGENT_HOOK` };
@@ -146,14 +140,15 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 			const planned = nextTool;
 			nextTool = undefined;
 			const stream = createAssistantMessageEventStream();
+			const view = contextView(context);
 			audit("model", { modelId: model.id, reasoning: options?.reasoning, parentMarkerSeen: JSON.stringify(context.messages).includes("PARENT_ONLY_HISTORY_SENTINEL"),
-				tools: context.tools?.map((tool) => tool.name), ...(environment || development || structured ? { systemPrompt: context.systemPrompt,
+				tools: view.tools.map((tool) => tool.name), ...(environment || development || structured ? { systemPrompt: view.systemPrompt,
 					messages: context.messages } : {}) });
 			queueMicrotask(async () => {
 				if (structured) {
-					const payload = { model: model.id, instructions: context.systemPrompt, input: context.messages.map((message) => ({ role: message.role === "assistant" ? "assistant" : "user",
+					const payload = { model: model.id, instructions: view.systemPrompt, input: context.messages.filter((message) => message.role !== "system").map((message) => ({ role: message.role === "assistant" ? "assistant" : "user",
 						content: [{ type: "input_text", text: typeof message.content === "string" ? message.content : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") }] })),
-						tools: context.tools?.map((tool) => ({ type: "function", name: tool.name, parameters: tool.parameters, description: tool.description })) };
+						tools: view.tools.map((tool) => ({ type: "function", name: tool.name, parameters: tool.parameters, description: tool.description })) };
 					audit("provider-payload", { payload: await options?.onPayload?.(payload, model) ?? payload });
 				}
 				if (isChild() && scenario === "cancel") {
@@ -244,6 +239,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					Object.assign(args, { cmd: `cat '${file}'` });
 				}
 				const longReview = `LONG_REVIEW_BEGIN\n${"原始审查正文中文🔎\u2028".repeat(180)}\nLONG_REVIEW_END`;
+					const toolArguments = JSON.parse(JSON.stringify(args)) as ToolCall["arguments"];
 				const output: AssistantMessage = {
 					role: "assistant", api: model.api, provider: model.provider, model: model.id,
 					content: aborted ? [] : finished ? [{ type: "text", text: reviewChild && scenario.includes("structured-evidence") ? longReview
@@ -252,7 +248,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 					: !isChild() && delegate && scenario.endsWith("readonly-parallel") ? ["a", "b"].map((target) => ({ type: "toolCall", id: `parallel-${target}`, name: "delivery_readonly", arguments: { task: `读取 input-${target}.txt 并说明事实` } }))
 					: !isChild() && scenario === "structured-command-parallel" ? ["a", "b"].map((target) => ({ type: "toolCall", id: `command-${target}`, name: "exec_command", arguments: { cmd: `printf ORIGINAL_${target}`, yield_time_ms: 1000 } }))
 					: [...(reviewChild && scenario.endsWith("structured-evidence-fail") && step === 2 ? [{ type: "text" as const, text: longReview }] : []),
-						{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: args }],
+						{ type: "toolCall", id: planned?.id ?? (writer ? randomUUID() : `fixture-call-${calls}`), name: toolName, arguments: toolArguments }],
 					stopReason: aborted ? "aborted" : finished ? "stop" : "toolUse", timestamp: Date.now(),
 					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
