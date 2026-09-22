@@ -54,7 +54,7 @@ flowchart TD
 
 ## 快速开始
 
-Package 支持 npm 安装和本地路径，本版本为 `0.1.6`：
+Package 支持 npm 安装和本地路径，本版本为 `0.1.7`：
 
 ```sh
 pi install npm:pi-adaptive-delivery        # 全局：所有项目都加载
