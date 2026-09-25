@@ -23,7 +23,6 @@ export interface ReadOnlyEnvironment {
 	instructions: string;
 	rules: string;
 	skills: string;
-	structured?: { entry: string; version: string };
 }
 
 // 只核对 Pi 已加载的基础输入，不重新发现资源，也不将规则正文复制到握手记录。
@@ -39,7 +38,6 @@ export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, t
 
 export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?: ReadOnlyEnvironment): void {
 	const beforeSend = "\n子任务尚未发送；不得改用普通工具继续源码或测试写入。先核对环境和收尾状态，再决定是否重新委派。";
-	if (JSON.stringify(expected.structured) !== JSON.stringify(actual?.structured)) throw new Error("Structured 插件模式或来源未对齐，未发送任务" + beforeSend);
 	if (JSON.stringify(expected.tools) !== JSON.stringify(actual?.tools)) {
 		const parent = new Map(expected.tools.map((tool) => [tool.name, tool.digest]));
 		const child = new Map((actual?.tools ?? []).map((tool) => [tool.name, tool.digest]));
@@ -337,7 +335,6 @@ export async function startChild(input: ChildTask, kind: "readonly" | "developme
 		"--provider", input.model.provider, "--model", input.model.id, "--thinking", input.thinking,
 		"--tools", tools.join(","), input.projectTrusted ? "--approve" : "--no-approve",
 	], { cwd: input.cwd, env: { ...process.env, [CHILD_ENV]: kind === "development" ? "development" : "1",
-		PI_ADAPTIVE_DELIVERY_STRUCTURED: input.environment.structured ? "1" : "",
 		PI_ADAPTIVE_DELIVERY_READ_PATHS: JSON.stringify(input.readPaths ?? []) }, stdio: ["pipe", "pipe", "pipe"] }));
 }
 

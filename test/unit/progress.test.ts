@@ -158,17 +158,15 @@ test("在途输出按调用关联，累计工具更新不重复追加，结束�
 	assert.deepEqual(p.snapshot().pending, []);
 });
 
-test("Structured 工具返回 session_id 时仍显示真实命令，最终退出和取消不遗留运行状态", () => {
+test("命令工具返回 session_id 时仍显示真实命令，最终退出和取消不遗留运行状态", () => {
 	const p = createTaskProgress("s", "开发", "命令交回", () => {});
-	p.event({ type: "tool_execution_start", toolCallId: "cmd", toolName: "exec_command", args: { cmd: "node test.js" } });
-	p.event({ type: "tool_execution_end", toolCallId: "cmd", toolName: "exec_command", result: { details: { session_id: 123 } } });
-	assert.equal(p.snapshot().action, "正在执行：exec_command node test.js");
-	p.event({ type: "tool_execution_start", toolCallId: "poll", toolName: "write_stdin", args: { session_id: 123 } });
-	assert.equal(p.snapshot().action, "正在执行：exec_command node test.js");
-	p.event({ type: "tool_execution_end", toolCallId: "poll", toolName: "write_stdin", result: { details: { exit_code: 0 } } });
-	assert.equal(p.snapshot().action, "已完成：exec_command node test.js");
-	p.event({ type: "tool_execution_start", toolCallId: "patch", toolName: "apply_patch", args: { input: "*** Begin Patch\n*** Update File: src/a.ts\n" } });
-	assert.match(p.snapshot().action, /apply_patch src\/a.ts/);
+	p.event({ type: "tool_execution_start", toolCallId: "cmd", toolName: "command", args: { command: "node test.js" } });
+	p.event({ type: "tool_execution_end", toolCallId: "cmd", toolName: "command", result: { details: { session_id: 123 } } });
+	assert.equal(p.snapshot().action, "正在执行：command node test.js");
+	p.event({ type: "tool_execution_start", toolCallId: "poll", toolName: "poll", args: { session_id: 123 } });
+	assert.equal(p.snapshot().action, "正在执行：command node test.js");
+	p.event({ type: "tool_execution_end", toolCallId: "poll", toolName: "poll", result: { details: { exit_code: 0 } } });
+	assert.equal(p.snapshot().action, "已完成：command node test.js");
 	p.end(ABNORMAL_STATUS);
 	assert.ok(!p.snapshot().action.includes("正在执行"));
 });

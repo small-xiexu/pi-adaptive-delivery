@@ -31,7 +31,7 @@ test("不注册启动裁剪或 user_bash 拦截，所有普通工具交回 Pi �
 	const { handlers, tools } = host();
 	assert.equal(handlers.has("session_start"), false);
 	assert.equal(handlers.has("user_bash"), false);
-	for (const toolName of ["read", "edit", "write", "bash", "web_search", "fetch_content", "plugin_tool", "exec_command", "apply_patch", "unknown"]) {
+	for (const toolName of ["read", "edit", "write", "bash", "web_search", "fetch_content", "plugin_tool", "unknown"]) {
 		assert.equal(handlers.get("tool_call")!({ toolName }), undefined);
 	}
 	tools[0]!.sourceInfo.path = "/replacement/index.ts";

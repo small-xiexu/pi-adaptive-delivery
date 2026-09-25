@@ -1,7 +1,6 @@
 import { createEditTool, createWriteTool, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { fileURLToPath } from "node:url";
-import path from "node:path";
 import { Type } from "typebox";
 import { inheritedTools, installPolicy, CAPABILITY_NOTICE } from "./src/policy.ts";
 import { GIT_STATUS_TOOL, readGitStatus, getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "./src/workspace.ts";
@@ -10,7 +9,6 @@ import { installApprovals } from "./src/approvals.ts";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./src/parent-writer.ts";
 import { CHILD_ARM, DEVELOPMENT_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
 import { createTaskProgress, taskRenderers } from "./src/progress.ts";
-import { structuredPackage } from "./src/structured.ts";
 import { installTaskDetails } from "./src/task-details.ts";
 import { installStreamRetry } from "./src/stream-retry.ts";
 import { agentSelection, selectChildAgent } from "./src/agent-selection.ts";
@@ -31,7 +29,6 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	const child = Boolean(process.env[CHILD_ENV]);
 	const childDevelopment = process.env[CHILD_ENV] === "development" ? createChildDevelopment() : undefined;
 	let promptOptions: BuildSystemPromptOptions | undefined;
-	let structured: Awaited<ReturnType<typeof structuredPackage>>;
 	const readPaths = (ctx: ExtensionContext) => {
 		if (!promptOptions) throw new Error("本回合资源环境尚未核实");
 		const options = promptOptions;
@@ -49,15 +46,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 		}
 		return [...new Set(resources)];
 	};
-	const initializeStructured = async () => {
-		if (!structured && !pi.getActiveTools().includes("exec_command") && !process.env.PI_ADAPTIVE_DELIVERY_STRUCTURED) return;
-		if (!structured) structured = await structuredPackage(pi.getAllTools());
-	};
-	if (child) pi.on("session_start", initializeStructured);
-	const environment = (options: BuildSystemPromptOptions) => {
-		return { ...snapshotReadOnlyEnvironment(options, inheritedTools(pi, entryPath)),
-			...(structured ? { structured: { entry: path.join(structured.root, "dist", "index.js"), version: structured.version } } : {}) };
-	};
+	const environment = (options: BuildSystemPromptOptions) => snapshotReadOnlyEnvironment(options, inheritedTools(pi, entryPath));
 	installPolicy(pi, entryPath);
 	pi.on("session_start", () => { promptOptions = undefined; });
 	pi.on("before_agent_start", (event, ctx) => {
@@ -235,7 +224,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				ctx.ui.notify(`交付状态\n当前阶段：${stage}\n下一步：${next}`
 					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}）`).join("；")}` : "\n当前任务：无")
 					+ "\n详情：/delivery-tasks；诊断：/delivery-status details。"
-					+ (diagnostic ? `\n\n能力说明：沿用 Pi 原有工具与权限；交付工具只管理批准、委派、writer 和验收。\n工作区：${workspace.workspacePath}\n运行模式：${structured ? "Structured" : "原生 Pi"}\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。\n人工清理：/delivery-unlock（强制重置，不是安全释放）。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
+					+ (diagnostic ? `\n\n能力说明：沿用 Pi 原有工具与权限；交付工具只管理批准、委派、writer 和验收。\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。\n人工清理：/delivery-unlock（强制重置，不是安全释放）。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
 						+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("") : ""), "info");
 			} catch (error) {
 				ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");
@@ -243,7 +232,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 		},
 	});
 	return {
-		initialize: initializeStructured,
+		initialize: async () => {},
 		assertCanExit: async (ctx: ExtensionContext) => {
 			if (approvals.pending || active.size || (writer.pending && !writer.fault) || (developer.pending && !developer.fault)) {
 				throw new Error("交互或执行尚未收尾。请等待原始结果与写入权限交回，再重试 /delivery-exit。");

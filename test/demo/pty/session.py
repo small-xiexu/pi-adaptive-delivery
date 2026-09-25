@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """真机终端验证的可复用底座：真实 PTY + 真实 `pi` CLI + 终端屏幕模拟。
 
-只用标准库。被同目录的流程脚本（如 structured-full.py）导入使用，也可以单独当作
+只用标准库。被同目录的 `full.py` 导入使用，也可以单独当作
 交互式会话控制器：
 
     python3 session.py <root> [--drive]
@@ -30,8 +30,6 @@ import time
 PACKAGE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 PI = os.environ.get("PI_BIN") or shutil.which("pi") or "/opt/homebrew/bin/pi"
 USER_AGENT = os.path.join(os.path.expanduser("~"), ".pi", "agent")
-STRUCTURED_ADAPTER = os.environ.get("STRUCTURED_ADAPTER") or os.path.join(
-    USER_AGENT, "npm", "node_modules", "@howaboua", "pi-codex-conversion")
 
 
 class Screen:
@@ -246,12 +244,11 @@ def build(root, model="openai/gpt-5.6-sol", thinking="medium"):
         if os.path.exists(source):
             os.symlink(source, os.path.join(agent, name))
     provider, model_id = model.split("/")
-    adapter = os.environ.get("STRUCTURED_ADAPTER")
     if os.environ.get("PROBE_BASEURL"):
         with open(os.path.join(agent, "models.json"), "w", encoding="utf-8") as handle:
             handle.write(json.dumps({"providers": {provider: {"baseUrl": os.environ["PROBE_BASEURL"]}}}))
     settings = {
-        "packages": [adapter, PACKAGE] if adapter else [PACKAGE],
+        "packages": [PACKAGE],
         "defaultProvider": provider,
         "defaultModel": model_id,
         "defaultThinkingLevel": thinking,
@@ -259,12 +256,6 @@ def build(root, model="openai/gpt-5.6-sol", thinking="medium"):
         "httpIdleTimeoutMs": int(os.environ.get("IDLE_MS", "60000")),
         "retry": {"enabled": True, "maxRetries": 2},
     }
-    if adapter:
-        settings["defaultTools"] = ["read", "bash", "write", "edit", "grep", "find", "ls"]
-        with open(os.path.join(agent, "pi-codex-conversion.json"), "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"executionMode": "normal", "voiceFeaturesOnly": False,
-                "scope": {"allProviders": "on", "additionalProviders": []}, "voice": {"audioSetupCompleted": True},
-                "openai": {"forceCachedWebSockets": False, "cacheKeepalive": False, "lunaCacheKeepaliveMinutes": 0, "verbosity": "low"}}))
     with open(os.path.join(agent, "settings.json"), "w", encoding="utf-8") as handle:
         handle.write(json.dumps(settings, indent=2))
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME", "TZ")}

@@ -5,19 +5,19 @@
 | 文件 | 作用 |
 |---|---|
 | `session.py` | 可复用底座：PTY 会话 + 终端屏幕模拟、隔离 agent dir、demo 仓库生成 |
-| `structured-full.py` | Structured 环境（`@howaboua/pi-codex-conversion`）下的完整流程：一次方案确认并开始实施 → 委派开发 → 独立审查 → 返工 → 复审 → `/delivery-status` → `/delivery-tasks` → `/delivery-exit` |
+| `full.py` | 原生 Pi 环境下的完整流程：一次方案确认并开始实施 → 委派开发 → 独立审查 → 返工 → 复审 → `/delivery-status` → `/delivery-tasks` → `/delivery-exit` |
 | `gateway-proxy.mjs` | 停顿注入：第 1 个请求只发响应头后沉默，其余原样转发真网关，用于验证看门狗 |
 
 ## 运行
 
 ```bash
 # 完整流程（隔离根目录可指定，不指定则用临时目录）
-python3 test/demo/pty/structured-full.py /tmp/adaptive-pty-full
+python3 test/demo/pty/full.py /tmp/adaptive-pty-full
 
 # 停顿注入 + 看门狗：先起代理，再让流程指向它
 node test/demo/pty/gateway-proxy.mjs 8899 https://<你的网关> /tmp/gateway-proxy.log
 DEMO_PROXY_BASEURL=http://127.0.0.1:8899 PI_ADAPTIVE_STALL_MS=15000 \
-  python3 test/demo/pty/structured-full.py /tmp/adaptive-pty-stall
+  python3 test/demo/pty/full.py /tmp/adaptive-pty-stall
 ```
 
 产物都在隔离根目录：`run.log`（分阶段屏幕 + 判定）、`heartbeat.log`（进度心跳）、`raw.bin`（原始字节）、`agent/sessions/**`（父子会话记录，核对 `delivery_*` 调用链的地方）。
@@ -26,9 +26,9 @@ DEMO_PROXY_BASEURL=http://127.0.0.1:8899 PI_ADAPTIVE_STALL_MS=15000 \
 
 ## 真机环境的两条硬经验
 
-这两点曾让验证"看起来卡死"，实际都是插件 TUI 的输入处理，不是产品缺陷：
+这两点曾让验证"看起来卡死"，实际都是 Pi TUI 的输入处理，不是产品缺陷：
 
-1. **不能在一个写入里连发按键。** 一次写入 4 个上键，插件 TUI 只处理第 1 个 → 光标停在「提出修改意见」并进入意见输入态，面板看起来像卡住。正确做法是**一次一个按键，按完立刻校验光标位置**（见 `structured-full.py` 的 `accept()`）。
+1. **不能在一个写入里连发按键。** 一次写入 4 个上键，Pi TUI 只处理第 1 个 → 光标停在「提出修改意见」并进入意见输入态，面板看起来像卡住。正确做法是**一次一个按键，按完立刻校验光标位置**（见 `full.py` 的 `accept()`）。
 2. **回车可能被吞。** 首次回车常常不提交，本次实测第 5 次才被接受。正确做法是回车后**校验会话记录是否生成**，不成就重发（见 `send()`）。
 
 另外两点与产品无关但会影响验证：

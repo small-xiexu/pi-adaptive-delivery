@@ -3,9 +3,9 @@
 // 用 Pi 真实的 HTTP 路径（内置 deepseek provider 走 openai-completions），验证：
 //   1) httpIdleTimeoutMs 是否真的中断停顿（预期约等于配置值）；
 //   2) 中断后 Pi 是否自动重试并最终完成；
-//   3) 加 -plugin 参数时，加载 pi-codex-conversion 后上述行为是否仍然成立。
+//   3) 加 --watch 参数时，启用交付包后的停顿看门狗是否仍然成立。
 // 不调用真实模型、不读取、不复制、不打印任何凭证。
-// 用法：node --import tsx test/demo/idle-timeout-probe.ts [idleMs] [--plugin]
+// 用法：node --import tsx test/demo/idle-timeout-probe.ts [idleMs] [--watch]
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
@@ -16,9 +16,7 @@ import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, Ses
 
 const repo = await realpath(fileURLToPath(new URL("../../", import.meta.url)));
 const idleMs = Number(process.argv[2] ?? 5_000);
-const withPlugin = process.argv.includes("--plugin");
-const withWatch = process.env.PROBE_WATCH === "1";
-const adapter = path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", "@howaboua", "pi-codex-conversion");
+const withWatch = process.env.PROBE_WATCH === "1" || process.argv.includes("--watch");
 let stalls = Number(process.env.PROBE_STALLS ?? 1);
 const started = Date.now();
 const requests: { at: number; bytes: number; stalled: boolean }[] = [];
@@ -56,22 +54,15 @@ for (const file of ["auth.json", "models-store.json"]) {
 // 用户自己的 models.json 就是这么覆盖 baseUrl 的；这里把它指向本地假服务。
 await writeFile(path.join(agentDir, "models.json"), `${JSON.stringify({ providers: { deepseek: { baseUrl: `http://127.0.0.1:${port}/v1` } } }, null, 2)}\n`);
 execFileSync("git", ["init", "-q"], { cwd: root });   // 交付入口要求 Git 工作区
-const settings: Record<string, unknown> = { packages: withPlugin ? [adapter] : withWatch ? [repo] : [], defaultProvider: "deepseek", defaultModel: "deepseek-flash",
+const settings: Record<string, unknown> = { packages: withWatch ? [repo] : [], defaultProvider: "deepseek", defaultModel: "deepseek-flash",
 	httpIdleTimeoutMs: idleMs, retry: { enabled: true, maxRetries: 3, baseDelayMs: 300 }, compaction: { enabled: false } };
-if (withPlugin) settings.defaultTools = ["read", "bash", "write", "edit", "grep", "find", "ls"];
 await writeFile(path.join(agentDir, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`);
-if (withPlugin) {
-	await writeFile(path.join(agentDir, "pi-codex-conversion.json"), JSON.stringify({ executionMode: "normal", voiceFeaturesOnly: false,
-		scope: { allProviders: "on", additionalProviders: [] }, voice: { audioSetupCompleted: true },
-		openai: { forceCachedWebSockets: false, cacheKeepalive: false, lunaCacheKeepaliveMinutes: 0, verbosity: "low" } }));
-}
-
 const env = { ...process.env, HOME: path.join(root, "home"), TMPDIR: root, PI_CODING_AGENT_DIR: agentDir,
 	PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", DEEPSEEK_API_KEY: "probe-not-a-credential" };
 for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
 Object.assign(process.env, env);
 
-console.log(`模式：${withPlugin ? "加载 pi-codex-conversion" : withWatch ? "交付包 + 停顿看门狗" : "原生"} · httpIdleTimeoutMs=${idleMs} · 假服务 http://127.0.0.1:${port}/v1`);
+console.log(`模式：${withWatch ? "交付包 + 停顿看门狗" : "原生 Pi"} · httpIdleTimeoutMs=${idleMs} · 假服务 http://127.0.0.1:${port}/v1`);
 console.log(`（第一个请求只发响应头后沉默，之后正常回复"收到"）`);
 
 const timeline: string[] = [];

@@ -96,10 +96,9 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 		event(event: { type: string; [key: string]: any }) {
 			if (event.type === "tool_execution_start") {
 				const args = event.args ?? {};
-				const target = args.command ?? args.cmd ?? args.path ?? args.pattern ?? (event.toolName === "apply_patch" ? args.input?.match(/\*\*\* (?:Add|Update|Delete) File: ([^\n]+)/)?.[1] : undefined)
-					?? (args.session_id !== undefined ? `session ${args.session_id}` : "");
+				const target = args.command ?? args.cmd ?? args.path ?? args.pattern ?? "";
 				const detail = commands.get(args.session_id) ?? short(`${event.toolName}${target ? ` ${target}` : ""}`);
-				if (event.toolName === "write_stdin") polls.set(event.toolCallId, args.session_id);
+				if (typeof args.session_id === "number") polls.set(event.toolCallId, args.session_id);
 				open.set(event.toolCallId, detail);
 				pending.set(`call:${event.toolCallId}`, { id: `call:${event.toolCallId}`, callId: event.toolCallId, name: event.toolName, args, output: "" });
 				view.output = "";
@@ -110,7 +109,7 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 				open.delete(event.toolCallId);
 				pending.delete(`call:${event.toolCallId}`);
 				const session = event.result?.details?.session_id;
-				const running = !event.isError && ["exec_command", "write_stdin"].includes(event.toolName) && typeof session === "number";
+				const running = !event.isError && typeof session === "number";
 				if (running) commands.set(session, detail);
 				if (!event.isError && Number.isInteger(event.result?.details?.exit_code)) commands.delete(polls.get(event.toolCallId)!);
 				polls.delete(event.toolCallId);

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Structured 环境 + 真机终端的完整交付流程验证（一次方案确认并开始实施、开发、审查、返工、退出）。
+"""原生 Pi + 真机终端的完整交付流程验证（一次方案确认并开始实施、开发、审查、返工、退出）。
 
 用法：
-    python3 test/demo/pty/structured-full.py [隔离根目录]
+    python3 test/demo/pty/full.py [隔离根目录]
 
 环境变量：
     DEMO_MODEL        默认 openai/gpt-5.6-sol
@@ -12,8 +12,8 @@
 会在隔离根目录下生成 run.log（分阶段屏幕 + 判定）、heartbeat.log（进度心跳）、raw.bin（原始字节）。
 
 真机环境两条硬经验（都已在代码里处理，改动前请先读 test/demo/pty/README.md）：
-  1. 插件 TUI 会吞掉**同一写入里的连续按键** —— 面板导航必须一次一个键并校验光标；
-  2. 插件 TUI 会吞回车 —— 提交后必须校验会话记录是否生成，不成就重发。
+  1. Pi TUI 会吞掉**同一写入里的连续按键** —— 面板导航必须一次一个键并校验光标；
+  2. Pi TUI 会吞回车 —— 提交后必须校验会话记录是否生成，不成就重发。
 """
 import os
 import re
@@ -24,8 +24,6 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ.setdefault("STRUCTURED_ADAPTER", os.path.join(
-    os.path.expanduser("~"), ".pi", "agent", "npm", "node_modules", "@howaboua", "pi-codex-conversion"))
 os.environ.setdefault("IDLE_MS", "60000")
 import session as S  # noqa: E402
 
@@ -148,11 +146,11 @@ def accept(label=""):
 
 
 os.makedirs(ROOT, exist_ok=True)
-log(f"\n########## Structured 真机终端全程 · {time.strftime('%F %T')} · root={ROOT} · {COLS}x{ROWS} · {MODEL} ##########")
+log(f"\n########## 原生 Pi 真机终端全程 · {time.strftime('%F %T')} · root={ROOT} · {COLS}x{ROWS} · {MODEL} ##########")
 env = S.build(ROOT, MODEL, THINKING)
 env["PI_ADAPTIVE_STALL_MS"] = os.environ.get("PI_ADAPTIVE_STALL_MS", "15000")
 cwd = S.project(ROOT)
-log(f"工作区 {cwd}｜适配器 {os.environ['STRUCTURED_ADAPTER']}｜看门狗阈值 {env['PI_ADAPTIVE_STALL_MS']}ms")
+log(f"工作区 {cwd}｜原生 Pi｜看门狗阈值 {env['PI_ADAPTIVE_STALL_MS']}ms")
 log("settings: " + open(os.path.join(ROOT, "agent", "settings.json"), encoding="utf-8").read())
 driver = S.Driver(cwd, env, ROWS, COLS)
 try:
