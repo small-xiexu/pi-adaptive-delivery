@@ -66,11 +66,16 @@ test("独立进程留下的 lease 可由人工强制重置清理，之后能重�
 	const manager = new WriterLeaseManager(stateRoot);
 	assert.notEqual(await manager.read(workspace.key), undefined);
 	await assert.rejects(manager.assertIdle(workspace.key), /writer/);
+	const leaseOnly = await manager.inspectBlockage(workspace.key);
+	assert.equal(leaseOnly.operationLock, false);
+	assert.deepEqual(await manager.discard(workspace.key, leaseOnly), { lease: true, operationLock: false });
+	await manager.assertIdle(workspace.key);
+	assert.equal((await runContender(stateRoot, repo, "session-recovered")).ok, true);
 	// 操作锁残留由夹具构造：强杀正在锁内写入的进程无法在测试中稳定复现。
 	await mkdir(path.join(stateRoot, "leases", `${workspace.key}.operation-lock`));
 	const blockage = await manager.inspectBlockage(workspace.key);
 	assert.equal(blockage.operationLock, true);
 	assert.deepEqual(await manager.discard(workspace.key, blockage), { lease: true, operationLock: true });
 	await manager.assertIdle(workspace.key);
-	assert.equal((await runContender(stateRoot, repo, "session-recovered")).ok, true);
+	assert.equal((await runContender(stateRoot, repo, "session-recovered-again")).ok, true);
 });

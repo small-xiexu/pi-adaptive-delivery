@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { createDevelopmentHost as host } from "../support/development-host.ts";
 import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
+import { getWriterStateRoot, resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
 
 test("没有方案确认时不启动开发或审查子 Agent", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
@@ -36,6 +37,7 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
 	assert.match(JSON.stringify(reviewed.content), /独立验收和审查/);
 	assert.ok((reviewed.details as any).candidate.digest);
+	assert.equal((reviewed.details as any).reviewStatus, "valid");
 	assert.equal(await h.readLease(), undefined);
 	const sessions = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(sessions.length, 2);
@@ -46,9 +48,23 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	// 审查子看不到父会话里的例外授权，必须显式告知规划文档属于父维护、不算越界。
 	assert.match(JSON.stringify(reviewRequest.messages), /父维护的规划文档.*plan\.md/);
 	assert.ok(reviewRequest.tools.includes("write") && reviewRequest.tools.includes("edit") && reviewRequest.tools.includes("bash"));
+	const diffFile = (reviewed.details as any).diffFile as string;
+	await access(diffFile);
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const leaseDirectory = path.join(await getWriterStateRoot(workspace), "leases");
+	const blockedLease = path.join(leaseDirectory, `${workspace.key}.json`);
+	await mkdir(leaseDirectory, { recursive: true });
+	await writeFile(blockedLease, "broken");
+	await h.session.prompt("/delivery-exit");
+	await access(path.dirname(diffFile));
+	assert.ok(h.session.getActiveToolNames().includes("write"));
+	await rm(blockedLease);
+	await h.session.prompt("/delivery-exit");
+	await h.session.waitForIdle();
+	await assert.rejects(access(path.dirname(diffFile)), { code: "ENOENT" });
 });
 
-test("审查替身违反职责执行写入时，普通工具仍可用并记录实际候选", { timeout: 60_000 }, async (t) => {
+test("审查替身违反职责执行写入时，审查结论失效并记录实际候选", { timeout: 60_000 }, async (t) => {
 	const h = await host(t, "review-modifies");
 	await mkdir(path.join(h.cwd, "src"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
@@ -56,10 +72,10 @@ test("审查替身违反职责执行写入时，普通工具仍可用并记录�
 	assert.equal((await h.call("delivery_develop", { task: "把 src/value.js 的 value 修改为 2。", paths: ["src"], inputs: [] })).isError, false);
 	// fake provider 刻意执行写入，验证代码层没有按审查角色裁剪权限。
 	const reviewed = await h.call("delivery_review", { task: "独立检查实现并报告问题，修复交给父 Pi。", paths: ["src"], inputs: [] });
-	assert.equal(reviewed.isError, false, JSON.stringify(reviewed));
+	assert.equal(reviewed.isError, true, JSON.stringify(reviewed));
+	assert.match(JSON.stringify(reviewed.content), /未形成有效结论.*候选发生变化/);
+	assert.match(JSON.stringify(reviewed.content), /不能用于判断当前候选/);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
-	assert.ok((reviewed.details as any).candidate.digest);
-	assert.ok((reviewed.details as any).diffFile);
 	assert.equal(await h.readLease(), undefined);
 });
 

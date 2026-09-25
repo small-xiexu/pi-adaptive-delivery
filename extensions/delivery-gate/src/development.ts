@@ -90,7 +90,7 @@ interface DevelopmentRun extends SessionBinding {
 	readonlyReference?: Record<string, unknown>;
 	readonlyStarted?: boolean;
 	readonlyTerminal?: string;
-	review?: { result: Awaited<ReturnType<typeof delegateReadOnly>>; artifact: Awaited<ReturnType<typeof prepareReview>>; candidate: CandidateSnapshot };
+	review?: { result: Awaited<ReturnType<typeof delegateReadOnly>>; artifact: Awaited<ReturnType<typeof prepareReview>>; initialCandidate: CandidateSnapshot; candidate: CandidateSnapshot; changed: boolean };
 	problem?: unknown;
 	fault?: string;
 	run?: Promise<AgentToolResult<unknown>>;
@@ -216,8 +216,9 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					const result = await delegateReadOnly({ ...input, readPaths: [...(input.readPaths ?? []), artifact.directory], task: reviewTask }, running,
 						(data) => { if (data.phase === "started") state.readonlyStarted = true; state.readonlyReference = snapshot({ ...data, approvalId: grant.approvalId, designApprovalId: grant.approvalId, reviewDirectory: artifact.directory }); pi.appendEntry(DELEGATION_ENTRY, state.readonlyReference); }, update, ctx, progress, "review");
 					const finalCandidate = await captureCandidate(scope, running);
-					const finalArtifact = finalCandidate.digest === candidate.digest ? artifact : await prepareReview(scope, finalCandidate);
-					state.review = { result, artifact: finalArtifact, candidate: finalCandidate };
+					const changed = finalCandidate.digest !== candidate.digest;
+					const finalArtifact = changed ? await prepareReview(scope, finalCandidate) : artifact;
+					state.review = { result, artifact: finalArtifact, initialCandidate: candidate, candidate: finalCandidate, changed };
 				} else {
 					const rpc = state.rpc = await startChild(input, "development");
 					const interrupt = new AbortController();
@@ -260,8 +261,21 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.problem) throw state.problem;
 				if (state.review) {
 					const review = state.review;
-					progress.end(COMPLETED_STATUS);
-					const result = { content: [{ type: "text" as const, text: [`审查执行已结束；独立验收和审查结论见下文，最终由父 Pi 对照实际命令结果和当前候选核对，不自动等于交付通过（修复方式：单文件且不改对外行为契约的由父 Pi 直接改并复跑检查；多文件或金额、并发、权限等边界问题重新委派 delivery_develop）：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n") }], details: { candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() } };
+					progress.end(review.changed ? ABNORMAL_STATUS : COMPLETED_STATUS, review.changed ? "审查期间候选发生变化，原审查结论失效" : undefined);
+					const text = review.changed
+						? [
+							"审查执行已结束，但未形成有效结论：审查期间候选发生变化。",
+							`审查开始候选：${review.initialCandidate.digest}`,
+							`审查结束候选：${review.candidate.digest}`,
+							"审查正文只对应审查开始时的候选，不能用于判断当前候选。工作区未自动回滚，请父 Pi 核对当前变更后重新调用 delivery_review。",
+							`审查原始记录：${review.result.sessionFile}`,
+							`当前候选制品：${review.artifact.directory}`,
+							`当前差异：${review.artifact.diffFile}`,
+						].join("\n")
+						: [`审查执行已结束；独立验收和审查结论见下文，最终由父 Pi 对照实际命令结果和当前候选核对，不自动等于交付通过（修复方式：单文件且不改对外行为契约的由父 Pi 直接改并复跑检查；多文件或金额、并发、权限等边界问题重新委派 delivery_develop）：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n");
+					if (review.changed) throw new Error(text);
+					const details = { reviewStatus: "valid", candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, progress: progress.snapshot() };
+					const result = { content: [{ type: "text" as const, text }], details };
 					state.result = snapshot({ ...result, isError: false });
 					return result;
 				}

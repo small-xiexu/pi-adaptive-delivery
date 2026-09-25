@@ -33,6 +33,24 @@ test("正式 Package 进入和退出均保留 RPC Shell，交付批准独立处�
 	t.diagnostic(JSON.stringify({ root: f.root, pid: f.rpc.process.pid }));
 });
 
+test("后续子任务不默认读取父 Session 和历史委派记录", { timeout: 40_000 }, async (t) => {
+	const fixture = await createPiFixture(source);
+	t.after(() => fixture.rpc.stop());
+	const run = async (plannedId?: string) => {
+		const from = fixture.rpc.records.length;
+		if (plannedId) await fixture.rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id: plannedId, name: "delivery_readonly", arguments: { task: "读取当前输入并提供独立证据" } })}` });
+		await fixture.rpc.send("prompt", { message: "fixture-delegate" });
+		await fixture.rpc.waitFor((record) => record.type === "agent_settled", from);
+	};
+	await run();
+	await run("second-readonly");
+	const events = (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	const children = events.filter((event) => event.child && event.phase === "start");
+	assert.equal(children.length, 2, JSON.stringify(children));
+	for (const child of children) assert.ok(child.readPaths.every((value: string) => !value.endsWith(".jsonl")), JSON.stringify(child.readPaths));
+	t.diagnostic(JSON.stringify({ root: fixture.root, pid: fixture.rpc.process.pid, readPaths: children.map((child) => child.readPaths) }));
+});
+
 test("npm tarball 在无 node_modules 的隔离目录加载完整自有资源并执行真实 Pi", { timeout: 40_000 }, async (t) => {
 	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "adaptive-pack-")));
 	const stage = path.join(root, "stage");

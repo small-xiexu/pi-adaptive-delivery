@@ -7,7 +7,8 @@ import { GIT_STATUS_TOOL, readGitStatus, getWriterStateRoot, resolveWorkspaceIde
 import { CHILD_ENV, CHILD_READY, CHILD_EXIT, CHILD_STOP, DELEGATE_TOOL, DELEGATION_ENTRY, delegateReadOnly, snapshotReadOnlyEnvironment } from "./src/subagents.ts";
 import { installApprovals } from "./src/approvals.ts";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./src/parent-writer.ts";
-import { CHILD_ARM, DEVELOPMENT_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
+import { CHILD_ARM, DEVELOPMENT_ENTRY, DEVELOPMENT_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
+import { cleanupReviewArtifacts } from "./src/review.ts";
 import { createTaskProgress, taskRenderers } from "./src/progress.ts";
 import { installTaskDetails } from "./src/task-details.ts";
 import { installStreamRetry } from "./src/stream-retry.ts";
@@ -32,18 +33,9 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	const readPaths = (ctx: ExtensionContext) => {
 		if (!promptOptions) throw new Error("本回合资源环境尚未核实");
 		const options = promptOptions;
+		// 子只接收本回合基础规则、Skills 和调用方明确加入的当前证据；不默认暴露父 Session 或历史委派记录。
 		const resources = [...(options.contextFiles ?? []).map((file) => file.path), ...(options.skills ?? []).map((skill) => skill.baseDir)];
-		// 子只接收父明确给定的证据；自身 Session 仍在追加，收尾后由父按委派引用读取。
-		if (!child && ctx.sessionManager.getSessionFile()) resources.push(ctx.sessionManager.getSessionFile()!);
 		if (child) resources.push(...JSON.parse(process.env.PI_ADAPTIVE_DELIVERY_READ_PATHS ?? "[]"));
-		for (const entry of ctx.sessionManager.getEntries()) {
-			if (entry.type === "custom" && [DELEGATION_ENTRY, "delivery-development"].includes(entry.customType)) {
-				const data = entry.data as { sessionFile?: string; childSessionFile?: string; reviewDirectory?: string };
-				if (data.sessionFile) resources.push(data.sessionFile);
-				if (data.childSessionFile) resources.push(data.childSessionFile);
-				if (data.reviewDirectory) resources.push(data.reviewDirectory);
-			}
-		}
 		return [...new Set(resources)];
 	};
 	const environment = (options: BuildSystemPromptOptions) => snapshotReadOnlyEnvironment(options, inheritedTools(pi, entryPath));
@@ -245,6 +237,15 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 			const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 			try { await leases.assertIdle(workspace.key); }
 			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 若确认是残留记录，再用 /delivery-unlock 强制清理。`); }
+		},
+		cleanup: async (ctx: ExtensionContext) => {
+			const directories = ctx.sessionManager.getEntries().flatMap((entry) => {
+				if (entry.type !== "custom" || ![DELEGATION_ENTRY, DEVELOPMENT_ENTRY].includes(entry.customType)) return [];
+				const directory = (entry.data as { reviewDirectory?: unknown }).reviewDirectory;
+				return typeof directory === "string" ? [directory] : [];
+			});
+			const result = await cleanupReviewArtifacts(directories);
+			if (result.failed.length) throw new Error(`审查制品清理失败：${result.failed.join("；")}`);
 		},
 	};
 }

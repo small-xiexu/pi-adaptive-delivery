@@ -40,7 +40,7 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	});
 	pi.on("session_start", (_event, ctx) => {
 		audit("start", { sessionId: ctx.sessionManager.getSessionId(), commands: pi.getCommands().map((command) => command.name),
-			tools: pi.getAllTools().map((tool) => tool.name) });
+			tools: pi.getAllTools().map((tool) => tool.name), ...(isChild() ? { readPaths: JSON.parse(process.env.PI_ADAPTIVE_DELIVERY_READ_PATHS ?? "[]") } : {}) });
 		if (isChild() && scenario === "missing-tools") pi.setActiveTools([]);
 		if (isChild() && ["development-selection-mismatch", "development-selection-mismatch-stop-error"].includes(scenario)) pi.setThinkingLevel("low");
 		if (isChild() && scenario === "boot-failure") process.exit(13);

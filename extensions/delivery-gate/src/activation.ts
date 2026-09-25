@@ -5,7 +5,7 @@ import { resolveWorkspaceIdentity } from "./workspace.ts";
 
 const ENTRY = "delivery-activation";
 type Activation = { enabled: boolean; tools?: string[] };
-type Runtime = { initialize(): Promise<void>; assertCanExit(ctx: ExtensionContext): Promise<void> };
+type Runtime = { initialize(): Promise<void>; assertCanExit(ctx: ExtensionContext): Promise<void>; cleanup?(ctx: ExtensionContext): Promise<void> };
 
 function prioritizeDeliveryShape(suggestions: AutocompleteSuggestions | null): AutocompleteSuggestions | null {
 	if (!suggestions) return suggestions;
@@ -108,7 +108,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 				return;
 			}
 			changing = true;
-			try { await runtime.assertCanExit(ctx); }
+			try { await runtime.assertCanExit(ctx); await runtime.cleanup?.(ctx); }
 			catch (error) {
 				changing = false;
 				ctx.ui.notify(`暂不能退出交付：${String(error)}`, "warning");

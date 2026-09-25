@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,12 +12,42 @@ const within = (root: string, file: string) => {
 	const relative = path.relative(root, file);
 	return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 };
+const REVIEW_PREFIX = "adaptive-review-";
+const reviewDirectories = new Set<string>();
+
+export async function cleanupReviewArtifacts(paths: readonly string[] = []) {
+	const temporary = await realpath(os.tmpdir());
+	const candidates = new Set([...reviewDirectories, ...paths]);
+	const failed: string[] = [];
+	let removed = 0;
+	for (const value of candidates) {
+		if (typeof value !== "string" || !path.isAbsolute(value)) { failed.push(`${String(value)}：不是绝对路径`); continue; }
+		const directory = path.resolve(value);
+		if (path.dirname(directory) !== temporary || !path.basename(directory).startsWith(REVIEW_PREFIX)) {
+			failed.push(`${directory}：不是 Package 创建的临时审查目录`);
+			continue;
+		}
+		try {
+			const info = await lstat(directory);
+			if (info.isSymbolicLink() || !info.isDirectory()) { failed.push(`${directory}：不是普通目录`); continue; }
+			await rm(directory, { recursive: true, force: true });
+			reviewDirectories.delete(value);
+			reviewDirectories.delete(directory);
+			removed++;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") { reviewDirectories.delete(value); reviewDirectories.delete(directory); continue; }
+			failed.push(`${directory}：${String(error)}`);
+		}
+	}
+	return { removed, failed };
+};
 
 export async function prepareReview(scope: CandidateScope, candidate: CandidateSnapshot) {
 	const root = scope.workspace.workspacePath;
 	const temporary = await realpath(os.tmpdir());
 	if (within(root, temporary)) throw new Error("审查制品临时目录必须在被审查 worktree 之外");
-	const directory = await mkdtemp(path.join(temporary, "adaptive-review-"));
+	const directory = await mkdtemp(path.join(temporary, REVIEW_PREFIX));
+	reviewDirectories.add(directory);
 	const env = { PATH: "/usr/bin:/bin", HOME: directory, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null",
 		GIT_CONFIG_GLOBAL: "/dev/null", GIT_ATTR_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" };
 	const git = async (args: string[], cwd: string, allowOne = false) => {
