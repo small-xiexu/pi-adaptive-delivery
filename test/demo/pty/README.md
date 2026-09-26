@@ -5,12 +5,16 @@
 | 文件 | 作用 |
 |---|---|
 | `session.py` | 可复用底座：PTY 会话 + 终端屏幕模拟、隔离 agent dir、demo 仓库生成 |
+| `test_session.py` | 屏幕模拟器 alternate screen 隔离回归测试 |
 | `full.py` | 原生 Pi 环境下的完整流程：一次方案确认并开始实施 → 委派开发 → 独立审查 → 返工 → 复审 → `/delivery-status` → `/delivery-tasks` → `/delivery-exit` |
 | `gateway-proxy.mjs` | 停顿注入：第 1 个请求只发响应头后沉默，其余原样转发真网关，用于验证看门狗 |
 
 ## 运行
 
 ```bash
+# 屏幕模拟器的确定性回归测试
+python3 -m unittest discover -s test/demo/pty -p 'test_*.py'
+
 # 完整流程（隔离根目录可指定，不指定则用临时目录）
 python3 test/demo/pty/full.py /tmp/adaptive-pty-full
 
@@ -35,6 +39,9 @@ DEMO_PROXY_BASEURL=http://127.0.0.1:8899 PI_ADAPTIVE_STALL_MS=15000 \
 
 3. **页脚会每 15 秒刷新**（token 计数、spinner），所以"等屏幕静止"不能看原始字节，要看**去掉底部页脚后的正文**（见 `Driver.transcript()` 与 `wait_quiet()`）。
 4. **上游内容过滤会偶发误判**：同一段文本可能返回 `invalid_prompt`（不是本包的问题，Pi 也不会重试它）。验证脚本对这种情况会自动重投。
+
+5. **终端 alternate screen 必须隔离。** Pi 进入 `CSI ?1049h`/`?1047h` 时会切换到新的屏幕缓冲区；模拟器会在进入时清空临时屏幕、退出时恢复主屏幕，避免关闭方案面板后把旧文字误判为当前 UI。该边界由 `test_session.py` 回归覆盖。
+6. **退出命令必须有收尾证据。** `/delivery-exit` 的回车通过当前反馈重试；首次被收尾门禁拒绝时先等待回合空闲再重试，驱动器不自动调用 `/delivery-unlock`，结束时先优雅终止 Pi，超时才强制回收。
 
 ## 写入安全（重要）
 

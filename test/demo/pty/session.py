@@ -20,6 +20,7 @@ import os
 import pty
 import re
 import select
+import signal
 import shutil
 import struct
 import subprocess
@@ -41,6 +42,9 @@ class Screen:
     def __init__(self, rows, cols):
         self.rows, self.cols = rows, cols
         self.grid = [[" "] * cols for _ in range(rows)]
+        self._primary_grid = self.grid
+        self._using_alternate = False
+        self._saved_cursor = (0, 0)
         self.row = self.col = 0
         self.pending = ""
 
@@ -105,8 +109,10 @@ class Screen:
                 continue
             csi = self.CSI.match(data, index)
             if csi:
-                params = [int(p) for p in csi.group(1).replace("?", "").split(";") if p.isdigit()]
-                self._control(csi.group(2), params)
+                parameter_text = csi.group(1)
+                private = parameter_text.startswith("?")
+                params = [int(p) for p in parameter_text.replace("?", "").split(";") if p.isdigit()]
+                self._control(csi.group(2), params, private=private)
                 index = csi.end()
                 continue
             if data[index:index + 2] == "\x1b]" or len(data) - index <= 2:
@@ -114,8 +120,26 @@ class Screen:
                 return
             index += 3 if data[index + 1] in "()[]#%" else 2
 
-    def _control(self, final, params):
+    def _control(self, final, params, private=False):
         first = params[0] if params else None
+        if private and final in ("h", "l") and any(value in (47, 1047, 1049) for value in params):
+            if final == "h" and not self._using_alternate:
+                self._primary_grid = self.grid
+                self._saved_cursor = (self.row, self.col)
+                self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                self.row = self.col = 0
+                self._using_alternate = True
+            elif final == "l" and self._using_alternate:
+                self.grid = self._primary_grid
+                self.row, self.col = self._saved_cursor
+                self._using_alternate = False
+            return
+        if private and final in ("h", "l") and 1048 in params:
+            if final == "h":
+                self._saved_cursor = (self.row, self.col)
+            else:
+                self.row, self.col = self._saved_cursor
+            return
         if final in ("H", "f"):
             self.row = max(0, min(self.rows - 1, (params[0] if params else 1) - 1))
             self.col = max(0, min(self.cols - 1, (params[1] if len(params) > 1 else 1) - 1))
@@ -166,6 +190,7 @@ class Driver:
             os.chdir(cwd)
             os.execve(PI, [PI], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self._waited = False
 
     def pump(self, quiet=0.5, timeout=3.0):
         """读到安静为止；返回时屏幕已包含这段时间的全部输出。"""
@@ -224,11 +249,36 @@ class Driver:
                 return True
         return False
 
-    def close(self):
+    def close(self, grace=5.0):
+        """先请求 Pi 正常退出，超时后才强制结束并回收子进程。"""
+        if self._waited:
+            return
         try:
-            os.kill(self.pid, 9)
+            os.kill(self.pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass
+            self.closed = True
+        deadline = time.time() + grace
+        waited = False
+        while time.time() < deadline:
+            try:
+                child, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                child = self.pid
+            if child == self.pid:
+                waited = True
+                break
+            time.sleep(0.05)
+        if not waited:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self.pid, 0)
+            except ChildProcessError:
+                pass
+        self._waited = True
+        self.closed = True
 
 
 def build(root, model="openai/gpt-5.6-sol", thinking="medium"):
