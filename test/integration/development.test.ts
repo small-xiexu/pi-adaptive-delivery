@@ -5,6 +5,7 @@ import test from "node:test";
 import { createDevelopmentHost as host } from "../support/development-host.ts";
 import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
+import { EXECUTION_PATH_ENTRY } from "../../extensions/delivery-gate/src/execution-path.ts";
 
 test("没有方案确认时不启动开发或审查子 Agent", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
@@ -24,7 +25,30 @@ test("复杂开发由独立子 Agent 完成并核实 writer 收尾", { timeout: 
 	const child = (await h.audit()).find((row) => row.child && row.phase === "start");
 	assert.ok(child);
 	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+	const paths = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === EXECUTION_PATH_ENTRY).map((row: any) => row.data);
+	assert.ok(paths.some((row: any) => row.path === "delivery_develop" && row.phase === "started"));
+	assert.ok(paths.some((row: any) => row.path === "delivery_develop" && row.phase === "ended" && row.status === "completed"));
 });
+
+test("父 Pi 直改节点记录 parent_direct，状态详情显示声明但不冒充完成", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	await h.prepare();
+	const result = await h.call("delivery_path", { node: "局部配置迁移", reason: "只改一个调用点，父上下文连续且可立即检查", independentReview: true });
+	assert.equal(result.isError, false, JSON.stringify(result));
+	const record = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === EXECUTION_PATH_ENTRY);
+	assert.ok(record?.type === "custom");
+	const data = record.data as any;
+	assert.equal(data.path, "parent_direct");
+	assert.equal(data.phase, "declared");
+	assert.equal(data.independentReview, true);
+	await h.session.prompt("/delivery-status");
+	assert.match(h.notices.at(-1)!, /交付已启用，当前无在途任务/);
+	await h.session.prompt("/delivery-status details");
+	assert.match(h.notices.at(-1)!, /parent_direct.*局部配置迁移/);
+	assert.match(h.notices.at(-1)!, /父 Pi 已声明/);
+	assert.match(h.notices.at(-1)!, /不代表已执行/);
+});
+
 
 test("审查子收到检查报告职责，同时继承普通写入工具", { timeout: 60_000 }, async (t) => {
 	const h = await host(t, "review-normal");
@@ -38,6 +62,9 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	assert.match(JSON.stringify(reviewed.content), /独立验收和审查/);
 	assert.ok((reviewed.details as any).candidate.digest);
 	assert.equal((reviewed.details as any).reviewStatus, "valid");
+	const paths = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === EXECUTION_PATH_ENTRY).map((row: any) => row.data);
+	assert.ok(paths.some((row: any) => row.path === "delivery_develop"));
+	assert.ok(paths.some((row: any) => row.path === "delivery_review" && row.phase === "ended" && row.status === "completed"));
 	assert.equal(await h.readLease(), undefined);
 	const sessions = (await h.audit()).filter((row) => row.child && row.phase === "start");
 	assert.equal(sessions.length, 2);
@@ -75,6 +102,7 @@ test("审查替身违反职责执行写入时，审查结论失效并记录实�
 	assert.equal(reviewed.isError, true, JSON.stringify(reviewed));
 	assert.match(JSON.stringify(reviewed.content), /未形成有效结论.*候选发生变化/);
 	assert.match(JSON.stringify(reviewed.content), /不能用于判断当前候选/);
+	assert.match(JSON.stringify((reviewed.details as any).executionFacts), /readonlySessionPersisted.*true/);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
 	assert.equal(await h.readLease(), undefined);
 });

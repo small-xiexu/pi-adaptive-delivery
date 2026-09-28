@@ -9,7 +9,14 @@ import path from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { createReadTool, type BuildSystemPromptOptions, type ExtensionUIContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import test from "node:test";
-import { ChildRpc, createChildDialogs, delegateReadOnly, parseReadOnlySession, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
+import { ChildRpc, createChildDialogs, delegateReadOnly, parseReadOnlySession, persistedAssistantFacts, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
+
+test("持久模型终态事实保留 Provider 原始错误，不把不同失败合并成一个原因", () => {
+	assert.equal(persistedAssistantFacts({ stopReason: "error", errorMessage: "upstream_http2_stream_error" }), "模型终态：error\n模型原始错误：upstream_http2_stream_error");
+	assert.equal(persistedAssistantFacts({ stopReason: "aborted" }), "模型终态：aborted\n模型原始错误：无");
+	assert.match(persistedAssistantFacts(undefined), /模型终态：未取得/);
+});
+
 
 test("只读持久结果拒绝截断、关闭记录重复、归属不符及关闭后消息，保留 Unicode 正文", () => {
 	const rows = [{ type: "session", id: "session" },

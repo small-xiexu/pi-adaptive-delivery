@@ -25,6 +25,12 @@ export interface ReadOnlyEnvironment {
 	skills: string;
 }
 
+export function persistedAssistantFacts(message: any): string {
+	const stopReason = typeof message?.stopReason === "string" ? message.stopReason : "未取得";
+	const errorMessage = typeof message?.errorMessage === "string" && message.errorMessage.trim() ? message.errorMessage.trim().slice(0, 2000) : "无";
+	return `模型终态：${stopReason}\n模型原始错误：${errorMessage}`;
+}
+
 // 只核对 Pi 已加载的基础输入，不重新发现资源，也不将规则正文复制到握手记录。
 export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, tools: ToolInfo[]): ReadOnlyEnvironment {
 	const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -387,6 +393,7 @@ export async function delegateReadOnly(
 	let state: RpcSessionState | undefined;
 	let text: string | null = null;
 	let toolNotes: ReturnType<typeof summarizeToolErrors>;
+	let terminalFacts = "模型终态：未取得\n模型原始错误：未取得";
 	let problem: unknown;
 	let stopped = false;
 	let recordProblem: unknown;
@@ -422,8 +429,8 @@ export async function delegateReadOnly(
 			const rows = parseReadOnlySession(await readFile(state.sessionFile, "utf8"), state.sessionId, rpc.process.pid!);
 			recordedClose = true;
 			toolNotes = summarizeToolErrors(rows);
-			// 最终正文只从已关闭进程的原生记录取得，不把 RPC 内存读回当成落盘证明。
 			const last = rows.findLast((row) => row.type === "message" && row.message?.role === "assistant")?.message;
+			terminalFacts = persistedAssistantFacts(last);
 			if (last?.stopReason !== "stop") throw new Error("子任务没有正常完成的持久模型终态");
 			text = last.content.filter((item: any) => item.type === "text").map((item: any) => item.text).join("").trim();
 			if (!text) throw new Error("子任务没有可核对的最终正文");
@@ -438,6 +445,7 @@ export async function delegateReadOnly(
 		+ (state?.sessionFile ? `\n原始子 Session：${state.sessionFile}` : "\n子 Session 引用尚未取得。")
 		+ `\n进程收尾：${stopped && rpc.exit?.code === 0 && rpc.exit.signal === null && !rpc.failure ? "已正常关闭" : "未核实正常关闭"}；工具终态：${rpc.openTools.size ? "仍有未确认执行" : "无在途工具"}。`
 		+ `\n持久关闭记录：${recordedClose ? "已核实" : "未核实"}。${recordProblem ? `记录核对：${String(recordProblem)}` : ""}`
+		+ `\n${terminalFacts}`
 		+ `\n父 Session ID：${input.parentSessionId}\n本次工具调用：${input.id}`
 		+ "\n此结果仍为失败；先读取已有原始证据，不据此自动重试或放宽权限。", { cause: problem });
 	const output = truncateHead(text!);

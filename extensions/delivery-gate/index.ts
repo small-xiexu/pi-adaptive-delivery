@@ -15,6 +15,7 @@ import { installStreamRetry } from "./src/stream-retry.ts";
 import { agentSelection, selectChildAgent } from "./src/agent-selection.ts";
 import { installActivation } from "./src/activation.ts";
 import { installStallWatch } from "./src/stall-watch.ts";
+import { deliveryStage, formatExecutionPaths, installExecutionPath } from "./src/execution-path.ts";
 
 export default function adaptiveDelivery(pi: ExtensionAPI): void {
 	if (process.env[CHILD_ENV]) { installDelivery(pi); return; }
@@ -77,6 +78,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
 	const tasks = () => [...active.values()].map((item) => item.progress.snapshot()).concat(developer.progress ? [developer.progress] : []);
 	const openTask = installTaskDetails(pi, tasks, initialContext);
+	installExecutionPath(pi, approvals);
 	pi.registerTool({ name: GIT_STATUS_TOOL, label: "Git 现状",
 		description: "固定只读查询当前 worktree 的分支、HEAD、暂存/未暂存及未跟踪改动，路径按 JSON 转义。无 HEAD 或 detached 明确返回 null。最多读取 50 KiB，超限报错，不隐藏改动；没有命令或路径参数，不获取源码差异、不产生批准。",
 		parameters: Type.Object({}, { additionalProperties: false }),
@@ -206,17 +208,18 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const inherited = diagnostic ? inheritedTools(pi, entryPath).map((tool) => tool.name) : [];
 				const executing = running.filter((task) => !task.endedAt);
 				const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
-				let stage = approvals.confirmedStage === "design" ? "实施进行中" : "等待方案确认";
-				let next = approvals.confirmedStage === "design" ? "按内部实施计划核对实际改动、检查命令和审查结果。" : "整理方案并调用 delivery_approval 确认；中断后用 /delivery-resume 继续审阅。";
+				let stage = deliveryStage(approvals.confirmedStage === "design", !ctx.isIdle(), ctx.hasPendingMessages());
+				let next = approvals.confirmedStage === "design" ? "按内部实施计划核对实际改动、检查命令和审查结果；完成后退出交付。" : "整理方案并调用 delivery_approval 确认；中断后用 /delivery-resume 继续审阅。";
 				if (approvals.pending) next = "在当前审阅面板选择确认、提出意见或暂停。";
-				if (executing.length) next = "等待当前任务收尾，再核对检查结论。";
+				if (executing.length) { if (approvals.confirmedStage === "design") stage = "实施进行中"; next = "等待当前任务收尾，再核对检查结论。"; }
+				else if (!ctx.isIdle() || ctx.hasPendingMessages()) next = "等待父 Pi 回合和排队消息收尾，再核对结果。";
 				else if (writer.fault || developer.fault) { stage = "需要核对未收尾的执行"; next = "用 /delivery-status details 查看证据；确认残留后用 /delivery-unlock 清理。"; }
 				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，暂不重放任务。"; }
 				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "先核对原执行的收尾证据；证据不足时暂停写入，不自动解锁。"; }
 				ctx.ui.notify(`交付状态\n当前阶段：${stage}\n下一步：${next}`
-					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}）`).join("；")}` : "\n当前任务：无")
+					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}）`).join("；")}` : !ctx.isIdle() ? "\n当前任务：父 Pi 回合运行中（无交付子任务）" : ctx.hasPendingMessages() ? "\n当前任务：等待排队消息" : "\n当前任务：无")
 					+ "\n详情：/delivery-tasks；诊断：/delivery-status details。"
-					+ (diagnostic ? `\n\n能力说明：沿用 Pi 原有工具与权限；交付工具只管理批准、委派、writer 和验收。\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。\n人工清理：/delivery-unlock（强制重置，不是安全释放）。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
+					+ (diagnostic ? `\n\n能力说明：沿用 Pi 原有工具与权限；交付工具只管理批准、委派、writer 和验收。\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n执行路径：\n${formatExecutionPaths(ctx.sessionManager.getBranch(), running)}\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。\n人工清理：/delivery-unlock（强制重置，不是安全释放）。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
 						+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("") : ""), "info");
 			} catch (error) {
 				ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");

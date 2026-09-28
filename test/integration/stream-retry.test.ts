@@ -92,6 +92,13 @@ for (const kind of ["once", "exhausted", "disabled"]) test(`真实开发 CLI 子
 	await h.prepare();
 	const result = await h.call("delivery_develop", { task: "创建、编辑并读回 src/value.js，断流后沿原记录继续。", paths: ["src"], inputs: [] });
 	assert.equal(result.isError, kind !== "once", JSON.stringify(result));
+	if (kind === "exhausted") {
+		const text = result.content.map((part: any) => part.type === "text" ? part.text : "").join("\n");
+		assert.match(text, /模型终态：error/);
+		assert.match(text, /stream_read_error/);
+		assert.match(JSON.stringify((result.details as any).executionFacts), /childSessionPersisted.*true/);
+		assert.match(JSON.stringify((result.details as any).executionFacts), /toolErrors/);
+	}
 	const ref = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-development") as any;
 	const rows = await disk(ref.data.childSessionFile);
 	assert.equal(errors(rows).length, kind === "exhausted" ? 3 : 1);
