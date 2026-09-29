@@ -154,8 +154,8 @@ sequenceDiagram
 | `/delivery-status details` | 查看工作区、运行模式、沿用工具、lease、状态目录和原始子 Session 等诊断信息 | 进入交付后排查问题；未进入时只提示当前状态 |
 | `/delivery-tasks [任务ID]` | 选择子任务、看实时输出；带 ID 时直接打开对应详情 | 进入交付后，在主 Pi 终端查看当前会话分支的任务 |
 | `/delivery-resume` | 继续看当前会话分支里最近尚未确认的方案 | 进入交付后、主 Pi 空闲时；只继续讨论，不会自动开始开发 |
-| `/delivery-exit` | 退出并重载，恢复原工具和进入前启用的工具列表；退出检查成功后清理本次交付记录中的审查制品 | 等执行结束、写入权限交回；还不能退出或清理失败时会说明原因并保留现场 |
-| `/delivery-unlock` | 人工核对并强制清理残留的 writer 记录 | 崩溃或强杀后退出或写入被拒时；清理后须自行核对代码改动 |
+| `/delivery-exit` | 退出并重载，恢复原工具和进入前启用的工具列表；退出检查成功后清理本次交付记录中的审查制品 | 等执行结束、写入权限交回；如果仍有 lease，先 `/delivery-status details`，确认没有在途任务后 `/delivery-unlock`，再核对状态并重试 `/delivery-exit` |
+| `/delivery-unlock` | 人工核对并强制清理残留的 writer 记录 | 崩溃或强杀后退出或写入被拒时；先确认没有在途任务，清理后须再次核对状态并自行检查代码改动 |
 
 **不必把这些命令按顺序输一遍。** 进入后，主 Pi 会按流程推进，需要你确认时再提示。`/delivery-plan` 和 `/delivery-run` 只是方便你主动推进的提示，不会自行开启交付，也不能代替方案确认。
 
@@ -170,7 +170,7 @@ sequenceDiagram
 详情：/delivery-tasks；诊断：/delivery-status details。
 ```
 
-父 Pi 回合仍在运行或有排队消息时，状态页会分别显示“父 Pi 回合运行中（无交付子任务）”或“等待排队消息”；有子任务时显示子任务状态。`/delivery-status details` 还会投影本轮的 `parent_direct`、`delivery_develop`、`delivery_review` 和 `delivery_readonly` 路径，以及原始子 Session、失败结果和工具错误事实。未调用 `delivery_path` 的父侧普通 `edit`、`write` 或 `bash` 不会被自动猜测成某个业务节点。
+父 Pi 回合仍在运行或有排队消息时，状态页会分别显示“父 Pi 回合运行中（无交付子任务）”或“等待排队消息”；有子任务时显示子任务状态和当前阶段。`/delivery-status details` 还会投影本轮的 `parent_direct`、`delivery_develop`、`delivery_review` 和 `delivery_readonly` 路径，以及原始子 Session、失败阶段、退出/工具错误事实和审查制品路径。未调用 `delivery_path` 的父侧普通 `edit`、`write` 或 `bash` 不会被自动猜测成某个业务节点。
 
 任务列表中的“实施批次 N”表示同一套方案批准下的任务归组；“开发 · 第 2 次”表示该节点的第二次委派，返工仍属于同一批次。独立只读委派显示为“独立任务”，不会伪造实施批次。
 
@@ -182,7 +182,7 @@ sequenceDiagram
 
 - **暂停看方案：** 在方案页选择“稍后再看”或按 Esc，之后可以直接提意见，或用 `/delivery-resume` 继续。输入意见时，Esc 先返回方案页。
 - **关闭子任务详情：** 按 Esc 只关窗口，任务还会继续。
-- **卡在“暂不能退出交付”：** 先用 `/delivery-status details` 看现场。确属崩溃或强杀留下的残留记录时，用 `/delivery-unlock` 核对证据并确认清理；清理后要自己核对代码改动，交付仍保持启用。
+- **卡在“暂不能退出交付”：** 先用 `/delivery-status details` 看现场；确认没有在途交互、排队消息或交付任务后，确属崩溃或强杀留下的残留记录时，用 `/delivery-unlock` 核对证据并确认清理；再核对状态并重试 `/delivery-exit`，清理后要自己核对代码改动。`/delivery-exit` 不负责清理 lease。
 - **命令没生效：** 模型正在输出或排队消息时输入的命令可能不会执行（输入框里会只剩下命令名）；等执行结束后重新输入，并可用 `/delivery-status` 核对是否真的已启用或已退出。
 - **重载或重开原会话：** `/reload` 会重载扩展；交付流程仍然开启，但旧批准和检查证据不能直接沿用，开发前需要重新确认方案。历史消息、方案正文、已有代码改动和任务进度仍可作为恢复依据，不需要重新设计或回退已完成工作。重载保留当前启用的工具列表；升级后若缺少原有工具，待执行收尾后用 `/delivery-exit` 恢复进入前工具，再按需要进入交付。新建普通会话则默认不开启交付。
 

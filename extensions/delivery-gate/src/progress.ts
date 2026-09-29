@@ -5,6 +5,7 @@ export interface TaskProgress {
 	id: string;
 	name: string;
 	status: string;
+	stage?: string;
 	action: string;
 	recent: string[];
 	output: string;
@@ -80,6 +81,11 @@ export function createTaskProgress(id: string, label: string, task: string, upda
 	return {
 		snapshot,
 		agent(agent: NonNullable<TaskProgress["agent"]>) { view.agent = { ...agent }; emit(); },
+		stage(value: string, detail?: string) {
+			view.stage = short(value, 120);
+			if (detail) action(detail);
+			emit();
+		},
 		phase(_status: string, detail?: string, sessionFile?: string) {
 			view.status = RUNNING_STATUS;
 			if (detail) action(detail);
@@ -164,7 +170,9 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 					: label === "开发" ? "执行已结束，检查结论由父 Pi 核对"
 							: undefined
 						: undefined;
-			const detail = (latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking} · ` : "") + (completionNote ?? latest?.action ?? (isPartial ? "核对任务环境" : short(body)));
+			const stageNote = latest?.stage ? `阶段：${latest.stage}` : "";
+			const detailAction = completionNote ?? latest?.action ?? (isPartial ? "核对任务环境" : short(body));
+			const detail = [stageNote, latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking}` : "", detailAction].filter(Boolean).join(" · ");
 			const component = {
 				invalidate() {},
 				render(width: number) {
@@ -174,7 +182,7 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 					if (expanded) {
 						if (open) lines.push(...new Text("/delivery-tasks 查看详情 · 全屏模式可点击卡片 · Esc 关闭详情", 0, 0).render(width));
 						const elapsed = latest ? `耗时 ${Math.max(0, ((latest.endedAt ?? Date.now()) - latest.startedAt) / 1000).toFixed(1)} 秒` : "";
-						const more = [completionNote ? `检查结论：${completionNote}` : "", latest?.agent ? `模型：${latest.agent.provider}/${latest.agent.id} · ${latest.agent.thinking}\n选择理由：${latest.agent.reason}` : "", elapsed, ...(latest?.recent ?? []), latest?.output, latest?.sessionFile ? `原始子 Session：${latest.sessionFile}` : "", !isPartial ? tail(body) : ""].filter(Boolean).join("\n");
+						const more = [stageNote, completionNote ? `检查结论：${completionNote}` : "", latest?.agent ? `模型：${latest.agent.provider}/${latest.agent.id} · ${latest.agent.thinking}\n选择理由：${latest.agent.reason}` : "", elapsed, ...(latest?.recent ?? []), latest?.output, latest?.sessionFile ? `原始子 Session：${latest.sessionFile}` : "", !isPartial ? tail(body) : ""].filter(Boolean).join("\n");
 						// Text 处理宽度；终端控制字符不能通过子输出注入界面。
 						lines.push(...new Text(more.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""), 0, 0).render(width));
 					}

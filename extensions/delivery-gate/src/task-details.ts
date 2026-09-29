@@ -18,6 +18,7 @@ export interface TaskDetail {
 	resultFailed?: boolean;
 	sessionFile?: string;
 	progress?: TaskProgress;
+	stage?: string;
 	agent?: TaskProgress["agent"];
 	approvalId?: string;
 	designApprovalId?: string;
@@ -40,6 +41,7 @@ export function taskDetails(ctx: Pick<ExtensionContext, "sessionManager">, live:
 			task.result = text(entry.message);
 			task.resultFailed = Boolean(entry.message.isError);
 			task.progress = progress;
+			if (progress?.stage) task.stage = progress.stage;
 			if (progress?.agent) task.agent = progress.agent;
 			if (progress?.sessionFile) task.sessionFile = progress.sessionFile;
 		} else if (entry.type === "custom" && [DELEGATION_ENTRY, "delivery-development"].includes(entry.customType)) {
@@ -53,7 +55,7 @@ export function taskDetails(ctx: Pick<ExtensionContext, "sessionManager">, live:
 	}
 	for (const progress of live) {
 		const task = tasks.get(progress.id);
-		if (task && task.result === undefined) Object.assign(task, { status: progress.status, progress, agent: progress.agent ?? task.agent, sessionFile: progress.sessionFile ?? task.sessionFile });
+		if (task && task.result === undefined) Object.assign(task, { status: progress.status, progress, stage: progress.stage ?? task.stage, agent: progress.agent ?? task.agent, sessionFile: progress.sessionFile ?? task.sessionFile });
 	}
 	const batches = new Map<string, number>();
 	const attempts = new Map<string, number>();
@@ -201,7 +203,7 @@ export class TaskDetailsPanel {
 	private content(width: number): string[] {
 		const { task, entries, notice } = this.record;
 		let body: string;
-		if (this.full) body = `完整任务\n\n${task.task}${task.agent ? `\n\n模型：${task.agent.provider}/${task.agent.id} · ${task.agent.thinking}\n选择理由：${task.agent.reason}` : ""}\n\n原始子 Session\n${task.sessionFile ?? "尚未取得"}`;
+		if (this.full) body = `完整任务\n\n${task.task}${task.stage ? `\n\n阶段：${task.stage}` : ""}${task.agent ? `\n\n模型：${task.agent.provider}/${task.agent.id} · ${task.agent.thinking}\n选择理由：${task.agent.reason}` : ""}\n\n原始子 Session\n${task.sessionFile ?? "尚未取得"}`;
 		else if (this.frozen !== undefined) body = this.frozen;
 		else {
 			body = entries.map((entry) => `${truncateToWidth(`${short(entry.name)} · ${entryStatus(entry)}${entry.callId ? ` · ${this.summary(entry)}` : ""}`, width)}\n`
@@ -225,6 +227,7 @@ export class TaskDetailsPanel {
 		const context = !this.full ? [th.fg("muted", `${task.batch ? `实施批次 ${task.batch} · ` : "独立任务 · "}${clean(task.label)}${task.attempt ? ` · 第 ${task.attempt} 次` : ""}`),
 			th.fg("muted", `任务：${short(task.task)}`),
 			...(task.agent ? [th.fg("muted", `模型：${short(task.agent.id)} · ${short(task.agent.thinking)} · Enter 查看选择理由`)] : []),
+			...(task.stage ? [th.fg("muted", `阶段：${clean(task.stage)}`)] : []),
 			...(task.result === undefined ? [th.fg("muted", short(task.progress?.action ?? "等待进度更新"))] : [])] : [];
 		context.splice(Math.max(0, Math.floor(this.tui.terminal.rows * 0.85) - 10));
 		this.pageSize = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 7 - footer.length - context.length);
@@ -254,7 +257,7 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[],
 		const tasks = taskDetails(ctx, live()).reverse();
 		if (!id) {
 			if (!tasks.length) { ctx.ui.notify("当前会话还没有交付子任务。", "info"); return; }
-			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `实施批次 ${task.batch} · ` : "独立任务 · "}${displayText(task.label)}${task.attempt ? ` · 第 ${task.attempt} 次` : ""} · ${displayText(task.status)}${task.agent ? ` · 模型：${displayText(task.agent.id)} · 推理：${displayText(task.agent.thinking)}` : ""} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
+			const choices = tasks.map((task, index) => `${index + 1}. ${task.batch ? `实施批次 ${task.batch} · ` : "独立任务 · "}${displayText(task.label)}${task.attempt ? ` · 第 ${task.attempt} 次` : ""} · ${displayText(task.status)}${task.stage ? ` · 阶段：${displayText(task.stage)}` : ""}${task.agent ? ` · 模型：${displayText(task.agent.id)} · 推理：${displayText(task.agent.thinking)}` : ""} · ${displayText(task.task).replace(/\s+/g, " ").slice(0, 80)}`);
 			const controller = new AbortController();
 			close = () => controller.abort();
 			let selected: string | undefined;

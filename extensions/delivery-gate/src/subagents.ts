@@ -386,7 +386,15 @@ export async function delegateReadOnly(
 	mode: "readonly" | "review" = "readonly",
 ): Promise<{ text: string; sessionId: string; sessionFile: string; pid: number; toolErrors: boolean }> {
 	signal.throwIfAborted();
-	const rpc = await startChild(input, "readonly");
+	progress.stage("子 Session 启动");
+	let rpc: Awaited<ReturnType<typeof startChild>>;
+	try {
+		rpc = await startChild(input, "readonly");
+	} catch (error) {
+		const failureStage = progress.snapshot().stage ?? "子 Session 启动";
+		progress.end(ABNORMAL_STATUS, `失败阶段：${failureStage}`);
+		throw new Error(`只读委派未成功：${String(error)}\n失败阶段：${failureStage}\n子 Session 尚未启动。\n父 Session ID：${input.parentSessionId}\n本次工具调用：${input.id}`, { cause: error });
+	}
 	const interrupt = new AbortController();
 	const operation = AbortSignal.any([signal, interrupt.signal]);
 	const dialogs = createChildDialogs(rpc, ctx, operation, interrupt);
@@ -408,6 +416,7 @@ export async function delegateReadOnly(
 		await readyChild(rpc, input, operation, (value) => { state = value; });
 		progress.agent({ provider: state!.model!.provider, id: state!.model!.id, thinking: state!.thinkingLevel, reason: input.selectionReason });
 		record({ ...reference(), phase: "started" });
+		progress.stage("子 Agent 工具执行");
 		progress.phase("运行中", "子任务已启动", state?.sessionFile);
 		await Promise.all([
 			rpc.waitSettled(operation),
@@ -416,6 +425,7 @@ export async function delegateReadOnly(
 		]);
 		if (rpc.openTools.size) throw new Error("子任务存在未确认的工具执行终态");
 	} catch (error) { problem = error; }
+	progress.stage("子 Session 收尾");
 	progress.phase(operation.aborted ? "正在取消" : "核对收尾中");
 	try { await dialogs.close(); }
 	catch (error) { problem ??= error; }
@@ -438,10 +448,11 @@ export async function delegateReadOnly(
 	}
 	if (!problem && (!recordedClose || !text)) problem = new Error("子任务原始记录或最终正文未核实");
 	if (operation.aborted) problem ??= operation.reason;
+	const failureStage = progress.snapshot().stage ?? "子 Session 启动";
 	record({ ...reference(), phase: "ended", status: !rpc.exit || rpc.openTools.size ? "unknown" : operation.aborted ? "cancelled" : problem ? "failed" : "completed",
-		exit: rpc.exit, toolErrors: rpc.toolError, error: problem ? String(problem) : undefined });
+		exit: rpc.exit, toolErrors: rpc.toolError, modelTerminal: terminalFacts, processFailure: rpc.failure ? String(rpc.failure) : undefined, inFlightTools: [...rpc.openTools], failureStage, error: problem ? String(problem) : undefined });
 	progress.end(!rpc.exit || rpc.openTools.size || !stopped || operation.aborted || problem ? ABNORMAL_STATUS : COMPLETED_STATUS);
-	if (problem) throw new Error(`只读委派未成功：${String(problem)}`
+	if (problem) throw new Error(`只读委派未成功：${String(problem)}\n失败阶段：${failureStage}`
 		+ (state?.sessionFile ? `\n原始子 Session：${state.sessionFile}` : "\n子 Session 引用尚未取得。")
 		+ `\n进程收尾：${stopped && rpc.exit?.code === 0 && rpc.exit.signal === null && !rpc.failure ? "已正常关闭" : "未核实正常关闭"}；工具终态：${rpc.openTools.size ? "仍有未确认执行" : "无在途工具"}。`
 		+ `\n持久关闭记录：${recordedClose ? "已核实" : "未核实"}。${recordProblem ? `记录核对：${String(recordProblem)}` : ""}`

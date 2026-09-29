@@ -45,7 +45,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	pi.on("before_agent_start", (event, ctx) => {
 		promptOptions = structuredClone(event.systemPromptOptions);
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。Pi 的交付命令（\`/delivery-shape\`、\`/delivery-exit\`、\`/delivery-unlock\` 等）由用户命令入口执行，不由模型执行也不会因模型回复而生效：如果用户消息里出现命令名、尤其是没有前导斜杠（例如单独一条 \`delivery-exit\`），说明该命令没有执行。此时不要声称已启用、已退出或已批准，要说明该命令未生效，提示用户等当前执行结束后重新输入 \`/命令\`，并可用 \`/delivery-status\` 核对。`
+			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。Pi 的交付命令（\`/delivery-shape\`、\`/delivery-exit\`、\`/delivery-unlock\` 等）由用户命令入口执行，不由模型执行也不会因模型回复而生效：如果用户消息里出现命令名、尤其是没有前导斜杠（例如单独一条 \`delivery-exit\`），说明该命令没有执行。此时不要声称已启用、已退出或已批准，要说明该命令未生效，提示用户等当前执行结束后重新输入 \`/命令\`，并可用 \`/delivery-status\` 核对。若状态中仍有 writer lease，\`/delivery-exit\` 不能清理它：确认没有在途任务后，先让用户执行 \`/delivery-unlock\`，再核对 \`/delivery-status details\` 并重试 \`/delivery-exit\`。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守本次节点范围，不修改父规划文档、不批准或继续委派。"
 					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n方案确认后由 AI 内部维护实施计划：简单任务由父 Pi 直接修改并检查，复杂任务按需委派。每次委派明确提供当前 paths 和 inputs；范围内调整不重复请求确认。需要持续维护时沿用已有方案/台账；Markdown 编辑使用父文档工具并保留用户内容，每回合一次变更。委派时按工作场景、复杂度和风险选择推理级别，不另选模型。")
@@ -91,8 +91,8 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	});
 	pi.registerTool({ name: REVIEW_TOOL, label: "独立候选审查",
 		...taskRenderers("审查", openTask),
-		description: "沿独立子路径检查和审查批准目标、当前代码、实际差异，并主动运行项目测试、编译或 lint。审查期间占用 writer lease，结束后核实候选与记录再交回。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险" }), paths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, description: "本次审查涉及的源码、配置或测试路径；必须位于当前 worktree 内" }), inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "纳入候选核对的只读输入路径" })), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
+		description: "沿独立子路径检查和审查批准目标、当前代码、实际差异，并主动运行项目测试、编译或 lint。审查期间占用 writer lease，结束后核实候选与记录再交回。paths 只填写源码、测试或配置，inputs 只填写额外只读证据；父维护规划文档与范围重叠时在子 Session 启动前拒绝调用。发现由父会话裁决，不自动等于审查通过；不恢复旧 Session 证据。",
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本次审查重点和已知风险" }), paths: Type.Array(Type.String({ minLength: 1 }), { description: "本次审查涉及的源码、配置或测试路径；必须位于当前 worktree 内；至少提供一个路径" }), inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "纳入候选核对的只读输入路径" })), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未开始审查");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
@@ -103,8 +103,8 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	});
 	pi.registerTool({ name: DEVELOPMENT_TOOL, label: "开发文件委派",
 		...taskRenderers("开发", openTask),
-		description: "将一次本机开发任务交给独立标准 Pi。要求本轮父 TUI 的方案确认，并在 paths 中提供本节点范围；继承父已启用的文件、Shell、联网及插件工具。子任务须遵守范围、不修改父规划文档、不递归委派；普通工具不受本 Package 路径拦截。Pi 进程与原生工具终态落盘后交回交付 writer，结果仍需核实。",
-		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据" }), paths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, description: "本次开发允许修改的源码、配置或测试路径；必须位于当前 worktree 内" }), inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "纳入候选核对的只读输入路径" })), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
+		description: "将一次本机开发任务交给独立标准 Pi。要求本轮父 TUI 的方案确认，并在 paths 中提供本节点范围；paths 只填写允许修改的源码、配置或测试，inputs 只填写额外只读证据，父维护规划文档重叠时在子 Session 启动前拒绝调用。继承父已启用的文件、Shell、联网及插件工具。子任务须遵守范围、不修改父规划文档、不递归委派；普通工具不受本 Package 路径拦截。Pi 进程与原生工具终态落盘后交回交付 writer，结果仍需核实。",
+		parameters: Type.Object({ task: Type.String({ minLength: 1, description: "本节点的文件变更目标、现场事实和预期证据" }), paths: Type.Array(Type.String({ minLength: 1 }), { description: "本次开发允许修改的源码、配置或测试路径；必须位于当前 worktree 内；至少提供一个路径" }), inputs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "纳入候选核对的只读输入路径" })), agent: Type.Optional(agentSelection) }, { additionalProperties: false }),
 		execute: async (id, input, signal, update, ctx) => {
 			if (!ctx.model || !promptOptions) throw new Error("当前模型或本回合基础环境未核实，未委派");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
@@ -190,7 +190,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const removed = await leases.discard(workspace.key, blockage);
 				pi.appendEntry("delivery-unlock", { workspaceKey: workspace.key, leaseId: blockage.lease?.leaseId, owner,
 					operationLock: removed.operationLock, at: new Date().toISOString() });
-				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。下一步：用 /delivery-status 核对现场，再决定退出；代码改动需自行检查。`, "warning");
+				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。下一步：用 /delivery-status 核对现场；确认没有新的在途任务后重试 /delivery-exit，代码改动需自行检查。`, "warning");
 			} catch (error) {
 				ctx.ui.notify(`未清理：${error instanceof Error ? error.message : String(error)}`, "error");
 			}
@@ -215,11 +215,11 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				else if (!ctx.isIdle() || ctx.hasPendingMessages()) next = "等待父 Pi 回合和排队消息收尾，再核对结果。";
 				else if (writer.fault || developer.fault) { stage = "需要核对未收尾的执行"; next = "用 /delivery-status details 查看证据；确认残留后用 /delivery-unlock 清理。"; }
 				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，暂不重放任务。"; }
-				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "先核对原执行的收尾证据；证据不足时暂停写入，不自动解锁。"; }
+				if (lease && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "先用 /delivery-status details 核对原执行收尾；确认没有在途任务且 lease 是残留后执行 /delivery-unlock，再核对状态并重试 /delivery-exit。"; }
 				ctx.ui.notify(`交付状态\n当前阶段：${stage}\n下一步：${next}`
-					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}）`).join("；")}` : !ctx.isIdle() ? "\n当前任务：父 Pi 回合运行中（无交付子任务）" : ctx.hasPendingMessages() ? "\n当前任务：等待排队消息" : "\n当前任务：无")
+					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}${task.stage ? `，阶段：${task.stage}` : ""}）`).join("；")}` : !ctx.isIdle() ? "\n当前任务：父 Pi 回合运行中（无交付子任务）" : ctx.hasPendingMessages() ? "\n当前任务：等待排队消息" : "\n当前任务：无")
 					+ "\n详情：/delivery-tasks；诊断：/delivery-status details。"
-					+ (diagnostic ? `\n\n能力说明：沿用 Pi 原有工具与权限；交付工具只管理批准、委派、writer 和验收。\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n执行路径：\n${formatExecutionPaths(ctx.sessionManager.getBranch(), running)}\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。\n人工清理：/delivery-unlock（强制重置，不是安全释放）。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
+					+ (diagnostic ? `\n\n能力说明：沿用 Pi 原有工具与权限；交付工具只管理批准、委派、writer 和验收。\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行环境：本机，使用项目已有工具链与权限。\n执行路径：\n${formatExecutionPaths(ctx.sessionManager.getBranch(), running)}\n${lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n不自动解锁，记录不证明执行已停止。\n人工清理：/delivery-unlock（强制重置，不是安全释放）；清理后重新核对并重试 /delivery-exit。` : "未发现 lease；不等于已取得授权。"}\n状态目录：${stateRoot}`
 						+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("") : ""), "info");
 			} catch (error) {
 				ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");
@@ -239,7 +239,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 			try { await leases.assertIdle(workspace.key); }
-			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 若确认是残留记录，再用 /delivery-unlock 强制清理。`); }
+			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 若确认是残留记录，请先用 /delivery-status details 核对并执行 /delivery-unlock，清理后再重试 /delivery-exit。`); }
 		},
 		cleanup: async (ctx: ExtensionContext) => {
 			const directories = ctx.sessionManager.getEntries().flatMap((entry) => {

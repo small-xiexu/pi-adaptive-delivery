@@ -93,6 +93,8 @@ interface DevelopmentRun extends SessionBinding {
 	readonlyStarted?: boolean;
 	readonlyTerminal?: string;
 	executionPath?: { path: ExecutionPathKind; node: string; reason: string; approvalId: string; sessionId: string; workspaceKey: string };
+	stage?: string;
+	interruption?: string;
 	toolErrors?: boolean;
 	pathEnded?: boolean;
 	review?: { result: Awaited<ReturnType<typeof delegateReadOnly>>; artifact: Awaited<ReturnType<typeof prepareReview>>; initialCandidate: CandidateSnapshot; candidate: CandidateSnapshot; changed: boolean };
@@ -130,17 +132,21 @@ async function readonlyTerminal(state: DevelopmentRun) {
 
 function executionFacts(state: DevelopmentRun) {
 	return {
-		modelTerminal: state.childTerminalFacts,
+		stage: state.stage,
+		modelTerminal: state.childTerminalFacts ?? state.readonlyReference?.modelTerminal,
 		childSessionFile: state.child?.sessionFile,
 		childSessionPersisted: Boolean(state.childTerminal),
 		childTerminalDigest: state.childTerminal,
-		childProcessExit: state.rpc?.exit ? { code: state.rpc.exit.code, signal: state.rpc.exit.signal } : undefined,
-		childProcessFailure: state.rpc?.failure ? String(state.rpc.failure) : undefined,
-		inFlightTools: state.rpc ? [...state.rpc.openTools] : undefined,
-		toolErrors: state.rpc?.toolError ?? state.toolErrors,
+		childProcessExit: state.rpc?.exit ? { code: state.rpc.exit.code, signal: state.rpc.exit.signal } : state.readonlyReference?.exit,
+		childProcessFailure: state.rpc?.failure ? String(state.rpc.failure) : state.readonlyReference?.processFailure,
+		inFlightTools: state.rpc ? [...state.rpc.openTools] : state.readonlyReference?.inFlightTools,
+		toolErrors: state.rpc?.toolError ?? state.readonlyReference?.toolErrors ?? state.toolErrors,
+		interruption: state.interruption,
 		readonlySessionFile: state.readonlyReference?.sessionFile,
 		readonlySessionPersisted: Boolean(state.readonlyTerminal),
 		readonlyTerminalDigest: state.readonlyTerminal,
+		reviewDirectory: state.readonlyReference?.reviewDirectory,
+		reviewStatus: state.review ? state.review.changed ? "invalidated" : "valid" : undefined,
 	};
 }
 
@@ -169,6 +175,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		if (!progress?.endedAt) return;
 		const details = { ...(event.details as Record<string, unknown> | undefined), ...(state.result.details as Record<string, unknown> | undefined), progress };
 		state.result = snapshot({ ...state.result, details });
+		if (!state.attemptedLease && active === state) active = undefined;
 		return { details };
 	});
 
@@ -181,21 +188,35 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		active = state;
 		const progress = state.progress = createTaskProgress(input.id, name === REVIEW_TOOL ? "审查" : "开发", input.task, update);
 		progress.phase("准备中");
+		const setStage = (value: string, detail?: string) => { state.stage = value; progress.stage(value, detail); };
+		setStage("调用前范围校验");
 		const operation = signal ? AbortSignal.any([signal, state.lifetime.signal]) : state.lifetime.signal;
 		state.run = Promise.resolve().then(async () => {
 			let executionSignal = operation;
 			let dialogs: ReturnType<typeof createChildDialogs> | undefined;
 			try {
+				setStage("批准与候选准备");
 				const grant = await approvals.readApproval(ctx, operation);
+				setStage("调用前范围校验");
 				const rawPaths = input.paths ?? [], rawInputs = input.inputs ?? [];
-				if (rawPaths.some((value) => !value.trim()) || rawInputs.some((value) => !value.trim())) throw new Error("开发或审查路径不能是空白字符串");
+				if (rawPaths.some((value) => !value.trim()) || rawInputs.some((value) => !value.trim())) throw new Error("调用前范围校验失败：开发或审查路径不能是空白字符串。");
 				const paths = rawPaths.map((value) => path.resolve(ctx.cwd, value));
 				const inputs = rawInputs.map((value) => path.resolve(ctx.cwd, value));
-				if (!paths.length) throw new Error("本次开发或审查必须提供非空 paths；实施计划由 AI 内部维护，不再通过第二次确认声明范围");
+				if (!paths.length) throw new Error("调用前范围校验失败：本次开发或审查必须提供非空 paths；实施计划由 AI 内部维护，不再通过第二次确认声明范围。");
 				const outside = (value: string) => { const relative = path.relative(grant.workspace.workspacePath, value); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); };
-				if ([...paths, ...inputs].some(outside)) throw new Error("开发或审查路径必须在当前 worktree 内");
+				if ([...paths, ...inputs].some(outside)) throw new Error("调用前范围校验失败：开发或审查路径必须在当前 worktree 内。");
 				const overlaps = (left: string, right: string) => { const relative = path.relative(left, right); return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`)); };
-				if ([...paths, ...inputs].some((candidate) => grant.planningPaths.some((planning) => overlaps(planning, candidate) || overlaps(candidate, planning)))) throw new Error("开发或审查路径不能包含父维护规划文档");
+				const conflicts = [
+					...paths.map((value) => ({ field: "paths", value })),
+					...inputs.map((value) => ({ field: "inputs", value })),
+				].filter(({ value }) => grant.planningPaths.some((planning) => overlaps(planning, value) || overlaps(value, planning)));
+				if (conflicts.length) {
+					const ranges = [...new Set(conflicts.map(({ field, value }) => `${field}=${path.relative(grant.workspace.workspacePath, value) || "."}`))];
+					const shown = ranges.slice(0, 8);
+					const suffix = ranges.length > shown.length ? `；另有 ${ranges.length - shown.length} 项` : "";
+					throw new Error(`调用前范围校验失败：开发或审查路径不能包含父维护规划文档。\n冲突范围：${shown.join("、")}${suffix}\n请只把需要核对的源码、测试或配置放入 paths；额外只读文件放入 inputs。父维护规划文档由父会话维护，不放入本次范围。\n子 Session 尚未启动。`);
+				}
+				setStage("父调用与 Session 核验");
 				state.approvalId = grant.approvalId;
 				state.designApprovalId = grant.approvalId;
 				const running = executionSignal = AbortSignal.any([operation, grant.signal]);
@@ -205,6 +226,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (!call || call.type !== "message" || call.message.role !== "assistant" || toolCalls.length !== 1) throw new Error("本次交付工具调用未核实");
 				records.requireEntry(call);
 				if (records.entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === input.id)) throw new Error("交付工具调用已有终态，不能重放");
+				setStage("writer 与候选准备");
 				state.call = call;
 				state.executionPath = { path: name === REVIEW_TOOL ? "delivery_review" : "delivery_develop", node: input.task,
 					reason: name === REVIEW_TOOL ? "独立核对当前候选和实际检查结果" : "父 Pi 委派本节点给独立开发子 Agent",
@@ -221,6 +243,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				state.owner = { ...acquired.record.owner };
 				const parent = state.parent = { ...state.owner };
 				if (name === REVIEW_TOOL) {
+					setStage("候选与审查制品准备");
 					const scope: CandidateScope = { workspace: grant.workspace, readPaths: inputs, writePaths: paths, protectedPaths: [...grant.planningPaths, sessionFile, path.dirname(stateRoot)] };
 					const candidate = await captureCandidate(scope, running);
 					const artifact = await prepareReview(scope, candidate);
@@ -238,14 +261,22 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						`差异基线：${artifact.baseHead ?? "无 HEAD，空基线"}；before/after 为原始 Git blob/当前文件副本。`,
 						`审查重点：${input.task}`,
 					].join("\n\n");
+					setStage("子 Session 启动");
 					const result = await delegateReadOnly({ ...input, readPaths: [...(input.readPaths ?? []), artifact.directory], task: reviewTask }, running,
-						(data) => { if (data.phase === "started") state.readonlyStarted = true; state.readonlyReference = snapshot({ ...data, approvalId: grant.approvalId, designApprovalId: grant.approvalId, reviewDirectory: artifact.directory }); pi.appendEntry(DELEGATION_ENTRY, state.readonlyReference); }, update, ctx, progress, "review");
+						(data) => {
+							if (data.phase === "started") { state.readonlyStarted = true; setStage("子 Agent 工具执行"); }
+							if (data.phase === "ended") setStage("子 Session 收尾");
+							state.readonlyReference = snapshot({ ...data, approvalId: grant.approvalId, designApprovalId: grant.approvalId, reviewDirectory: artifact.directory });
+							pi.appendEntry(DELEGATION_ENTRY, state.readonlyReference);
+						}, update, ctx, progress, "review");
+					setStage("审查候选核对");
 					const finalCandidate = await captureCandidate(scope, running);
 					state.toolErrors = result.toolErrors;
 					const changed = finalCandidate.digest !== candidate.digest;
 					const finalArtifact = changed ? await prepareReview(scope, finalCandidate) : artifact;
 					state.review = { result, artifact: finalArtifact, initialCandidate: candidate, candidate: finalCandidate, changed };
 				} else {
+					setStage("子 Session 启动");
 					const rpc = state.rpc = await startChild(input, "development");
 					const interrupt = new AbortController();
 					const childSignal = AbortSignal.any([running, interrupt.signal]);
@@ -254,6 +285,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 					const { state: child, data } = await readyChild(rpc, input, childSignal, (value) => { state.child = value; });
 					progress.agent({ provider: child.model!.provider, id: child.model!.id, thinking: child.thinkingLevel, reason: input.selectionReason });
 					if (data.owner?.pid !== rpc.process.pid || data.owner?.sessionId !== child.sessionId || data.owner?.runId !== input.id) throw new Error("子 writer 身份未核实");
+					setStage("子 Agent 工具执行");
 					const childOwner = snapshot(data.owner) as WriterLeaseOwner;
 					await state.leases.handoff(state.lease, parent, childOwner, async () => { const latest = await approvals.readApproval(ctx, childSignal); if (latest.approvalId !== grant.approvalId) throw new Error("方案授权已变化"); current(state, ctx); }, childSignal);
 					state.owner = childOwner;
@@ -273,8 +305,10 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						`本次任务：${input.task}`,
 					].join("\n\n");
 					await Promise.all([rpc.waitSettled(childSignal), rpc.request({ type: "prompt", message: developmentTask }, childSignal)]);
+					setStage("子 Session 收尾");
 				}
 			} catch (error) { state.problem = error; }
+			if (state.problem && (state.rpc || state.readonlyStarted || state.stage === "子 Session 启动" || state.stage === "子 Agent 工具执行")) setStage("子 Session 收尾");
 			progress.phase(executionSignal.aborted ? "正在取消" : "核对收尾中");
 			try { await dialogs?.close(); } catch (error) { state.problem ??= error; }
 			try {
@@ -282,12 +316,16 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.rpc) { const terminal = await childTerminal(state); state.childTerminal = terminal.digest; state.childTerminalFacts = persistedAssistantFacts(terminal.last); if (terminal.last?.stopReason !== "stop") { const message = `子模型没有正常完成的持久模型终态\n${state.childTerminalFacts}`; state.problem = state.problem ? new Error(`${state.problem instanceof Error ? state.problem.message : String(state.problem)}\n${message}`, { cause: state.problem }) : new Error(message); } }
 				if (state.readonlyReference?.pid) state.readonlyTerminal = await readonlyTerminal(state);
 			} catch (error) { state.problem = new Error(`交付任务收尾失败：${String(error)}`, { cause: state.problem ?? error }); }
-			if (executionSignal.aborted) state.problem ??= executionSignal.reason;
+			if (executionSignal.aborted) {
+				state.interruption = String(executionSignal.reason ?? "父回合中断");
+				state.problem ??= executionSignal.reason;
+			}
 			try {
 				if (state.problem) throw state.problem;
 				if (state.review) {
 					const review = state.review;
-					progress.end(review.changed ? ABNORMAL_STATUS : COMPLETED_STATUS, review.changed ? "审查期间候选发生变化，原审查结论失效" : undefined);
+					const reviewHasToolErrors = Boolean(review.result.toolErrors);
+					progress.end(COMPLETED_STATUS, review.changed ? "审查期间候选发生变化，原审查结论失效" : reviewHasToolErrors ? "子 Agent 存在工具失败，审查结论不能直接视为通过" : undefined);
 					const text = review.changed
 						? [
 							"审查执行已结束，但未形成有效结论：审查期间候选发生变化。",
@@ -300,7 +338,8 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 						].join("\n")
 						: [`审查执行已结束；独立验收和审查结论见下文，最终由父 Pi 对照实际命令结果和当前候选核对，不自动等于交付通过（修复方式：单文件且不改对外行为契约的由父 Pi 直接改并复跑检查；多文件或金额、并发、权限等边界问题重新委派 delivery_develop）：`, review.result.text, `候选：${review.candidate.digest}`, `审查原始记录：${review.result.sessionFile}`, `审查制品：${review.artifact.directory}`, `实际差异：${review.artifact.diffFile}`].join("\n");
 					if (review.changed) throw new Error(text);
-					const details = { reviewStatus: "valid", candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, toolErrors: review.result.toolErrors, readonlySessionPersisted: Boolean(state.readonlyTerminal), progress: progress.snapshot() };
+					setStage("父结果与 writer 交接");
+					const details = { reviewStatus: "valid", candidate: review.candidate, reviewSessionFile: review.result.sessionFile, diffFile: review.artifact.diffFile, pid: review.result.pid, toolErrors: review.result.toolErrors, readonlySessionPersisted: Boolean(state.readonlyTerminal), executionFacts: executionFacts(state), progress: progress.snapshot() };
 					const result = { content: [{ type: "text" as const, text }], details };
 					state.result = snapshot({ ...result, isError: false });
 					appendExecutionPath(pi, { id: input.id, ...state.executionPath!, phase: "ended", status: "completed", toolErrors: review.result.toolErrors, sessionFile: review.result.sessionFile });
@@ -309,17 +348,19 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				}
 				const terminal = await childTerminal(state);
 				const text = ((terminal.last as any)?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
-				progress.end(COMPLETED_STATUS);
-				const result = { content: [{ type: "text" as const, text: `开发执行已结束；检查结论由父 Pi 根据真实命令结果核对，仍需核对实际变更和审查结果：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}${state.rpc!.toolError ? `\n\n${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}` : ""}` }], details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, toolErrors: terminal.toolNotes, childSessionPersisted: true, childProcessExit: { code: state.rpc!.exit?.code, signal: state.rpc!.exit?.signal }, progress: progress.snapshot() } };
+				setStage("父结果与 writer 交接");
+				const hasToolErrors = Boolean(terminal.toolNotes);
+				progress.end(COMPLETED_STATUS, hasToolErrors ? "子 Agent 存在工具失败，检查结论不能直接视为通过" : undefined);
+				const result = { content: [{ type: "text" as const, text: `开发执行已结束；检查结论由父 Pi 根据真实命令结果核对，仍需核对实际变更和审查结果：\n${truncateHead(text).content}\n子会话：${state.child!.sessionFile}${state.rpc!.toolError ? `\n\n${TOOL_ERROR_GUIDANCE}\n${terminal.toolNotes?.text ?? "请查看原始子 Session 的工具返回。"}` : ""}` }], details: { childSessionFile: state.child!.sessionFile, childSessionId: state.child!.sessionId, pid: state.rpc!.process.pid, toolErrors: terminal.toolNotes, childSessionPersisted: true, childProcessExit: { code: state.rpc!.exit?.code, signal: state.rpc!.exit?.signal }, executionFacts: executionFacts(state), progress: progress.snapshot() } };
 				state.result = snapshot({ ...result, isError: false });
 				appendExecutionPath(pi, { id: input.id, ...state.executionPath!, phase: "ended", status: "completed", toolErrors: state.rpc!.toolError, sessionFile: state.child!.sessionFile ?? undefined });
 				state.pathEnded = true;
 				return result;
 			} catch (error) {
-				const completed = Boolean(state.taskSent && state.childTerminal) || Boolean(state.readonlyStarted && state.readonlyTerminal);
-				progress.end(completed ? COMPLETED_STATUS : ABNORMAL_STATUS);
+				progress.end(ABNORMAL_STATUS, `失败阶段：${state.stage ?? "未取得"}`);
 				const childSession = state.child?.sessionFile ?? state.readonlyReference?.sessionFile;
-				const text = (error instanceof Error ? error.message : String(error)) + (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。") + (typeof state.readonlyReference?.reviewDirectory === "string" ? `\n审查制品：${state.readonlyReference.reviewDirectory}` : "") + (state.child && !state.taskSent ? "\n子任务尚未发送，Session 文件可能尚未生成。" : "") + (state.rpc || state.readonlyReference?.pid ? `\n子收尾核验：${state.childTerminal || state.readonlyTerminal ? "已取得证明，交接时仍须复核。" : "未取得证明，保持关闭。"}` : "") + `\n父 Session：${state.sessionFile}\n本次工具调用：${state.id}` + (state.lease ? "\n父 writer 尚待本次工具结果落盘后核验交接；此失败结果不证明已交回，可用 /delivery-status 核对现场。" : "");
+				const toolFailure = state.rpc?.toolError ?? state.toolErrors ? "\n工具失败：子 Agent 存在工具失败，不能把正常进程退出当作检查通过。" : "";
+				const text = `失败阶段：${state.stage ?? "未取得"}\n` + (error instanceof Error ? error.message : String(error)) + toolFailure + (typeof childSession === "string" ? `\n原始子 Session：${childSession}` : "\n子 Session 引用尚未取得。") + (typeof state.readonlyReference?.reviewDirectory === "string" ? `\n审查制品：${state.readonlyReference.reviewDirectory}` : "") + (state.child && !state.taskSent ? "\n子任务尚未发送，Session 文件可能尚未生成。" : "") + (state.rpc || state.readonlyReference?.pid ? `\n子收尾核验：${state.childTerminal || state.readonlyTerminal ? "已取得证明，交接时仍须复核。" : "未取得证明，保持关闭。"}` : "") + `\n父 Session：${state.sessionFile}\n本次工具调用：${state.id}` + (state.lease ? "\n父 writer 尚待本次工具结果落盘后核验交接；此失败结果不证明已交回，可用 /delivery-status 核对现场。" : "");
 				const failure = new Error(text, { cause: error });
 				if (state.executionPath && !state.pathEnded) {
 					appendExecutionPath(pi, { id: input.id, ...state.executionPath, phase: "ended", status: state.childTerminal || state.readonlyTerminal ? "failed" : "unknown",
@@ -328,7 +369,7 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				}
 				state.result = snapshot({ content: [{ type: "text", text }], details: { executionFacts: executionFacts(state) }, isError: true });
 				throw failure;
-			} finally { state.finished = true; if (!state.attemptedLease && active === state) active = undefined; }
+			} finally { state.finished = true; }
 		});
 		return state.run;
 	}
@@ -342,7 +383,12 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 			if (state.owner.kind === "child") await state.leases.releaseChild(state.lease, state.owner, state.parent, verify, state.lifetime.signal);
 			else await state.leases.releaseParent(state.lease, state.owner, verify, state.lifetime.signal);
 			active = undefined;
-		} catch (error) { state.fault = String(error); ctx.ui.notify(`交付 writer 未交回，保持关闭：${state.fault}`, "error"); }
+		} catch (error) {
+			state.stage = "writer 交接";
+			state.progress?.stage("writer 交接", "交付 writer 未交回，保持关闭");
+			state.fault = String(error);
+			ctx.ui.notify(`交付 writer 未交回，保持关闭：${state.fault}`, "error");
+		}
 	}
 	const settle = async (_event: unknown, ctx: ExtensionContext) => { if (finishing) return finishing; finishing = finish(ctx); try { await finishing; } finally { finishing = undefined; } };
 	pi.on("turn_end", settle);

@@ -20,6 +20,9 @@ test("复杂开发由独立子 Agent 完成并核实 writer 收尾", { timeout: 
 	const result = await h.call("delivery_develop", { task: "创建 src/value.js，将 value 从 1 改为 2 并读取文件核对。", paths: ["src"], inputs: [] });
 	assert.equal(result.isError, false, JSON.stringify(result));
 	assert.equal((result.details as any).progress.status, COMPLETED_STATUS);
+	assert.equal((result.details as any).progress.stage, "父结果与 writer 交接");
+	assert.equal((result.details as any).executionFacts.stage, "父结果与 writer 交接");
+	assert.equal((result.details as any).executionFacts.childProcessExit.code, 0);
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 2;\n");
 	assert.equal(await h.readLease(), undefined);
 	const child = (await h.audit()).find((row) => row.child && row.phase === "start");
@@ -62,6 +65,9 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	assert.match(JSON.stringify(reviewed.content), /独立验收和审查/);
 	assert.ok((reviewed.details as any).candidate.digest);
 	assert.equal((reviewed.details as any).reviewStatus, "valid");
+	assert.equal((reviewed.details as any).progress.stage, "父结果与 writer 交接");
+	assert.equal((reviewed.details as any).executionFacts.stage, "父结果与 writer 交接");
+	assert.equal((reviewed.details as any).executionFacts.readonlySessionPersisted, true);
 	const paths = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === EXECUTION_PATH_ENTRY).map((row: any) => row.data);
 	assert.ok(paths.some((row: any) => row.path === "delivery_develop"));
 	assert.ok(paths.some((row: any) => row.path === "delivery_review" && row.phase === "ended" && row.status === "completed"));
@@ -83,6 +89,7 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	await mkdir(leaseDirectory, { recursive: true });
 	await writeFile(blockedLease, "broken");
 	await h.session.prompt("/delivery-exit");
+	assert.match(h.notices.at(-1)!, /\/delivery-status details.*\/delivery-unlock.*\/delivery-exit/);
 	await access(path.dirname(diffFile));
 	assert.ok(h.session.getActiveToolNames().includes("write"));
 	await rm(blockedLease);
@@ -103,8 +110,46 @@ test("审查替身违反职责执行写入时，审查结论失效并记录实�
 	assert.match(JSON.stringify(reviewed.content), /未形成有效结论.*候选发生变化/);
 	assert.match(JSON.stringify(reviewed.content), /不能用于判断当前候选/);
 	assert.match(JSON.stringify((reviewed.details as any).executionFacts), /readonlySessionPersisted.*true/);
+	assert.equal((reviewed.details as any).executionFacts.stage, "审查候选核对");
+	assert.equal((reviewed.details as any).progress.status, "异常退出");
 	assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 3;\n");
 	assert.equal(await h.readLease(), undefined);
+});
+
+test("审查子被 SIGKILL 后保留未知终态和 lease", { timeout: 60_000 }, async (t) => {
+	const h = await host(t, "review-crash");
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await h.prepare();
+	const reviewed = await h.call("delivery_review", { task: "独立检查并运行相关验证。", paths: ["src"], inputs: [] });
+	assert.equal(reviewed.isError, true, JSON.stringify(reviewed));
+	assert.match(JSON.stringify(reviewed.content), /失败阶段：子 Session 收尾/);
+	const facts = (reviewed.details as any).executionFacts;
+	assert.equal(facts.readonlySessionPersisted, false);
+	assert.equal(facts.childProcessExit.signal, "SIGKILL");
+	assert.equal(facts.reviewDirectory !== undefined, true);
+	assert.equal((await h.readLease())?.owner.kind, "parent");
+});
+
+test("父回合中断审查时保留中断阶段、子 Session 引用和 lease", { timeout: 60_000 }, async (t) => {
+	const h = await host(t, "review-wait");
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await h.prepare();
+	const run = h.call("delivery_review", { task: "独立检查并等待父回合收尾。", paths: ["src"], inputs: [] });
+	const deadline = Date.now() + 15_000;
+	while (!(await h.audit()).some((row) => row.child && row.phase === "review-waiting")) {
+		assert.ok(Date.now() < deadline, "未观察到审查子等待");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	await h.session.abort();
+	const reviewed = await run;
+	assert.equal(reviewed.isError, true, JSON.stringify(reviewed));
+	const facts = (reviewed.details as any).executionFacts;
+	assert.match(JSON.stringify(reviewed.content), /失败阶段：子 Session 收尾/);
+	assert.ok(facts.interruption);
+	assert.equal(typeof facts.readonlySessionFile, "string");
+	assert.equal(await h.readLease(), undefined, "可核实的用户取消完成正常 writer 交回");
 });
 
 test("方案确认不冻结开发路径，节点调整和返工只记录新的调用范围", { timeout: 60_000 }, async (t) => {
@@ -126,10 +171,25 @@ test("方案确认不冻结开发路径，节点调整和返工只记录新的�
 test("开发和审查调用拒绝空范围、越界路径和父维护台账", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	await h.prepare();
-	assert.equal((await h.call("delivery_develop", { task: "空范围", paths: [], inputs: [] })).isError, true);
-	assert.equal((await h.call("delivery_develop", { task: "越出 worktree", paths: ["../outside"], inputs: [] })).isError, true);
-	assert.equal((await h.call("delivery_review", { task: "审查台账", paths: ["plan.md"], inputs: [] })).isError, true);
-	assert.equal((await h.call("delivery_review", { task: "审查输入越界", paths: ["src"], inputs: ["../outside"] })).isError, true);
+	const rejected = async (name: string, args: Record<string, unknown>, patterns: RegExp[]) => {
+		const result = await h.call(name, args);
+		assert.equal(result.isError, true, JSON.stringify(result));
+		const text = JSON.stringify(result.content);
+		for (const pattern of patterns) assert.match(text, pattern);
+		assert.equal((result.details as any).executionFacts?.stage, "调用前范围校验");
+		return result;
+	};
+	await rejected("delivery_develop", { task: "空范围", paths: [], inputs: [] }, [/调用前范围校验/, /非空 paths/]);
+	await rejected("delivery_develop", { task: "越出 worktree", paths: ["../outside"], inputs: [] }, [/调用前范围校验/, /当前 worktree/]);
+	for (const args of [
+		{ task: "审查台账精确命中", paths: ["plan.md"], inputs: [] },
+		{ task: "审查台账目录重叠", paths: ["."], inputs: [] },
+		{ task: "审查输入重叠", paths: ["src"], inputs: ["./plan.md"] },
+		{ task: "审查台账相对路径", paths: ["./plan.md"], inputs: [] },
+	]) {
+		const result = await rejected("delivery_review", args, [/父维护规划文档/, /冲突范围：(?:paths=.*(?:plan\.md|\.)|inputs=.*plan\.md)/, /子 Session 尚未启动/]);
+		assert.match(JSON.stringify(result.details), /调用前范围校验/);
+	}
 	assert.equal(await h.readLease(), undefined);
 	assert.equal((await h.audit()).filter((row) => row.child).length, 0);
 });
