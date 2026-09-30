@@ -45,7 +45,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	pi.on("before_agent_start", (event, ctx) => {
 		promptOptions = structuredClone(event.systemPromptOptions);
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。Pi 的交付命令（\`/delivery-shape\`、\`/delivery-exit\`、\`/delivery-unlock\` 等）由用户命令入口执行，不由模型执行也不会因模型回复而生效：如果用户消息里出现命令名、尤其是没有前导斜杠（例如单独一条 \`delivery-exit\`），说明该命令没有执行。此时不要声称已启用、已退出或已批准，要说明该命令未生效，提示用户等当前执行结束后重新输入 \`/命令\`，并可用 \`/delivery-status\` 核对。若状态中仍有 writer lease，\`/delivery-exit\` 不能清理它：确认没有在途任务后，先让用户执行 \`/delivery-unlock\`，再核对 \`/delivery-status details\` 并重试 \`/delivery-exit\`。`
+			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n不要把规划目标、旧记录或模型声明当成已实现功能或用户批准。Pi 的交付命令（\`/delivery-shape\`、\`/delivery-exit\`、\`/delivery-unlock\` 等）由用户命令入口执行，不由模型执行也不会因模型回复而生效：如果用户消息里出现命令名、尤其是没有前导斜杠（例如单独一条 \`delivery-exit\`），说明该命令没有执行。此时不要声称已启用、已退出或已批准，要说明该命令未生效，提示用户等当前执行结束后重新输入 \`/命令\`，并可用 \`/delivery-status\` 核对。若状态中仍有 writer lease，\`/delivery-exit\` 不能清理它：确认没有在途任务后，先让用户执行 \`/delivery-unlock\`，再核对 \`/delivery-status details\`；如果明确提示已复位同一父进程中已结束且有 fault 的已知运行态，且方案确认仍有效，可以重新核对现场后重试交付任务；仍保留交付状态时再重试 \`/delivery-exit\`。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守本次节点范围，不修改父规划文档、不批准或继续委派。"
 					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n方案确认后由 AI 内部维护实施计划：简单任务由父 Pi 直接修改并检查，复杂任务按需委派。每次委派明确提供当前 paths 和 inputs；范围内调整不重复请求确认。需要持续维护时沿用已有方案/台账；Markdown 编辑使用父文档工具并保留用户内容，每回合一次变更。委派时按工作场景、复杂度和风险选择推理级别，不另选模型。")
@@ -188,9 +188,15 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				].join("\n");
 				if (!await ctx.ui.confirm("强制清理残留 writer 记录？", evidence)) { ctx.ui.notify("未清理，现场保持原样。", "info"); return; }
 				const removed = await leases.discard(workspace.key, blockage);
+				const reconciled = blockage.lease?.leaseId ? developer.reconcileAfterUnlock(workspace.key, blockage.lease.leaseId) : undefined;
 				pi.appendEntry("delivery-unlock", { workspaceKey: workspace.key, leaseId: blockage.lease?.leaseId, owner,
-					operationLock: removed.operationLock, at: new Date().toISOString() });
-				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。下一步：用 /delivery-status 核对现场；确认没有新的在途任务后重试 /delivery-exit，代码改动需自行检查。`, "warning");
+					operationLock: removed.operationLock, at: new Date().toISOString(),
+					...(reconciled ? { reconciledRunId: reconciled.runId, inMemoryState: "cleared" } : { inMemoryState: developer.pending ? "retained" : "none" }) });
+				const next = reconciled
+					? "已复位父进程中的已知失败运行态；旧失败事实仍保留在本次 Session，可在方案确认有效且现场重新核对后重试交付任务。"
+					: developer.pending ? "父进程仍保留未能安全复位的交付状态；先用 /delivery-exit 结束当前交付并重载，再重新 /delivery-shape 和确认方案。"
+					: "下一步用 /delivery-status 核对现场；确认没有新的在途任务后重试 /delivery-exit。";
+				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。${next} 代码改动需自行检查。`, "warning");
 			} catch (error) {
 				ctx.ui.notify(`未清理：${error instanceof Error ? error.message : String(error)}`, "error");
 			}

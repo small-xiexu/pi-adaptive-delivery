@@ -131,6 +131,56 @@ test("审查子被 SIGKILL 后保留未知终态和 lease", { timeout: 60_000 },
 	assert.equal((await h.readLease())?.owner.kind, "parent");
 });
 
+test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeout: 90_000 }, async (t) => {
+	const h = await host(t, "review-crash");
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await h.prepare();
+	const first = await h.call("delivery_review", { task: "独立检查并运行相关验证。", paths: ["src"], inputs: [] });
+	assert.equal(first.isError, true, JSON.stringify(first));
+	assert.equal((await h.readLease())?.owner.kind, "parent");
+	const firstStarts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
+
+	await h.session.prompt("/delivery-unlock");
+	await h.session.waitForIdle();
+	assert.match(h.notices.at(-1)!, /已复位父进程中的已知失败运行态/);
+	assert.equal(await h.readLease(), undefined);
+	const unlock = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");
+	assert.equal(unlock?.type, "custom");
+	assert.equal((unlock.data as any).inMemoryState, "cleared");
+	assert.equal(typeof (unlock.data as any).reconciledRunId, "string");
+
+	const second = await h.call("delivery_review", { task: "重新独立检查并运行相关验证。", paths: ["src"], inputs: [] });
+	assert.equal(second.isError, true, JSON.stringify(second));
+	const secondStarts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
+	assert.equal(secondStarts, firstStarts + 1, "解锁后应启动新的审查子 Session，而不是被旧 active fault 拒绝");
+	assert.equal((await h.readLease())?.owner.kind, "parent", "第二次审查自身仍失败时应继续保留 lease");
+});
+
+test("lease ID 不匹配时解锁不复位 fault，仍阻止重放交付任务", { timeout: 90_000 }, async (t) => {
+	const h = await host(t, "review-crash");
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await h.prepare();
+	const failed = await h.call("delivery_review", { task: "制造可核对的异常审查终态。", paths: ["src"], inputs: [] });
+	assert.equal(failed.isError, true, JSON.stringify(failed));
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const leaseFile = path.join(await getWriterStateRoot(workspace), "leases", `${workspace.key}.json`);
+	const record = JSON.parse(await readFile(leaseFile, "utf8"));
+	record.leaseId = "replacement-lease-for-test";
+	await writeFile(leaseFile, `${JSON.stringify(record)}\n`);
+
+	await h.session.prompt("/delivery-unlock");
+	await h.session.waitForIdle();
+	assert.match(h.notices.at(-1)!, /仍保留未能安全复位的交付状态/);
+	const unlock = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");
+	assert.equal(unlock?.type, "custom");
+	assert.equal((unlock.data as any).inMemoryState, "retained");
+	const retry = await h.call("delivery_review", { task: "不得绕过未匹配的 fault 状态。", paths: ["src"], inputs: [] });
+	assert.equal(retry.isError, true, JSON.stringify(retry));
+	assert.match(JSON.stringify(retry.content), /交付 writer 尚未完成交接或已关闭/);
+});
+
 test("父回合中断审查时保留中断阶段、子 Session 引用和 lease", { timeout: 60_000 }, async (t) => {
 	const h = await host(t, "review-wait");
 	await mkdir(path.join(h.cwd, "src"));

@@ -411,6 +411,13 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		review: (input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext, update: ProgressUpdate) => execute(REVIEW_TOOL, input, signal, ctx, update),
 		get progress() { return active?.progress?.snapshot(); },
 		get pending() { return active !== undefined; },
+		// 仅在用户确认并成功清理与本运行态绑定的 lease 后，复位已结束的内存 fault；未知或仍在途状态继续关闭。
+		reconcileAfterUnlock(workspaceKey: string, leaseId: string): { runId: string; fault: string } | undefined {
+			const state = active;
+			if (!state || !state.finished || !state.fault || state.lease?.workspaceKey !== workspaceKey || state.lease.leaseId !== leaseId) return undefined;
+			active = undefined;
+			return { runId: state.id, fault: state.fault };
+		},
 		// 已结束且未自动收尾的失败是终态记录，不是仍在途的执行。
 		get fault() { return active?.fault; },
 	};
