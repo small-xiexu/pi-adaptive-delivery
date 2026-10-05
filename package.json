@@ -1,7 +1,7 @@
 {
   "name": "pi-adaptive-delivery",
-  "version": "0.1.11",
-  "description": "Adaptive, approval-gated delivery orchestration for Pi coding tasks",
+  "version": "0.1.12",
+  "description": "A Pi coding workflow that confirms the plan before changes, delegates complex tasks, runs checks, and supports independent review.",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -16,10 +16,12 @@
     "node": ">=22.19.0"
   },
   "keywords": [
-    "pi-package",
+    "pi",
     "pi-coding-agent",
-    "delivery",
-    "subagents"
+    "approval-gated",
+    "code-review",
+    "subagents",
+    "developer-workflow"
   ],
   "files": [
     "README.md",
