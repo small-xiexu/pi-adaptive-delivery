@@ -189,7 +189,12 @@ test("真实 Pi 工具组件折叠为两行、展开有界，错误终态与恢�
 		assert.match(rows.join(""), /运行中/, "窄屏不能把真实状态截断到长任务名称之后");
 		assert.ok(!rows.join("").includes("耗时"));
 	}
-	progress.phase("运行中", "最近操作", "/tmp/child.jsonl");
+	progress.phase("子 Agent 工具执行", "最近操作", "/tmp/child.jsonl");
+	progress.agent({ provider: "fixture", id: "gpt-6.1-sol", thinking: "high", reason: "按任务要求选择" });
+	component.setExpanded(false);
+	const compact = component.render(80).join("\n");
+	assert.match(compact, /最近操作/);
+	assert.doesNotMatch(compact, /阶段：|gpt-6\.1-sol|high/);
 	progress.event({ type: "tool_execution_update", partialResult: { content: [{ type: "text", text: "OUTPUT\n\x1b]0;INJECT\x07" + "X".repeat(5000) }] } });
 	component.setExpanded(true);
 	const expanded = component.render(80).join("\n");

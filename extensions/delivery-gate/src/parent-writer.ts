@@ -1,12 +1,45 @@
 import { readFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
-import type { AgentToolResult, EditToolInput, ExtensionAPI, ExtensionContext, SessionEntry, WriteToolInput } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import type { AgentToolResult, EditToolInput, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolRenderResultOptions, WriteToolInput } from "@earendil-works/pi-coding-agent";
 import { createPlanningDocumentTools } from "./planning-documents.ts";
 import path from "node:path";
 import { getWriterStateRoot, resolveWorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
 
 export const DOCUMENT_EDIT_TOOL = "delivery_document_edit";
 export const DOCUMENT_WRITE_TOOL = "delivery_document_write";
+
+type DocumentRenderArgs = { path?: string; file_path?: string; content?: string; edits?: unknown[] };
+
+function documentPath(args: DocumentRenderArgs | undefined, cwd?: string): string {
+	const value = args?.file_path ?? args?.path;
+	if (typeof value !== "string" || !value.trim()) return "未指定路径";
+	if (cwd && path.isAbsolute(value)) {
+		const relative = path.relative(cwd, value);
+		if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
+	}
+	return value;
+}
+
+function documentSummary(args: DocumentRenderArgs | undefined, cwd?: string): string {
+	if (Array.isArray(args?.edits)) return `编辑规划文档 · ${documentPath(args, cwd)} · ${args.edits.length} 处变更`;
+	return `写入规划文档 · ${documentPath(args, cwd)}`;
+}
+
+export const documentRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
+	renderCall(args, theme, context) {
+		return new Text(theme.fg("toolTitle", theme.bold(documentSummary(args as DocumentRenderArgs, context.cwd))), 0, 0);
+	},
+	renderResult(result, _options: ToolRenderResultOptions, theme, context) {
+		const args = context.args as DocumentRenderArgs | undefined;
+		if (context.isError || result.isError) {
+			const message = result.content.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ").trim();
+			return new Text(theme.fg("error", `规划文档更新失败：${message || "未取得错误详情"}`), 0, 0);
+		}
+		const action = Array.isArray(args?.edits) ? "已更新规划文档" : "已写入规划文档";
+		return new Text(theme.fg("toolOutput", `${action}：${documentPath(args, context.cwd)}`), 0, 0);
+	},
+};
 
 export interface SessionBinding {
 	cwd: string;

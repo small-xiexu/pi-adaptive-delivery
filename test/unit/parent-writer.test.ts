@@ -9,7 +9,7 @@ import path from "node:path";
 import test from "node:test";
 import { SessionManager, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, JsonObject, ToolResultMessage } from "@earendil-works/pi-ai";
-import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "../../extensions/delivery-gate/src/parent-writer.ts";
+import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, documentRenderers } from "../../extensions/delivery-gate/src/parent-writer.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
 import { approvalUI } from "../support/delivery-ui.ts";
 
@@ -17,6 +17,17 @@ function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	return { role: "assistant", content, api: "openai-completions", provider: "fixture", model: "fake", stopReason: "toolUse", timestamp: Date.now(),
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 }
+
+test("文档工具卡片只显示操作摘要，不在主记录展开原始替换文本", () => {
+	const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value } as any;
+	const args = { path: "docs/plan.md", edits: [{ oldText: "内部实现细节", newText: "简短结果" }] };
+	const context = { args } as any;
+	const call = documentRenderers.renderCall!(args, theme, context).render(200).join("");
+	assert.match(call, /编辑规划文档 · docs\/plan\.md · 1 处变更/);
+	assert.doesNotMatch(call, /oldText|newText|内部实现细节|简短结果/);
+	const result = documentRenderers.renderResult!({ content: [{ type: "text", text: "Successfully replaced text" }], details: {}, isError: false }, { expanded: false, isPartial: false }, theme, context).render(200).join("");
+	assert.equal(result.trimEnd(), "已更新规划文档：docs/plan.md");
+});
 
 async function host(existing?: string) {
 	const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "parent-writer-")));

@@ -292,7 +292,9 @@ test("卡片只显示已核实模型，原生记录重开后保留选择理由�
 	card.updateResult({ content: [], details: { progress: progress.snapshot() }, isError: false }, true);
 	const rows = card.render(80).filter((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trim());
 	assert.equal(rows.length, 2);
-	assert.match(rows[1]!, /fixture-reasoner.*high/);
+	assert.doesNotMatch(rows[1]!, /fixture-reasoner.*high/);
+	card.setExpanded(true);
+	assert.match(card.render(80).join("\n"), /fixture-reasoner.*high/);
 	sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "a", name: tool.name, arguments: { task: "核对代码" } }], timestamp: Date.now() } as any);
 	sm.appendCustomEntry("delivery-development", { id: "a", agent, childSessionFile: path.join(root, "child.jsonl") });
 	assert.deepEqual(taskDetails({ sessionManager: sm }, [])[0]!.agent, agent);

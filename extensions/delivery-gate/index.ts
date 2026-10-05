@@ -6,7 +6,7 @@ import { inheritedTools, installPolicy, CAPABILITY_NOTICE } from "./src/policy.t
 import { GIT_STATUS_TOOL, readGitStatus, getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "./src/workspace.ts";
 import { CHILD_ENV, CHILD_READY, CHILD_EXIT, CHILD_STOP, DELEGATE_TOOL, DELEGATION_ENTRY, delegateReadOnly, snapshotReadOnlyEnvironment } from "./src/subagents.ts";
 import { installApprovals } from "./src/approvals.ts";
-import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL } from "./src/parent-writer.ts";
+import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, documentRenderers } from "./src/parent-writer.ts";
 import { CHILD_ARM, DEVELOPMENT_ENTRY, DEVELOPMENT_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
 import { cleanupReviewArtifacts } from "./src/review.ts";
 import { createTaskProgress, taskRenderers } from "./src/progress.ts";
@@ -115,12 +115,14 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	});
 	pi.registerTool({
 		name: DOCUMENT_EDIT_TOOL, label: "编辑规划文档",
+		...documentRenderers,
 		description: "默认允许父 TUI 精确编辑任务所需的 worktree 内 Markdown，无须文档授权。先读取现场并保留其他内容，每回合一次变更，原生结果落盘后才交回 writer；不编辑源码。",
 		parameters: createEditTool(".").parameters,
 		execute: (id, input, signal, _onUpdate, ctx) => writer.edit(id, input, signal, ctx),
 	});
 	pi.registerTool({
 		name: DOCUMENT_WRITE_TOOL, label: "写入规划文档",
+		...documentRenderers,
 		description: "默认允许父 TUI 创建或完整重写任务所需的 worktree 内 Markdown，无须文档授权。已有文件先读取并保留用户内容，局部修改使用 delivery_document_edit。每回合一次变更；不编辑源码。",
 		parameters: createWriteTool(".").parameters,
 		execute: (id, input, signal, _onUpdate, ctx) => writer.write(id, input, signal, ctx),

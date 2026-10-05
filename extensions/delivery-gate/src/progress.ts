@@ -164,7 +164,8 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 			const body = outputText(result);
 			const status = latest?.endedAt ? (latest.status === ABNORMAL_STATUS ? ABNORMAL_STATUS : COMPLETED_STATUS)
 				: isPartial ? RUNNING_STATUS : context.isError ? ABNORMAL_STATUS : COMPLETED_STATUS;
-			const heading = `${status} · ${label} · ${short((context.args as { task?: string })?.task ?? "项目检查", 64)}`;
+			const task = short((context.args as { task?: string })?.task ?? "项目检查", 40);
+			const heading = `${status} · ${label}${task ? ` · ${task}` : ""}`;
 			const completionNote = latest?.endedAt
 				? label === "审查" ? "审查已结束，结论见正文并由父 Pi 核对"
 					: label === "开发" ? "执行已结束，检查结论由父 Pi 核对"
@@ -172,7 +173,9 @@ export function taskRenderers(label: string, open?: (id: string) => void): Pick<
 						: undefined;
 			const stageNote = latest?.stage ? `阶段：${latest.stage}` : "";
 			const detailAction = completionNote ?? latest?.action ?? (isPartial ? "核对任务环境" : short(body));
-			const detail = [stageNote, latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking}` : "", detailAction].filter(Boolean).join(" · ");
+			const detail = expanded
+				? [stageNote, latest?.agent ? `${short(latest.agent.id, 32)} · ${latest.agent.thinking}` : "", detailAction].filter(Boolean).join(" · ")
+				: detailAction;
 			const component = {
 				invalidate() {},
 				render(width: number) {
