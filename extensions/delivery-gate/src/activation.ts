@@ -94,7 +94,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 					pi.appendEntry(ENTRY, { enabled: true, tools: originalTools });
 					await enter(ctx);
 				}
-				ctx.ui.notify("交付已启用。下一步：提交方案确认并开始实施；任务完成并核对结果后用 /delivery-exit 恢复普通工具。", "info");
+				ctx.ui.notify("交付已启用。这条流程适合需要先确认范围、验收或独立审查的任务；小改动、低风险任务可以继续使用普通 Pi。下一步：提交方案确认并开始实施；任务完成并核对结果后用 /delivery-exit 恢复普通工具。", "info");
 				if (args.trim()) pi.sendUserMessage(`先读取并遵循 ${fileURLToPath(new URL("../../../skills/adaptive-delivery/SKILL.md", import.meta.url))}，核实项目事实并对齐需求；明确需求可以零追问，简单任务无须规划文档。当前需求：\n${args}`, { expandPromptTemplates: false });
 			} finally { changing = false; }
 		},

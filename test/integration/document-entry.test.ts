@@ -128,7 +128,7 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	h.api.setActiveTools([...h.session.getActiveToolNames(), "write", "plugin_tool"]);
 	assert.equal((await h.call("write", { path: "blocked.txt", content: "原工具" })).isError, false);
 	assert.equal((await h.call("plugin_tool", {})).isError, false);
-	assert.match(h.prompts.at(-1)!, /交付已启用：保留 Pi 原有工具与权限检查/);
+	assert.match(h.prompts.at(-1)!, /交付已启用：小改动、低风险、范围明确的任务可以直接由父 Pi 完成/);
 	assert.ok(h.prompts.at(-1)!.includes(fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))));
 	await h.session.prompt("/delivery-exit");
 	assert.deepEqual(h.session.getActiveToolNames(), original);

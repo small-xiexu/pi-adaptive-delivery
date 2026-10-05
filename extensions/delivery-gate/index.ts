@@ -215,7 +215,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 				const executing = running.filter((task) => !task.endedAt);
 				const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
 				let stage = deliveryStage(approvals.confirmedStage === "design", !ctx.isIdle(), ctx.hasPendingMessages());
-				let next = approvals.confirmedStage === "design" ? "按内部实施计划核对实际改动、检查命令和审查结果；完成后退出交付。" : "整理方案并调用 delivery_approval 确认；中断后用 /delivery-resume 继续审阅。";
+				let next = approvals.confirmedStage === "design" ? "核对实际改动、检查命令和审查结果；完成后退出交付。" : "整理方案并提交给你确认；中断后用 /delivery-resume 继续审阅。";
 				if (approvals.pending) next = "在当前审阅面板选择确认、提出意见或暂停。";
 				if (executing.length) { if (approvals.confirmedStage === "design") stage = "实施进行中"; next = "等待当前任务收尾，再核对检查结论。"; }
 				else if (!ctx.isIdle() || ctx.hasPendingMessages()) next = "等待父 Pi 回合和排队消息收尾，再核对结果。";

@@ -28,7 +28,7 @@ interface Confirmed { approval: Approval; proposal: Proposal; sessionFile: strin
 
 const action = "确认方案并开始实施";
 const permission = "确认后 AI 自行维护实施计划，开始本机开发、检查、按需审查和返工。Shell 沿用 Pi 权限。\n提交、推送、PR、发布、部署及其他外部写入需另行授权。";
-export const executionInstruction = "方案已由用户确认并授权开始实施。请自行拆解并维护内部计划：简单任务保存在会话中，复杂任务沿用项目唯一台账，记录待完成、进行中、已完成、阻塞、返工及检查证据。简单任务由父 Pi 直接修改并运行项目已有检查；父 Pi 直接开始源码或测试实施节点前，先调用 delivery_path 记录 parent_direct、节点、理由和是否计划独立审查；复杂任务按需调用 delivery_develop，必要时调用 delivery_review，每次调用提供当前 paths 和 inputs。不再请求实施确认；文件数量、步骤、顺序、检查命令调整和范围内返工无需重新批准。只有业务目标、数据行为、对外接口、验收标准或未覆盖的重大外部风险变化时，暂停受影响工作并重新确认方案。完成后核对实际差异和检查结果再交付。";
+export const executionInstruction = "方案已由用户确认并授权开始实施。请自行拆解并维护内部计划：简单任务保存在会话中，复杂任务沿用项目唯一台账，记录待完成、进行中、已完成、阻塞、返工及检查证据。简单任务由父 Pi 直接修改并运行项目已有检查；父 Pi 直接开始源码或测试实施节点前，先调用 delivery_path 记录 parent_direct、节点、理由和是否计划独立审查；复杂任务按需调用 delivery_develop，必要时调用 delivery_review，每次调用提供当前 paths 和 inputs。不再请求实施确认；文件数量、步骤、顺序、检查命令调整和范围内返工无需重新批准。只有业务目标、数据行为、对外接口、验收标准或未覆盖的重大外部风险变化时，暂停受影响工作并重新确认方案。完成后核对实际差异和检查结果再交付，并固定列出修改内容、实际检查命令与退出码、独立审查、限制和未执行项；没有运行检查时明确写未运行，不得写成通过。";
 
 async function resolvePlan(request: Request, cwd: string) {
 	const paths = request.paths.map((value) => path.resolve(cwd, value));

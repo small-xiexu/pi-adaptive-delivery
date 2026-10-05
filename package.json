@@ -1,6 +1,6 @@
 {
   "name": "pi-adaptive-delivery",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "A Pi coding workflow that confirms the plan before changes, delegates complex tasks, runs checks, and supports independent review.",
   "license": "MIT",
   "type": "module",
