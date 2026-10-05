@@ -33,7 +33,7 @@ test("真实 Pi 同回合两个只读子并发运行，卡片事件和原始记�
 	assert.notEqual(results[0].result.details.sessionFile, results[1].result.details.sessionFile);
 });
 
-for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi", "boot-failure", "tool-fail", "readonly-recover", "recursive", "corrupt", "crash", "persistence", "ui", "cancel",
+for (const scenario of ["normal", "task-command", "missing-tools", "path-changed", "boot-failure", "tool-fail", "readonly-recover", "recursive", "corrupt", "crash", "persistence", "ui", "cancel",
 	"readonly-record-missing-newline", "readonly-record-duplicate-exit", "readonly-record-message-after-exit"]) {
 	test(`普通 Extension 的真实 RPC 委派：${scenario}`, { timeout: 40_000 }, async (t) => {
 		const fixture = await createPiFixture(source, scenario);
@@ -41,7 +41,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		t.after(() => rpc.stop());
 		const parent = (await rpc.send("get_state")).data;
 		await rpc.send("prompt", { message: "/fixture-parent-history" });
-		if (scenario === "missing-pi") await rpc.send("prompt", { message: "/fixture-hide-pi" });
+		if (scenario === "path-changed") await rpc.send("prompt", { message: "/fixture-hide-pi" });
 		const cursor = rpc.records.length;
 		await rpc.send("prompt", { message: "fixture-delegate" });
 		if (scenario === "cancel") {
@@ -72,7 +72,7 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		await rpc.waitFor((record) => record.type === "agent_settled", cursor);
 		const tool = rpc.records.find((record) => record.type === "tool_execution_end" && record.toolName === "delivery_readonly");
 		assert.ok(tool, "必须通过实际模型工具调用进入正式委派");
-		const success = scenario === "normal" || scenario === "task-command";
+		const success = ["normal", "task-command", "path-changed"].includes(scenario);
 		const toolErrors = ["tool-fail", "readonly-recover", "recursive"].includes(scenario);
 		const progress = rpc.records.filter((row) => row.type === "tool_execution_update" && row.toolName === "delivery_readonly").map((row) => row.partialResult.details.progress);
 		assert.ok(progress.length);
@@ -87,14 +87,10 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		if (toolErrors) assert.equal(tool.result.details.progress.status, "已完成");
 		const entries = (await rpc.send("get_entries")).data.entries;
 		const ended = entries.findLast((entry: any) => entry.type === "custom" && entry.customType === "delivery-delegation" && entry.data.phase === "ended")?.data;
-		if (scenario === "missing-pi") {
-			assert.equal(ended, undefined, "启动前拒绝不能伪造子进程终态");
-			const result = entries.findLast((entry: any) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "delivery_readonly");
-			assert.equal(result?.message.isError, true);
-			assert.match(JSON.stringify(result.message.content), /没有可用的已安装标准 Pi CLI/);
-			assert.match(JSON.stringify(result.message.content), /失败阶段：子 Session 启动/);
-			assert.match(JSON.stringify(result.message.content), /子 Session 尚未启动/);
-			assert.ok(!entries.some((entry: any) => entry.customType === "delivery-delegation"));
+		if (scenario === "path-changed") {
+			assert.ok(ended, "复用父 Pi CLI 时仍应创建子任务记录");
+			assert.equal(ended.parentSessionId, parent.sessionId);
+			assert.equal(ended.status, "completed");
 		} else {
 			assert.ok(ended, "原生父会话应记录实际委派引用与结果");
 			assert.equal(ended.parentSessionId, parent.sessionId);
@@ -131,16 +127,13 @@ for (const scenario of ["normal", "task-command", "missing-tools", "missing-pi",
 		if (ended?.pid) assert.throws(() => process.kill(ended.pid, 0), { code: "ESRCH" });
 		const events = await audit(fixture.agentDir);
 		const childStart = events.find((event) => event.child && event.phase === "start");
-		if (scenario === "missing-pi") assert.equal(childStart, undefined);
-		else {
-			assert.ok(childStart);
-			assert.ok(!childStart.tools.includes("delivery_readonly"));
-			assert.ok(!childStart.tools.includes("delivery_approval"));
-			assert.ok(!childStart.commands.includes("delivery-status"));
-			assert.notEqual(childStart.sessionId, parent.sessionId);
-		}
+		assert.ok(childStart);
+		assert.ok(!childStart.tools.includes("delivery_readonly"));
+		assert.ok(!childStart.tools.includes("delivery_approval"));
+		assert.ok(!childStart.commands.includes("delivery-status"));
+		assert.notEqual(childStart.sessionId, parent.sessionId);
 		assert.ok(!events.some((event) => event.child && event.parentMarkerSeen));
-		if (["missing-tools", "missing-pi", "boot-failure"].includes(scenario)) assert.ok(!events.some((event) => event.child && event.phase === "model"));
+		if (["missing-tools", "boot-failure"].includes(scenario)) assert.ok(!events.some((event) => event.child && event.phase === "model"));
 		if (scenario === "cancel") {
 			assert.ok(events.some((event) => event.child && event.phase === "aborted"));
 			assert.equal(events.filter((event) => !event.child && event.phase === "model").length, 1, "取消后父模型不得续跑");

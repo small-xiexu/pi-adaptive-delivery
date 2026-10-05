@@ -127,7 +127,7 @@ for (const kind of ["file", "symlink"]) test(`子 Pi 启动前拒绝工作区 ${
 function environmentFixture() {
 	const sourceInfo = { path: "read", source: "builtin", scope: "temporary" as const, origin: "top-level" as const };
 	const { name, description, parameters } = createReadTool("/repo");
-	const tools: ToolInfo[] = [{ name, description, parameters, sourceInfo }];
+	const tools: ToolInfo[] = [{ name, description, parameters, exposure: "direct", sourceInfo }];
 	const options: BuildSystemPromptOptions = { cwd: "/repo", customPrompt: "基础指令", appendSystemPrompt: "附加指令",
 		contextFiles: [{ path: "/repo/AGENTS.md", content: "规则正文，不复制到子握手" }],
 		skills: [{ name: "proof", description: "任务所需 Skill", filePath: "/repo/skills/proof/SKILL.md", baseDir: "/repo/skills/proof",

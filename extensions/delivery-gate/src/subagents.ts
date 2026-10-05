@@ -33,13 +33,31 @@ export function persistedAssistantFacts(message: any): string {
 
 // 只核对 Pi 已加载的基础输入，不重新发现资源，也不将规则正文复制到握手记录。
 export function snapshotReadOnlyEnvironment(options: BuildSystemPromptOptions, tools: ToolInfo[]): ReadOnlyEnvironment {
-	const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(normalizeForDigest(value))).digest("hex");
 	return {
-		tools: tools.map((tool) => ({ name: tool.name, digest: digest(tool) })).sort((a, b) => a.name.localeCompare(b.name)),
+		tools: tools.map((tool) => ({ name: tool.name, digest: digest({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+			promptGuidelines: tool.promptGuidelines,
+			exposure: tool.exposure,
+			namespace: tool.namespace,
+			annotations: tool.annotations,
+			sourceInfo: tool.sourceInfo,
+		}) })).sort((a, b) => a.name.localeCompare(b.name)),
 		instructions: digest([options.customPrompt ?? null, options.appendSystemPrompt ?? null]),
 		rules: digest(options.contextFiles ?? []),
 		skills: digest(options.skills ?? []),
 	};
+}
+
+function normalizeForDigest(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(normalizeForDigest);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value)
+		.filter(([, item]) => item !== undefined)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, item]) => [key, normalizeForDigest(item)]));
 }
 
 export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?: ReadOnlyEnvironment): void {
@@ -319,23 +337,38 @@ export async function startChild(input: ChildTask, kind: "readonly" | "developme
 		const relative = path.relative(workspacePath, file);
 		return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
 	};
-	let executable: string | undefined;
-	for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
-		const candidate = path.resolve(input.cwd, directory, "pi");
-		try { await access(candidate, constants.X_OK); }
-		catch (error) {
-			if (["ENOENT", "ENOTDIR", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
-			throw error;
-		}
-		const file = await realpath(candidate);
-		if (!outside(candidate) || !outside(file) || !(await stat(file)).isFile()) throw new Error("Pi 入口必须是工作区外的已安装标准 CLI，未执行项目入口");
-		executable = file;
-		break;
-	}
-	if (!executable) throw new Error("没有可用的已安装标准 Pi CLI，未启动子任务");
 	const node = await realpath(process.execPath);
 	if (!outside(node)) throw new Error("Pi 的 Node 解释器必须在工作区外");
-	// 不经 /usr/bin/env node 再次解析 PATH；仅支持当前标准 Node CLI 入口。
+
+	// CLI 进程优先复用启动父 Pi 的入口，避免 SDK/父 CLI 与 PATH 中另一份 Pi 混用。
+	// 单元测试和嵌入 SDK 没有可复用的 CLI 入口时，才回退到 PATH 查找。
+	let executable: string | undefined;
+	const currentScript = process.argv[1];
+	if (process.env.PI_CODING_AGENT === "true" && currentScript && !currentScript.startsWith("/$bunfs/root/")) {
+		try {
+			const candidate = await realpath(currentScript);
+			if (outside(candidate) && (await stat(candidate)).isFile()) executable = candidate;
+		}
+		catch (error) {
+			if (!(error instanceof Error) || !["ENOENT", "ENOTDIR", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+		}
+	}
+	if (!executable) {
+		for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+			const candidate = path.resolve(input.cwd, directory, "pi");
+			try { await access(candidate, constants.X_OK); }
+			catch (error) {
+				if (["ENOENT", "ENOTDIR", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+				throw error;
+			}
+			const file = await realpath(candidate);
+			if (!outside(candidate) || !outside(file) || !(await stat(file)).isFile()) throw new Error("Pi 入口必须是工作区外的已安装标准 CLI，未执行项目入口");
+			executable = file;
+			break;
+		}
+	}
+	if (!executable) throw new Error("没有可用的已安装标准 Pi CLI，未启动子任务");
+	// 不经 /usr/bin/env node 再次解析 PATH；优先执行父进程正在使用的 CLI 入口。
 	return new ChildRpc(spawn(node, [executable,
 		"--mode", "rpc", "--extension", input.entryPath,
 		"--provider", input.model.provider, "--model", input.model.id, "--thinking", input.thinking,
