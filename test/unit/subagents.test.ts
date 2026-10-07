@@ -78,6 +78,53 @@ for (const kind of ["malformed", "mismatch", "truncated", "exit", "error"]) {
 	});
 }
 
+for (const kind of ["json", "tool-end", "extension", "callback"] as const) {
+	test(`子 Pi ${kind} 异常保留原始原因与事件标识，停止后仍返回失败`, async () => {
+		const { rpc, process, emit } = fixture();
+		const signals: string[] = [];
+		process.kill = (signal: string) => { signals.push(signal); process.emit("close", 143, null); return true; };
+		const controller = new AbortController();
+		const patterns = kind === "json" ? [/RPC JSON 解析失败/, /SyntaxError/]
+			: kind === "tool-end" ? [/工具终态无对应开始事件/, /type="tool_execution_end"/, /toolCallId="orphan"/, /toolName="read"/]
+			: kind === "extension" ? [/CONFIGURED_EVENT_FAILURE/, /type="extension_error"/, /extensionPath="\/fixture\/plugin\.ts"/, /event="turn_end"/]
+			: [/FIXTURE_CALLBACK_FAILURE/, /type="message_end"/];
+		const rejected = assert.rejects(rpc.waitSettled(controller.signal), (error: Error) => {
+			for (const pattern of patterns) assert.match(error.message, pattern);
+			assert.doesNotMatch(error.message, /FIXTURE_PAYLOAD_MUST_NOT_BE_COPIED/);
+			return true;
+		});
+		if (kind === "json") process.stdout.write("invalid\n");
+		else if (kind === "tool-end") emit({ type: "tool_execution_end", toolCallId: "orphan", toolName: "read", isError: false,
+			result: { content: [{ type: "text", text: "FIXTURE_PAYLOAD_MUST_NOT_BE_COPIED" }] } });
+		else if (kind === "extension") emit({ type: "extension_error", extensionPath: "/fixture/plugin.ts", event: "turn_end", error: "CONFIGURED_EVENT_FAILURE" });
+		else {
+			rpc.onEvent = () => { throw new Error("FIXTURE_CALLBACK_FAILURE"); };
+			emit({ type: "message_end", message: { content: "FIXTURE_PAYLOAD_MUST_NOT_BE_COPIED" } });
+		}
+		await rejected;
+		assert.ok(rpc.failure?.cause instanceof Error);
+		const firstFailure = rpc.failure;
+		await assert.rejects(rpc.stop("/fixture/entry.ts"), (error: Error) => {
+			for (const pattern of patterns) assert.match(error.message, pattern);
+			return true;
+		});
+		assert.deepEqual(signals, ["SIGTERM"]);
+		assert.deepEqual(rpc.exit, { code: 143, signal: null });
+		assert.equal(rpc.failure, firstFailure);
+		await assert.rejects(rpc.request({ type: "get_state" }), (error: unknown) => error === firstFailure);
+	});
+}
+
+test("子 Pi 错误与事件标识有界，不复制工具参数或结果", () => {
+	const { rpc, process, emit } = fixture();
+	emit({ type: "extension_error", extensionPath: "/fixture/" + "x".repeat(10_000), event: "turn_end",
+		error: "CONFIGURED_EVENT_FAILURE" + "y".repeat(10_000), args: { path: "FIXTURE_PAYLOAD_MUST_NOT_BE_COPIED" } });
+	assert.match(rpc.failure!.message, /CONFIGURED_EVENT_FAILURE/);
+	assert.ok(rpc.failure!.message.length < 6000);
+	assert.doesNotMatch(rpc.failure!.message, /FIXTURE_PAYLOAD_MUST_NOT_BE_COPIED/);
+	process.emit("close", 143, null);
+});
+
 test("取消中断等待；收尾按 clear_queue→abort，并等待真实 close", async () => {
 	const { rpc, process, requests, emit } = fixture();
 	const controller = new AbortController();

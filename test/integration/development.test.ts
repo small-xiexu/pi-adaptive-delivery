@@ -6,12 +6,44 @@ import { createDevelopmentHost as host } from "../support/development-host.ts";
 import { COMPLETED_STATUS } from "../../extensions/delivery-gate/src/progress.ts";
 import { getWriterStateRoot, resolveWorkspaceIdentity } from "../../extensions/delivery-gate/src/workspace.ts";
 import { EXECUTION_PATH_ENTRY } from "../../extensions/delivery-gate/src/execution-path.ts";
+import { plainTheme } from "../support/delivery-ui.ts";
+import type { DeliveryPanel, DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
+import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
 test("没有方案确认时不启动开发或审查子 Agent", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	assert.equal((await h.call("delivery_develop", { task: "未批准开发", paths: ["src"], inputs: [] })).isError, true);
 	assert.equal((await h.call("delivery_review", { task: "未批准审查", paths: ["src"], inputs: [] })).isError, true);
 	assert.ok(!(await h.audit()).some((row) => row.child));
+});
+
+test("重载后重新审阅说明旧确认不可用，暂停不恢复权限，明确确认产生新记录", { timeout: 60_000 }, async (t) => {
+	const h = await host(t);
+	await h.prepare();
+	await h.session.reload();
+	await h.session.prompt("/delivery-shape");
+	const denied = await h.call("delivery_develop", { task: "不能沿用旧确认开发", paths: ["src"], inputs: [] });
+	assert.equal(denied.isError, true);
+	assert.match(JSON.stringify(denied.content), /解除任务占用不会恢复旧确认/);
+	let accept = false;
+	h.setCustom((async (factory) => {
+		let answer: unknown;
+		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
+			(value) => { answer = value; }) as DesignReviewPanel;
+		assert.match(panel.render(100).join("\n"), /旧实施确认已不可用，需要重新确认本次方案/);
+		if (accept) { panel.handleInput("\x1b[A"); panel.handleInput("\x1b[A"); }
+		panel.handleInput("\r");
+		return answer;
+	}) as ExtensionUIContext["custom"]);
+	const paused = await h.approve("design", ["plan.md"], "沿用现有目标，核对当前代码后继续修复。\n本次假设：无");
+	assert.equal((paused.details as any).paused, true);
+	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length, 1);
+	assert.ok(!(await h.audit()).some((row) => row.child), "恢复说明和暂停不会启动子任务");
+	accept = true;
+	const approved = await h.approve("design", ["plan.md"], "沿用现有目标，核对当前代码后继续修复。\n本次假设：无");
+	assert.equal((approved.details as any).approved, true);
+	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === "delivery-approval").length, 2);
+	assert.notEqual((approved.details as any).proposalId, (paused.details as any).proposalId);
 });
 
 test("复杂开发由独立子 Agent 完成并核实 writer 收尾", { timeout: 40_000 }, async (t) => {
@@ -131,6 +163,50 @@ test("审查子被 SIGKILL 后保留未知终态和 lease", { timeout: 60_000 },
 	assert.equal((await h.readLease())?.owner.kind, "parent");
 });
 
+for (const name of ["delivery_develop", "delivery_review"] as const) {
+	test(`${name} 子扩展异常在父返回和持久记录中保留原始原因，未知收尾仍保留 lease`, { timeout: 60_000 }, async (t) => {
+		const h = await host(t, "child-extension-error");
+		await mkdir(path.join(h.cwd, "src"));
+		await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+		await h.prepare();
+		const result = await h.call(name, { task: "核对扩展异常与 writer 收尾。", paths: ["src"], inputs: [] });
+		assert.equal(result.isError, true, JSON.stringify(result));
+		const facts = (result.details as any).executionFacts;
+		const original = ["FIXTURE_CHILD_EXTENSION_ERROR", 'type="extension_error"', 'event="tool_execution_end"',
+			`extensionPath=${JSON.stringify(path.join(h.packageDir, "provider.ts"))}`];
+		const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+		for (const value of original) {
+			assert.ok(text.includes(value), text);
+			assert.ok(facts.childProcessFailure.includes(value), facts.childProcessFailure);
+		}
+		assert.match(text, /交付任务收尾失败/);
+		assert.deepEqual(facts.childProcessExit, { code: 143, signal: null });
+		assert.equal(name === "delivery_review" ? facts.readonlySessionPersisted : facts.childSessionPersisted, false);
+		const child = (await h.audit()).find((row) => row.child && row.phase === "start");
+		assert.ok(child);
+		assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+		const lease = await h.readLease();
+		assert.ok(lease);
+		assert.equal(lease.owner.kind, name === "delivery_review" ? "parent" : "child");
+
+		const rows = (await readFile(h.sm.getSessionFile()!, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+		const persisted = rows.find((row) => row.type === "message" && row.message?.role === "toolResult" && row.message.toolCallId === result.toolCallId);
+		assert.deepEqual(persisted.message.content, result.content);
+		assert.equal(persisted.message.details.executionFacts.childProcessFailure, facts.childProcessFailure);
+		if (name === "delivery_review") {
+			const ended = rows.find((row) => row.type === "custom" && row.customType === "delivery-delegation" && row.data.phase === "ended");
+			assert.equal(ended.data.processFailure, facts.childProcessFailure);
+			assert.ok(ended.data.error.includes("FIXTURE_CHILD_EXTENSION_ERROR"));
+		}
+		const starts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
+		const retry = await h.call(name, { task: "未知收尾不得启动替代 writer。", paths: ["src"], inputs: [] });
+		assert.equal(retry.isError, true);
+		assert.match(JSON.stringify(retry.content), /交付 writer 尚未完成交接或已关闭/);
+		assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, starts);
+		assert.equal((await h.readLease())?.leaseId, lease.leaseId);
+	});
+}
+
 test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeout: 90_000 }, async (t) => {
 	const h = await host(t, "review-crash");
 	await mkdir(path.join(h.cwd, "src"));
@@ -138,12 +214,40 @@ test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeo
 	await h.prepare();
 	const first = await h.call("delivery_review", { task: "独立检查并运行相关验证。", paths: ["src"], inputs: [] });
 	assert.equal(first.isError, true, JSON.stringify(first));
-	assert.equal((await h.readLease())?.owner.kind, "parent");
+	const originalLease = await h.readLease();
+	assert.equal(originalLease?.owner.kind, "parent");
 	const firstStarts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
+	let accept = false;
+	h.setCustom((async (factory) => {
+		let answer: unknown;
+		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
+			(value) => { answer = value; }) as DeliveryPanel;
+		assert.equal(panel.title, "解除上次任务的占用");
+		const body = panel.render(100).join("\n");
+		assert.match(body, /保留现有代码改动/);
+		assert.match(body, /失效的方案确认不会恢复/);
+		assert.doesNotMatch(body, /PID|Session|lease|owner|请核对实施范围/);
+		assert.match(body, /暂不处理/);
+		panel.handleInput("\x0f");
+		panel.render(100);
+		panel.handleInput("\x1b[F");
+		const detail = panel.render(100).join("\n");
+		assert.match(detail, /PID/);
+		assert.ok(detail.includes(originalLease!.leaseId));
+		if (accept) panel.handleInput("\x1b[A");
+		panel.handleInput("\r");
+		return answer;
+	}) as ExtensionUIContext["custom"]);
 
+	await h.session.prompt("/delivery-unlock");
+	assert.match(h.notices.at(-1)!, /未解除占用，现场保持原样/);
+	assert.deepEqual(await h.readLease(), originalLease, "查看证据及默认回车均不清理占用");
+	assert.equal(h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-unlock"), false);
+	accept = true;
 	await h.session.prompt("/delivery-unlock");
 	await h.session.waitForIdle();
 	assert.match(h.notices.at(-1)!, /已复位父进程中的已知失败运行态/);
+	assert.match(h.notices.at(-1)!, /方案确认仍有效/);
 	assert.equal(await h.readLease(), undefined);
 	const unlock = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");
 	assert.equal(unlock?.type, "custom");

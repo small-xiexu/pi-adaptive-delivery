@@ -4,10 +4,11 @@ import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises"
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { initTheme, SessionManager, ToolExecutionComponent, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
 import { APPROVAL_ENTRY, APPROVAL_TOOL, PROPOSAL_ENTRY, installApprovals } from "../../extensions/delivery-gate/src/approvals.ts";
 import { executionInstruction } from "../../extensions/delivery-gate/src/approvals.ts";
-import { approvalUI } from "../support/delivery-ui.ts";
+import { approvalUI, plainTheme } from "../support/delivery-ui.ts";
 
 async function host() {
 	const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "approval-unit-")));
@@ -40,6 +41,54 @@ test("一次真实方案确认同时授权开始实施", async () => {
 	assert.equal(h.continuations.length, 1);
 	assert.match(String((h.continuations[0] as any).content), /内部计划/);
 	assert.match(String((h.continuations[0] as any).content), /不再请求实施确认/);
+});
+
+test("方案卡片折叠只显示中文摘要，展开保留原参数、反馈及执行指令", async () => {
+	const h = await host();
+	const approved = await h.run();
+	const renderCall = (expanded: boolean) => h.pi.tool.renderCall(h.request, plainTheme, { expanded }).render(200).join("\n");
+	assert.match(renderCall(false), /方案审阅 · 复用现有文档/);
+	assert.doesNotMatch(renderCall(false), /stage|documentStrategy|docs\/方案|空列表/);
+	assert.match(renderCall(true), /documentStrategy/);
+	assert.match(renderCall(true), /空列表/);
+	const renderResult = (result: any, expanded = false, isError = false) =>
+		h.pi.tool.renderResult(result, { expanded, isPartial: false }, plainTheme, { isError }).render(200).join("\n");
+	assert.match(renderResult(approved), /已确认方案，开始实施/);
+	assert.doesNotMatch(renderResult(approved), /parent_direct|delivery_develop|approvalId/);
+	assert.match(renderResult(approved, true), /parent_direct/);
+	initTheme("dark");
+	const card = new ToolExecutionComponent(APPROVAL_TOOL, "approval-call", h.request, {}, h.pi.tool,
+		{ terminal: { rows: 40 }, requestRender() {} } as any, h.cwd);
+	card.updateResult({ ...approved, isError: false });
+	const folded = card.render(100).join("\n");
+	assert.match(folded, /方案审阅.*复用现有文档/);
+	assert.doesNotMatch(folded, /stage|documentStrategy|parent_direct|空列表/);
+	card.setExpanded(true);
+	assert.match(card.render(100).join("\n"), /documentStrategy/);
+	assert.match(card.render(100).join("\n"), /parent_direct/);
+	h.ctx.ui.custom = approvalUI(async () => undefined, () => "补齐导出验收");
+	const feedback = await h.run();
+	assert.match(renderResult(feedback), /已收到修改意见，尚未确认/);
+	assert.match(renderResult(feedback, true), /补齐导出验收/);
+	h.ctx.ui.custom = approvalUI(async () => undefined);
+	assert.match(renderResult(await h.run()), /审阅已暂停.*delivery-resume/);
+	assert.match(renderResult({ content: [{ type: "text", text: "Session 归属已变化" }], details: {} }, false, true), /Session 归属已变化/);
+});
+
+test("方案正文优先阅读，规划路径只在详情展示且不改写原提案", async () => {
+	const h = await host();
+	h.ctx.ui.custom = async (factory: any) => {
+		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} }, plainTheme, {}, () => {}) as DesignReviewPanel;
+		assert.ok(panel.body.startsWith(h.request.body));
+		assert.doesNotMatch(panel.body, /docs\/方案/);
+		assert.match(panel.detail, /docs\/方案/);
+		assert.match(panel.render(100).join("\n"), /核对本次修改和验收方式/);
+		return undefined;
+	};
+	await h.run();
+	const proposal = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === PROPOSAL_ENTRY);
+	assert.ok(proposal?.type === "custom");
+	assert.equal((proposal.data as any).body, h.request.body);
 });
 
 test("方案暂停不产生批准，也不启动实施衔接", async () => {
@@ -97,7 +146,15 @@ for (const event of ["session_start", "session_shutdown", "session_tree"])
 		const grant = await h.approvals.readApproval(h.ctx);
 		await h.event(event);
 		assert.equal(grant.signal.aborted, true);
-		await assert.rejects(h.approvals.readApproval(h.ctx), /本轮没有|失效/);
+		await assert.rejects(h.approvals.readApproval(h.ctx), /本轮没有.*解除任务占用不会恢复旧确认/);
+		h.ctx.ui.custom = async (factory: any) => {
+			const panel = await factory({ terminal: { rows: 40 }, requestRender() {} }, plainTheme, {}, () => {}) as DesignReviewPanel;
+			assert.match(panel.render(100).join("\n"), /旧实施确认已不可用，需要重新确认本次方案/);
+			return undefined;
+		};
+		assert.equal((await h.run()).details.paused, true);
+		assert.equal(h.approvals.confirmedStage, undefined);
+		assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === APPROVAL_ENTRY).length, 1, "展示恢复说明不恢复旧确认");
 	});
 
 for (const mode of ["rpc", "json", "print", undefined])

@@ -15,7 +15,7 @@ export const APPROVAL_ENTRY = "delivery-approval";
 
 const parameters = Type.Object({
 	stage: StringEnum(["design"] as const),
-	body: Type.String({ minLength: 1, description: "完整技术方案：说明目标、业务与数据行为、范围、关键设计、风险和验收标准；结尾另起一行“本次假设：”，列出未经确认且不成立就要改方案的推断（最多 3 条），没有写“无”。确认同时授权开始实施，不提交第二份实施确认。" }),
+	body: Type.String({ minLength: 1, description: "完整技术方案：开头用大白话概括本次修改及效果，多个改动用短条目，再说明业务与数据行为、范围、关键设计、风险和验收标准；恢复时核对现有方案和现场，说明沿用及变化，不推断范围未变。结尾另起一行“本次假设：”，列出未经确认且不成立就要改方案的推断（最多 3 条），没有写“无”。确认同时授权开始实施，不提交第二份实施确认。" }),
 	documentStrategy: StringEnum(["none", "reuse", "new"] as const, { description: "none=方案留在会话；reuse=复用现有文档；new=新建需求文档。实施计划由 AI 内部维护。" }),
 	paths: Type.Array(Type.String({ minLength: 1 }), { description: "父维护的确切规划 Markdown 路径，供子任务保护；无文档传 []，不得遗漏已有需维护的方案或台账。不是开发范围。" }),
 	technicalPlanPath: Type.Optional(Type.String({ description: "技术方案 Markdown 路径，须在 paths 中；无对应文件时省略。" })),
@@ -27,7 +27,7 @@ interface Approval { id: string; proposalId: string; sessionId: string; workspac
 interface Confirmed { approval: Approval; proposal: Proposal; sessionFile: string; controller: AbortController; }
 
 const action = "确认方案并开始实施";
-const permission = "确认后 AI 自行维护实施计划，开始本机开发、检查、按需审查和返工。Shell 沿用 Pi 权限。\n提交、推送、PR、发布、部署及其他外部写入需另行授权。";
+const permission = "确认后开始本机开发、检查、按需审查和返工，AI 维护内部计划。\nShell 沿用 Pi 权限；提交、推送、PR、发布、部署及其他外部写入需另行授权。";
 export const executionInstruction = "方案已由用户确认并授权开始实施。请自行拆解并维护内部计划：简单任务保存在会话中，复杂任务沿用项目唯一台账，记录待完成、进行中、已完成、阻塞、返工及检查证据。简单任务由父 Pi 直接修改并运行项目已有检查；父 Pi 直接开始源码或测试实施节点前，先调用 delivery_path 记录 parent_direct、节点、理由和是否计划独立审查；复杂任务按需调用 delivery_develop，必要时调用 delivery_review，每次调用提供当前 paths 和 inputs。不再请求实施确认；文件数量、步骤、顺序、检查命令调整和范围内返工无需重新批准。只有业务目标、数据行为、对外接口、验收标准或未覆盖的重大外部风险变化时，暂停受影响工作并重新确认方案。完成后核对实际差异和检查结果再交付，并固定列出修改内容、实际检查命令与退出码、独立审查、限制和未执行项；没有运行检查时明确写未运行，不得写成通过。";
 
 async function resolvePlan(request: Request, cwd: string) {
@@ -54,8 +54,9 @@ async function resolvePlan(request: Request, cwd: string) {
 
 function presentation(proposal: Proposal, expanded = false): string {
 	const relative = (file?: string) => file ? path.relative(proposal.cwd, file) || "." : "无";
-	const documents = proposal.documentStrategy === "none" ? "文档策略：不落盘（方案保存在本次会话，项目里不新增文档）" : `文档策略：${proposal.documentStrategy === "reuse" ? "复用现有文档" : "新建需求文档"}\n技术方案：${relative(proposal.technicalPlanPath)}\n内部实施台账：${relative(proposal.implementationPlanPath)}（由 AI 维护）`;
-	return `${documents}\n\n${proposal.body}` + (expanded ? `\n\n维护的规划文档：\n${proposal.paths.map((file) => `• ${relative(file)}`).join("\n") || "方案保存在会话中，无须规划文档。"}\n\n${permission}\n\n工作目录：${proposal.cwd}\n提案记录：${proposal.id}` : "");
+	const documents = proposal.documentStrategy === "none" ? "文档：方案保存在本次会话，项目里不新增文档。"
+		: `文档：${proposal.documentStrategy === "reuse" ? "复用现有文档" : "新建需求文档"}；实施计划由 AI 维护。`;
+	return `${proposal.body}\n\n${documents}` + (expanded ? `\n技术方案：${relative(proposal.technicalPlanPath)}\n内部实施台账：${relative(proposal.implementationPlanPath)}\n\n维护的规划文档：\n${proposal.paths.map((file) => `• ${relative(file)}`).join("\n") || "方案保存在会话中，无须规划文档。"}\n\n${permission}\n\n工作目录：${proposal.cwd}\n提案记录：${proposal.id}` : "");
 }
 
 async function persisted<T>(ctx: ExtensionContext, ...references: [customType: string, id: string][]): Promise<CustomEntry<T>[]> {
@@ -117,10 +118,30 @@ export function installApprovals(pi: ExtensionAPI) {
 		name: APPROVAL_TOOL, label: "确认方案并开始实施",
 		description: "只在父 Pi TUI 请求一次技术方案确认，同时授权本机实施。RPC/JSON/print 不接受批准。内部计划、文件范围、步骤和检查方式由 AI 持续维护，不另设实施确认。普通工具沿用 Pi 权限，不提供文件或网络隔离。",
 		parameters,
+		renderCall(args, theme, context) {
+			const documents = args?.documentStrategy === "none" ? "方案留在会话" : args?.documentStrategy === "reuse" ? "复用现有文档" : args?.documentStrategy === "new" ? "新建需求文档" : "正在整理方案";
+			return new Text(theme.fg("toolTitle", theme.bold(`方案审阅 · ${documents}`))
+				+ (context.expanded ? `\n${displayText(JSON.stringify(args ?? {}, null, 2))}` : ""), 0, 0);
+		},
+		renderResult(result, { expanded, isPartial }, theme, context) {
+			const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			if (context.isError || result.isError) return new Text(theme.fg("error", displayText(text || "方案确认失败，未取得实施授权。")), 0, 0);
+			if (expanded) return new Text(displayText(text), 0, 0);
+			const details = result.details as { approved?: boolean; feedback?: string; paused?: boolean } | undefined;
+			const summary = isPartial ? "等待方案审阅结果"
+				: details?.approved ? "已确认方案，开始实施"
+				: details?.feedback ? "已收到修改意见，尚未确认方案"
+				: details?.paused ? "方案审阅已暂停，可用 /delivery-resume 继续" : "方案尚未确认";
+			return new Text(theme.fg("toolOutput", summary), 0, 0);
+		},
 		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("批准只接受父 Pi 的真实 TUI 交互；当前模式不接受批准");
 			if (pending) throw new Error("已有批准请求等待处理，不并发显示第二个请求");
 			if (request.stage !== "design") throw new Error("只接受方案确认；实施计划由 AI 内部维护，Markdown 编辑无需单独授权");
+			const subtitle = design ? "本次提案将替换当前方案确认，请核对正文后再确认。"
+				: ctx.sessionManager.getBranch().some((row) => row.type === "custom" && row.customType === APPROVAL_ENTRY)
+					? "旧实施确认已不可用，需要重新确认本次方案。"
+					: "请核对本次修改和验收方式，确认后开始实施。";
 			invalidateDesign();
 			const controller = new AbortController(), operation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal; pending = controller;
 			try {
@@ -138,7 +159,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				if (!isDeepStrictEqual(displayed.data, proposal)) throw new Error("展示正文与持久记录不一致"); current();
 				const choice = await ctx.ui.custom<DesignReviewResult>((tui, theme, _keys, done) => {
 					const cancel = () => done(undefined); operation.addEventListener("abort", cancel, { once: true }); if (operation.aborted) cancel();
-					return Object.assign(new DesignReviewPanel(presentation(proposal), presentation(proposal, true), tui, theme, done, permission, { acceptLabel: action }), { dispose: () => operation.removeEventListener("abort", cancel) });
+					return Object.assign(new DesignReviewPanel(presentation(proposal), presentation(proposal, true), tui, theme, done, permission, { acceptLabel: action, subtitle: subtitle + (proposal.documentStrategy === "none" ? "\n方案保存在本次会话，项目里不新增文档。" : "") }), { dispose: () => operation.removeEventListener("abort", cancel) });
 				});
 				current(); const [confirmed] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]); if (!isDeepStrictEqual(confirmed.data, proposal)) throw new Error("确认正文与原展示正文不一致");
 				if (typeof choice === "object" && choice.feedback.trim()) return { content: [{ type: "text", text: `用户对本次方案的修改意见：\n${choice.feedback}\n\n尚未确认方案。请修订同一份方案后重新提交 design 提案；不要进入实施或开发。` }], details: { approved: false, proposalId: proposal.id, feedback: choice.feedback } };
@@ -156,7 +177,7 @@ export function installApprovals(pi: ExtensionAPI) {
 		async readApproval(ctx: ExtensionContext, signal?: AbortSignal) {
 			const expected = design;
 			try {
-				if (!expected) throw new Error("本轮没有可核实的方案实施授权"); const cwd = ctx.cwd;
+				if (!expected) throw new Error("本轮没有有效的方案实施确认。解除任务占用不会恢复旧确认；请核对已有方案和现场后重新提交确认，不必重新讨论已明确的需求。"); const cwd = ctx.cwd;
 				const current = () => { signal?.throwIfAborted(); if (design !== expected) throw new Error("方案授权已失效或被新的请求替换"); if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("方案授权只供原父 TUI 会话核实"); if (ctx.sessionManager.getSessionId() !== expected.approval.sessionId || ctx.sessionManager.getSessionFile() !== expected.sessionFile || ctx.cwd !== cwd) throw new Error("方案授权的 Session、文件或当前目录已变化"); };
 				current(); const workspace = await resolveWorkspaceIdentity(cwd); current(); if (workspace.key !== expected.approval.workspaceKey) throw new Error("方案授权不属于当前 worktree");
 				const [approval, proposal] = await persisted<Approval | Proposal>(ctx, [APPROVAL_ENTRY, expected.approval.id], [PROPOSAL_ENTRY, expected.proposal.id]); current();

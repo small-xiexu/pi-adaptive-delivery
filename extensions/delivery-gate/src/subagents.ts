@@ -101,8 +101,20 @@ export class ChildRpc {
 				const line = buffer.slice(0, newline).replace(/\r$/, "");
 				buffer = buffer.slice(newline + 1);
 				if (!line || this.failure) continue;
-				try { this.receive(JSON.parse(line)); }
-				catch (error) { this.fail(new Error("子 Pi 协议或事件处理失败", { cause: error })); }
+				let packet: unknown;
+				try { packet = JSON.parse(line); }
+				catch (error) {
+					this.fail(new Error(`子 Pi RPC JSON 解析失败：${String(error).slice(0, 2000)}`, { cause: error }));
+					continue;
+				}
+				try { this.receive(packet); }
+				catch (error) {
+					// 只保存错误和关联标识；工具参数、结果及整条 RPC 记录不复制到诊断中。
+					const record = packet && typeof packet === "object" ? packet as Record<string, unknown> : {};
+					const identity = ["type", "command", "toolCallId", "toolName", "extensionPath", "event"].flatMap((key) =>
+						typeof record[key] === "string" ? [`${key}=${JSON.stringify(record[key].slice(0, 500))}`] : []);
+					this.fail(new Error(`子 Pi RPC 事件处理失败：${String(error).slice(0, 2000)}\n事件标识：${identity.join("，") || "未取得"}`, { cause: error }));
+				}
 			}
 		});
 		// 不将插件的原始 stderr 自动暴露给父模型；退出码与协议错误仍显式报告。
@@ -143,7 +155,7 @@ export class ChildRpc {
 			if (!this.openTools.delete(packet.toolCallId) || typeof packet.isError !== "boolean") throw new Error("工具终态无对应开始事件");
 			this.toolError ||= packet.isError;
 		}
-		if (packet.type === "extension_error") throw new Error(`子扩展事件失败：${String(packet.event)}`);
+		if (packet.type === "extension_error") throw new Error(`子扩展事件失败：${typeof packet.error === "string" ? packet.error.slice(0, 2000) : "原始错误未取得"}`);
 		this.onEvent(packet);
 		this.wake();
 	}

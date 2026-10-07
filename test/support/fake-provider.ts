@@ -97,6 +97,9 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		}
 		return undefined;
 	});
+	pi.on("tool_execution_end", () => {
+		if (isChild() && scenario.endsWith("child-extension-error")) throw new Error("FIXTURE_CHILD_EXTENSION_ERROR");
+	});
 	pi.on("tool_result", async (event, ctx) => {
 		if (isChild() && process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-child-persistence")) await chmod(ctx.sessionManager.getSessionFile()!, 0o400);
 		if (isChild() && (scenario === "crash" || process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-crash"))) process.kill(process.pid, "SIGKILL");

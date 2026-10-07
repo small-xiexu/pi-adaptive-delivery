@@ -40,6 +40,23 @@ test("方案先阅读，按需输入意见；空提交和查看详情不批准�
 	assert.deepEqual(results, [{ feedback: `先保留原接口\n${paste}` }]);
 });
 
+test("审阅宽屏限制阅读宽度，正文有足够可见空间且末尾与详情可完整查阅", () => {
+	const body = Array.from({ length: 100 }, (_, i) => `方案内容 ${i + 1}：保留接口，修复空状态`).join("\n") + "\nEND_OF_PLAN";
+	const panel = new DesignReviewPanel(body, body + "\n诊断证据 END_OF_DETAIL", tui, plainTheme, () => {},
+		"确认后开始本机开发、检查和审查。\n外部写入需另行授权。");
+	const lines = panel.render(240);
+	assert.ok(lines.every((line) => visibleWidth(line) <= 100), "宽屏正文也应控制阅读宽度");
+	assert.ok(lines.filter((line) => line.includes("方案内容")).length >= 10, "32 行终端首屏应能阅读至少 10 行正文");
+	assert.ok(lines.length <= 28, "保留主对话空间");
+	assert.match(lines.join("\n"), /确认方案并开始实施/);
+	panel.handleInput("\x1b[F");
+	assert.match(panel.render(240).join("\n"), /END_OF_PLAN/);
+	panel.handleInput("\x0f");
+	panel.render(40);
+	panel.handleInput("\x1b[F");
+	assert.match(panel.render(40).join("\n"), /END_OF_DETAIL/);
+});
+
 test("确认面板窄屏换行保留中文和长正文末尾", () => {
 	const panel = new DeliveryPanel("执行详情", "修改 src/features/日期格式化函数，并保留验收记录 END_OF_PLAN", "", [], tui, plainTheme, () => {});
 	for (const width of [20, 40, 80]) {
@@ -123,7 +140,7 @@ for (const accept of ["确认执行"]) test(`${accept} 在上但默认回车不�
 		const lines = panel.render(width);
 		assert.ok(lines.findIndex((line) => line.includes(accept)) < lines.findIndex((line) => line.includes("暂不批准")));
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
-		assert.ok(lines.length <= 22, "底部审批不能占满终端");
+		assert.ok(lines.length <= 28, "底部操作为主对话保留空间");
 	}
 	panel.handleInput("\x0f");
 	panel.handleInput("\x1b[F");

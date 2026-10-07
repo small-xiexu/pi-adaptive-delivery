@@ -14,7 +14,7 @@ export function approvalUI(select: ExtensionUIContext["select"], feedback?: () =
 		const panel = await factory({ terminal: { rows }, requestRender() {} } as any, plainTheme, {} as any, done) as (DeliveryPanel | DesignReviewPanel) & { dispose?(): void };
 		try {
 			const review = panel.title === "方案审阅";
-			assert.equal(panel.choices.at(-1), review ? "稍后再看" : "暂不批准");
+			assert.equal(panel.choices.at(-1), review ? "稍后再看" : panel.title === "解除上次任务的占用" ? "暂不处理" : "暂不批准");
 			panel.render(100);
 			const text = feedback?.();
 			if (text !== undefined) {

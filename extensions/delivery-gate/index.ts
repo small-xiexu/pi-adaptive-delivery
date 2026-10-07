@@ -6,6 +6,7 @@ import { inheritedTools, installPolicy, CAPABILITY_NOTICE } from "./src/policy.t
 import { GIT_STATUS_TOOL, readGitStatus, getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "./src/workspace.ts";
 import { CHILD_ENV, CHILD_READY, CHILD_EXIT, CHILD_STOP, DELEGATE_TOOL, DELEGATION_ENTRY, delegateReadOnly, snapshotReadOnlyEnvironment } from "./src/subagents.ts";
 import { installApprovals } from "./src/approvals.ts";
+import { DeliveryPanel } from "./src/ui.ts";
 import { createParentDocumentWriter, DOCUMENT_EDIT_TOOL, DOCUMENT_WRITE_TOOL, documentRenderers } from "./src/parent-writer.ts";
 import { CHILD_ARM, DEVELOPMENT_ENTRY, DEVELOPMENT_TOOL, REVIEW_TOOL, createChildDevelopment, createDevelopmentDelegator } from "./src/development.ts";
 import { cleanupReviewArtifacts } from "./src/review.ts";
@@ -180,25 +181,40 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 					return;
 				}
 				const owner = blockage.lease?.record?.owner;
+				const body = [
+					"发现工作区写入占用记录，后续交付受阻。",
+					...(blockage.lease && !owner ? ["记录无法核实归属，请先查看详情。"] : []),
+					"仅凭记录不能证明原任务已停止，请先确认没有运行中的任务。",
+					...(blockage.operationLock ? ["此次也会清理残留操作锁。"] : []),
+					"",
+					"解除后清除占用记录，保留现有代码改动。",
+					"失效的方案确认不会恢复，也不代表检查或审查通过。",
+					"下一步查看 /delivery-status，核对现场后继续或重新确认。",
+				].join("\n");
 				const evidence = [
 					`lease 记录：${blockage.lease ? blockage.lease.leaseId ?? "存在但无法解析，不能核对归属" : "无"}`,
 					...(owner ? [`owner：${owner.kind}，PID ${owner.pid}，Session ${owner.sessionId}，执行 ${owner.runId ?? "未记录"}`,
 						`记录时间：${blockage.lease?.record?.createdAt} → ${blockage.lease?.record?.updatedAt}`] : []),
 					`残留操作锁：${blockage.operationLock ? "存在，会阻止取得新的 writer" : "无"}`,
 					"",
-					"该记录不能证明原执行已经停止，也不代表代码已核对。确认后本 Package 不再认领它，本次会话已失败的委派对象不会恢复；退出交付后请自行核对实际改动。",
+					"该记录不能证明原执行已经停止，也不代表代码已核对。强制清理保留原失败事实，不会恢复上次任务；请检查现有代码改动。",
 				].join("\n");
-				if (!await ctx.ui.confirm("强制清理残留 writer 记录？", evidence)) { ctx.ui.notify("未清理，现场保持原样。", "info"); return; }
+				const choice = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) =>
+					new DeliveryPanel("解除上次任务的占用", body, `${body}\n\n任务归属和诊断证据\n${evidence}`,
+						["解除占用", "暂不处理"], tui, theme, done, 1));
+				if (choice !== "解除占用") { ctx.ui.notify("未解除占用，现场保持原样。", "info"); return; }
 				const removed = await leases.discard(workspace.key, blockage);
 				const reconciled = blockage.lease?.leaseId ? developer.reconcileAfterUnlock(workspace.key, blockage.lease.leaseId) : undefined;
 				pi.appendEntry("delivery-unlock", { workspaceKey: workspace.key, leaseId: blockage.lease?.leaseId, owner,
 					operationLock: removed.operationLock, at: new Date().toISOString(),
 					...(reconciled ? { reconciledRunId: reconciled.runId, inMemoryState: "cleared" } : { inMemoryState: developer.pending ? "retained" : "none" }) });
 				const next = reconciled
-					? "已复位父进程中的已知失败运行态；旧失败事实仍保留在本次 Session，可在方案确认有效且现场重新核对后重试交付任务。"
+					? "已复位父进程中的已知失败运行态；旧失败事实仍保留在本次 Session。" + (approvals.confirmedStage === "design"
+						? "方案确认仍有效；用 /delivery-status 核对后，可继续交付任务。"
+						: "当前没有有效的实施确认；核对已有方案和现场后，重新确认即可继续。")
 					: developer.pending ? "父进程仍保留未能安全复位的交付状态；先用 /delivery-exit 结束当前交付并重载，再重新 /delivery-shape 和确认方案。"
 					: "下一步用 /delivery-status 核对现场；确认没有新的在途任务后重试 /delivery-exit。";
-				ctx.ui.notify(`已强制清理：${[removed.lease ? "lease 记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。${next} 代码改动需自行检查。`, "warning");
+				ctx.ui.notify(`已解除占用：${[removed.lease ? "写入占用记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。${next} 请检查已有代码改动。`, "warning");
 			} catch (error) {
 				ctx.ui.notify(`未清理：${error instanceof Error ? error.message : String(error)}`, "error");
 			}

@@ -315,7 +315,10 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 				if (state.rpc) await state.rpc.stop(input.entryPath);
 				if (state.rpc) { const terminal = await childTerminal(state); state.childTerminal = terminal.digest; state.childTerminalFacts = persistedAssistantFacts(terminal.last); if (terminal.last?.stopReason !== "stop") { const message = `子模型没有正常完成的持久模型终态\n${state.childTerminalFacts}`; state.problem = state.problem ? new Error(`${state.problem instanceof Error ? state.problem.message : String(state.problem)}\n${message}`, { cause: state.problem }) : new Error(message); } }
 				if (state.readonlyReference?.pid) state.readonlyTerminal = await readonlyTerminal(state);
-			} catch (error) { state.problem = new Error(`交付任务收尾失败：${String(error)}`, { cause: state.problem ?? error }); }
+			} catch (error) {
+				const original = state.problem ? `${state.problem instanceof Error ? state.problem.message : String(state.problem)}\n` : "";
+				state.problem = new Error(`${original}交付任务收尾失败：${String(error)}`, { cause: state.problem ?? error });
+			}
 			if (executionSignal.aborted) {
 				state.interruption = String(executionSignal.reason ?? "父回合中断");
 				state.problem ??= executionSignal.reason;

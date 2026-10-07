@@ -22,11 +22,10 @@ const panelFooter = (theme: Theme, width: number, first: string, second: string)
 	...wrapped([first, second].filter(Boolean).join("\n"), width).map((line) => theme.fg("muted", line)),
 ];
 
-// 说明区自带空行，与上方正文分开；正文区和操作区不再挤在一起。
+// 说明区与正文分开，压缩固定标题，为方案正文留出空间。
 const noticeLines = (theme: Theme, width: number, notice: string) => notice ? [
 	"",
-	...wrapped("说明", width).map((line) => theme.fg("muted", line)),
-	...wrapped(notice, width, "  │ ").map((line) => theme.fg("muted", line)),
+	...wrapped(notice, width).map((line) => theme.fg("muted", line)),
 ] : [];
 
 export type DesignReviewResult = { feedback: string } | string | undefined;
@@ -117,6 +116,7 @@ export class DesignReviewPanel {
 		return { handled: true };
 	}
 	render(width: number) {
+		width = Math.min(width, 100);
 		const body = wrapped(this.expanded ? this.detail : this.body, width);
 		const editor = this.editing ? this.editor.render(width) : [];
 		const options = this.editing ? [] : this.select.render(width).map((line) => truncateToWidth(`  ${line}`, width, ""));
@@ -129,7 +129,7 @@ export class DesignReviewPanel {
 		this.fits = reserved + 1 < this.tui.terminal.rows;
 		if (!this.fits) return [truncateToWidth("请放大终端 · Esc 稍后再看", width)];
 		this.pageSize = Math.max(1, Math.min(body.length,
-			Math.floor(this.tui.terminal.rows * 0.7) - reserved));
+			Math.floor(this.tui.terminal.rows * 0.85) - reserved));
 		this.total = body.length;
 		this.scroll(0);
 		const position = body.length > this.pageSize ? `${this.offset + 1}–${Math.min(body.length, this.offset + this.pageSize)} / ${body.length} 行` : "";
@@ -198,10 +198,11 @@ export class DeliveryPanel {
 		return { handled: true };
 	}
 	render(width: number) {
+		width = Math.min(width, 100);
 		const body = wrapped(this.expanded ? this.detail : this.body, width);
-		const header = panelHeader(this.theme, width, this.title, this.detail ? "请核对实施范围和检查方式" : "查看信息 · Esc 关闭");
+		const header = panelHeader(this.theme, width, this.title, this.select ? "请核对操作影响，再选择" : "查看信息 · Esc 关闭");
 		const footer = panelFooter(this.theme, width,
-			this.detail ? "↑↓ 选择 · Enter 确定 · Esc 暂不批准" : "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭",
+			this.select ? "↑↓ 选择 · Enter 确定 · Esc 取消" : "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭",
 			this.detail ? `Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页` : "");
 		const options = this.select?.render(width).map((line) => truncateToWidth(`  ${line}`, width, "")) ?? [];
 		const notice = noticeLines(this.theme, width, this.notice);
@@ -209,7 +210,7 @@ export class DeliveryPanel {
 		this.fits = reserved + 1 < this.tui.terminal.rows;
 		if (!this.fits) return [truncateToWidth("请放大终端 · Esc 取消", width)];
 		this.pageSize = Math.max(1, Math.min(body.length,
-			Math.floor(this.tui.terminal.rows * 0.7) - reserved));
+			Math.floor(this.tui.terminal.rows * 0.85) - reserved));
 		this.total = body.length;
 		this.offset = Math.min(this.offset, Math.max(0, body.length - this.pageSize));
 		const page = body.slice(this.offset, this.offset + this.pageSize);
