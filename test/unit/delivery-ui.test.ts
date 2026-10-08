@@ -105,7 +105,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的
 	let mainKeys = 0;
 	const terminal: Terminal = { rows: 32, columns: 80, kittyProtocolActive: false,
 		start(input) { feed = input; }, stop() {}, drainInput: async () => {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {},
-		clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {} };
+		clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {} };
 	const renderer = new Renderer(terminal);
 	const main = { render: () => ["主对话"], invalidate() {}, handleInput() { mainKeys++; } };
 	const results: unknown[] = [];
@@ -194,7 +194,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的
 	let mainKeys = 0;
 	const terminal: Terminal = { rows: 32, columns: 80, kittyProtocolActive: false,
 		start(input) { feed = input; }, stop() {}, drainInput: async () => {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {},
-		clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {} };
+		clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {} };
 	const renderer = new Renderer(terminal);
 	const main = { render: () => ["原任务继续运行"], invalidate() {}, handleInput() { mainKeys++; } };
 	renderer.addChild(main);

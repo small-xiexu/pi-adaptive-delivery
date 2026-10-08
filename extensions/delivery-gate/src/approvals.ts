@@ -87,11 +87,11 @@ export function installApprovals(pi: ExtensionAPI) {
 	pi.on("session_shutdown", invalidate);
 	pi.on("session_tree", invalidate);
 	pi.on("tool_call", (event) => { if (event.toolName !== APPROVAL_TOOL) continuation = undefined; });
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("agent_before_settle", (event, ctx) => {
 		const approvalId = continuation;
 		continuation = undefined;
-		if (!approvalId || design?.approval.id !== approvalId || ctx.mode !== "tui" || !ctx.hasUI || !ctx.isIdle() || ctx.hasPendingMessages()) return;
-		pi.sendMessage({ customType: "delivery-continuation", content: executionInstruction, display: false, details: { stage: "design", approvalId } }, { deliverAs: "followUp", triggerTurn: true });
+		if (!approvalId || design?.approval.id !== approvalId || ctx.mode !== "tui" || !ctx.hasUI || event.outcome !== "completed" || ctx.hasPendingMessages()) return;
+		return { entries: [...event.entries, { type: "custom_message", customType: "delivery-continuation", content: executionInstruction, display: false, details: { stage: "design", approvalId } }], continue: true };
 	});
 	pi.registerCommand("delivery-resume", {
 		description: "继续当前会话尚未确认的方案审阅，不恢复旧权限或自动开始实施",

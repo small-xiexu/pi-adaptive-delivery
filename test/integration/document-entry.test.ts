@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContextActions, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, VERSION, withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContextActions, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, getCurrentSystemPrompt, type Context, type ToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getWriterStateRoot, resolveWorkspaceIdentity, WriterLeaseManager } from "../../extensions/delivery-gate/src/workspace.ts";
@@ -94,7 +94,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
 		return call("delivery_approval", { stage, body: `待确认正文 ${stage}`, documentStrategy, ...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}), paths });
 	};
-	t.diagnostic(JSON.stringify({ root, sdk: "0.87.0", ui: "simulated" }));
+	t.diagnostic(JSON.stringify({ root, sdk: VERSION, ui: "simulated" }));
 	return { root, cwd, sm, session, api, notices, choices, call, approve, contexts, prompts, readLease: () => leases.read(workspace.key),
 		setFollowups: (steps: ToolCall[][]) => { followups = steps; },
 		setFeedback: (callback: typeof feedback) => { feedback = callback; },
@@ -141,12 +141,17 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.equal(h.choices.length, 0);
 });
 
-test("真实 Pi 在方案批准回合结束后自动触发实施准备回合", { timeout: 40_000 }, async (t) => {
+test("真实 Pi 在方案批准回合结束前衔接实施，全部回合完成后只通知一次 settled", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
+	const settlements: number[] = [];
+	h.session.subscribe((event) => { if (event.type === "agent_settled") settlements.push(h.contexts.length); });
 	const result = await h.approve("design", []);
 	assert.equal(result.isError, false, JSON.stringify(result));
 	await h.session.waitForIdle();
 	assert.ok(h.contexts.some((messages) => JSON.stringify(messages).includes("方案已由用户确认并授权开始实施")), JSON.stringify(h.contexts));
+	assert.deepEqual(settlements, [h.contexts.length], "实施准备不能在提前发出的最终通知之后再运行");
+	const continuation = h.sm.getBranch().filter((row) => row.type === "custom_message" && row.customType === "delivery-continuation");
+	assert.equal(continuation.length, 1, "公开边界条目必须由真实 Pi 持久化一次");
 	assert.ok(!h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-approval-proposal" && (row.data as any)?.stage === "implementation"));
 });
 

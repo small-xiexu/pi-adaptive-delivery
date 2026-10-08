@@ -24,7 +24,11 @@ async function host() {
 	const approvals = installApprovals(pi as ExtensionAPI);
 	const request = { stage: "design", body: "目标：空列表显示空状态。\n数据行为：不改变接口。\n验收：现有测试通过。\n本次假设：无", documentStrategy: "reuse", technicalPlanPath: "docs/方案.md", paths: ["docs/方案.md"] };
 	const run = (value = request) => pi.tool.execute("approval-call", value, undefined, undefined, ctx);
-	return { cwd, sm, ctx, pi, approvals, request, run, continuations, event: async (name: string, value = {}) => { for (const handler of handlers.get(name) ?? []) await handler(value, ctx); } };
+	return { cwd, sm, ctx, pi, approvals, request, run, continuations, event: async (name: string, value = {}) => {
+		const results: any[] = [];
+		for (const handler of handlers.get(name) ?? []) { const result = await handler(value, ctx); if (result !== undefined) results.push(result); }
+		return results;
+	} };
 }
 
 test("一次真实方案确认同时授权开始实施", async () => {
@@ -35,13 +39,36 @@ test("一次真实方案确认同时授权开始实施", async () => {
 	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === APPROVAL_ENTRY).length, 1);
 	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === PROPOSAL_ENTRY).length, 1);
 	assert.equal(h.continuations.length, 0);
+	h.ctx.isIdle = () => false; // 可操作的收尾边界仍属于当前运行。
+	const previous = { type: "custom", customType: "other-extension", data: { retained: true } };
+	const boundary = { entries: [previous], outcome: "completed", context: { canContinue: false } };
+	const [continuation] = await h.event("agent_before_settle", boundary);
+	assert.equal(continuation?.continue, true);
+	assert.deepEqual(continuation.entries[0], previous, "保留前序扩展已经提出的条目");
+	assert.equal(continuation.entries[1].customType, "delivery-continuation");
+	assert.equal(continuation.entries[1].details.approvalId, result.details.approvalId);
+	assert.match(continuation.entries[1].content, /内部计划/);
+	assert.match(continuation.entries[1].content, /不再请求实施确认/);
+	assert.deepEqual(await h.event("agent_before_settle", boundary), [], "同一批准只请求一次后续回合");
 	await h.event("agent_settled");
-	assert.equal(h.continuations.length, 1);
-	await h.event("agent_settled");
-	assert.equal(h.continuations.length, 1);
-	assert.match(String((h.continuations[0] as any).content), /内部计划/);
-	assert.match(String((h.continuations[0] as any).content), /不再请求实施确认/);
+	assert.equal(h.continuations.length, 0, "最终通知不能再触发方案实施衔接");
 });
+
+for (const failure of ["aborted", "error", "queued", "rpc"] as const) {
+	test(`批准后的 ${failure} 边界不自动启动实施，迟到通知不再次请求`, async () => {
+		const h = await host();
+		await h.run();
+		if (failure === "queued") h.ctx.hasPendingMessages = () => true;
+		if (failure === "rpc") h.ctx.mode = "rpc";
+		const boundary = { entries: [], outcome: failure === "aborted" || failure === "error" ? failure : "completed", context: { canContinue: false } };
+		assert.deepEqual(await h.event("agent_before_settle", boundary), []);
+		h.ctx.hasPendingMessages = () => false;
+		h.ctx.mode = "tui";
+		assert.deepEqual(await h.event("agent_before_settle", { ...boundary, outcome: "completed", context: { canContinue: true } }), []);
+		await h.event("agent_settled");
+		assert.equal(h.continuations.length, 0);
+	});
+}
 
 test("方案卡片折叠只显示中文摘要，展开保留原参数、反馈及执行指令", async () => {
 	const h = await host();

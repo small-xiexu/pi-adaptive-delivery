@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout } from "node:timers/promises";
 import test from "node:test";
+import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
+import { installStallWatch } from "../../extensions/delivery-gate/src/stall-watch.ts";
 import { createDevelopmentHost } from "../support/development-host.ts";
 import { createPiFixture } from "../support/pi-fixture.ts";
 
@@ -11,6 +13,56 @@ const errors = (rows: any[]) => rows.filter((row) => row.message?.role === "assi
 const disk = async (file: string) => (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 const inject = (h: Awaited<ReturnType<typeof createDevelopmentHost>>, remaining = 1, afterTools = 0, message = "stream_read_error") =>
 	h.session.prompt(`/fixture-stream-error ${JSON.stringify({ message, remaining, afterTools })}`);
+
+test("真实 SDK 停顿中断后按公开发送 API 开启新回合，aborted 通知与最终完成分别可核对", { timeout: 10_000 }, async (t) => {
+	let requests = 0;
+	const h = await createDevelopmentHost(t, "stream-retry-parent", (pi) => {
+		installStallWatch(pi, { thresholdMs: 30, tickMs: 5 });
+		pi.registerProvider("stall-fixture", {
+			api: "stall-fixture", baseUrl: "http://127.0.0.1", apiKey: "fixture-not-a-credential",
+			models: [{ id: "fake", name: "Fake stall", reasoning: false, input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 100 }],
+			streamSimple(model, _context, options) {
+				const first = ++requests === 1;
+				const stream = createAssistantMessageEventStream();
+				const output: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+					content: [], stopReason: "stop", timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+				queueMicrotask(async () => {
+					stream.push({ type: "start", partial: output });
+					if (first) await new Promise<void>((resolve) => {
+						if (options?.signal?.aborted) resolve();
+						else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+					});
+					if (options?.signal?.aborted) {
+						output.stopReason = "aborted";
+						output.errorMessage = "fixture stalled request aborted";
+						stream.push({ type: "error", reason: "aborted", error: output });
+					} else {
+						output.content = [{ type: "text", text: "本地替身续跑完成" }];
+						stream.push({ type: "done", reason: "stop", message: output });
+					}
+					stream.end();
+				});
+				return stream;
+			},
+		});
+	});
+	const model = h.session.modelRuntime.getModel("stall-fixture", "fake");
+	assert.ok(model);
+	await h.session.setModel(model);
+	const settlements: boolean[] = [];
+	h.session.subscribe((event) => { if (event.type === "agent_settled") settlements.push(event.aborted); });
+	await h.session.prompt("模拟内容停顿并核对新回合");
+	await h.session.waitForIdle();
+	assert.equal(requests, 2);
+	assert.deepEqual(settlements, [true, false], "停顿恢复开启另一个回合，原中断通知仍准确");
+	assert.ok(h.notices.some((text) => text.includes("第 1/2 次")));
+	assert.deepEqual(h.sm.getBranch().filter((row) => row.type === "message" && row.message.role === "assistant")
+		.map((row) => row.type === "message" && row.message.role === "assistant" ? row.message.stopReason : undefined), ["aborted", "stop"]);
+	assert.equal(h.sm.getBranch().filter((row) => row.type === "custom_message" && row.customType === "delivery-stall-resume").length, 1);
+	assert.equal(await h.readLease(), undefined);
+});
 
 test("真实 SDK 父断流自动续跑：已完成文档写入不重放，半截调用不执行，批准不重复", async (t) => {
 	const h = await createDevelopmentHost(t, "stream-retry-parent");
