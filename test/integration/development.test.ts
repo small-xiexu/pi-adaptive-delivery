@@ -17,6 +17,30 @@ test("没有方案确认时不启动开发或审查子 Agent", { timeout: 40_000
 	assert.ok(!(await h.audit()).some((row) => row.child));
 });
 
+for (const name of ["delivery_develop", "delivery_review"] as const) for (const denied of [false, true]) {
+	test(`${name} 承接动态网页工具选择，${denied ? "权限钩子仍拒绝执行" : "四个工具均可执行"}并核验 writer 收尾`, { timeout: 40_000 }, async (t) => {
+		const h = await host(t, `dynamic-tools${denied ? "-hook-deny" : ""}`);
+		await mkdir(path.join(h.cwd, "src"));
+		await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+		await h.prepare();
+		const result = await h.call(name, { task: "fixture-dynamic-web", paths: ["src"], inputs: [] });
+		assert.equal(result.isError, false, JSON.stringify(result));
+		assert.equal((result.details as any).executionFacts.toolErrors, denied);
+		const audit = await h.audit();
+		const child = audit.find((row) => row.child && row.phase === "start");
+		assert.ok(child);
+		assert.ok(audit.some((row) => row.child && row.phase === "dynamic-tools-reset" && !row.active.includes("web_search")));
+		assert.deepEqual(audit.filter((row) => row.child && row.phase === "dynamic-web-executed").map((row) => row.toolName),
+			denied ? [] : ["web_search", "source_check", "fetch_content", "get_search_content"]);
+		assert.ok(audit.filter((row) => row.child && row.phase === "model").every((row) =>
+			["web_search", "source_check", "fetch_content", "get_search_content"].every((tool) => row.tools.includes(tool))));
+		if (denied) assert.match(JSON.stringify(result.content), /CONFIGURED_TOOL_HOOK_DENIED/);
+		assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+		assert.equal(await h.readLease(), undefined);
+		assert.equal(await readFile(path.join(h.cwd, "src/value.js"), "utf8"), "export const value = 1;\n");
+	});
+}
+
 test("重载后重新审阅说明旧确认不可用，暂停不恢复权限，明确确认产生新记录", { timeout: 60_000 }, async (t) => {
 	const h = await host(t);
 	await h.prepare();

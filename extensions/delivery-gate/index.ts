@@ -56,10 +56,13 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	if (child) {
 		pi.registerCommand(CHILD_STOP, { description: "内部子任务收尾，不授予任何权限", handler: async (_args, ctx) => ctx.shutdown() });
 		pi.registerCommand(CHILD_READY, { description: "内部任务环境核对，不调用模型", handler: async (args, ctx) => {
+			const request = JSON.parse(args) as { id: string; tools: string[] };
+			// 插件启动钩子可能覆盖 CLI 的 --tools；在握手前承接父本轮明确选择，随后仍完整核验定义与来源。
+			pi.setActiveTools(request.tools);
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			pi.appendEntry(CHILD_READY, { pid: process.pid, sessionId: ctx.sessionManager.getSessionId(),
 				cwd: workspace.cwdPath, entryPath, environment: environment(ctx.getSystemPromptOptions()), projectTrusted: ctx.isProjectTrusted(),
-				...(childDevelopment ? { owner: await childDevelopment.ready(args, ctx) } : {}) });
+				...(childDevelopment ? { owner: await childDevelopment.ready(request.id, ctx) } : {}) });
 		} });
 		if (childDevelopment) {
 			pi.registerCommand(CHILD_ARM, { description: "内部 writer 交接，不生成批准", handler: async (args, ctx) => {

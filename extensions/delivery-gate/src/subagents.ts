@@ -70,8 +70,8 @@ export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?
 		const changed = [...parent.keys()].filter((name) => child.has(name) && parent.get(name) !== child.get(name));
 		throw new Error("父子工具定义或来源未对齐，未发送任务。"
 			+ `\n子会话缺少：${missing.join(", ") || "无"}；子会话额外启用：${extra.join(", ") || "无"}；定义或来源不同：${changed.join(", ") || "无"}。`
-			+ "\n父会话可能仍保留更新前的插件或工具选择。先用 /delivery-status details 核对收尾；空闲且执行已收尾后，在父终端用 /delivery-exit 恢复进入前工具并重载。继续开发时再用 /delivery-shape 进入。"
-			+ "\n单独 /reload 会保留当前启用的工具列表；若退出后仍不一致，按上述差异核对插件配置与实现，不自动启用工具或重复委派。"
+			+ "\n请核对工具是否已注册、配置是否禁用，或父会话是否仍保留更新前的插件。先用 /delivery-status details 核对收尾；空闲且执行已收尾后，在父终端用 /delivery-exit 恢复进入前工具并重载。继续开发时再用 /delivery-shape 进入。"
+			+ "\n单独 /reload 会保留当前启用的工具列表；若退出后仍不一致，按上述差异核对插件配置与实现，不补启父未选择的工具或重复委派。"
 			+ beforeSend);
 	}
 	if (expected.instructions !== actual?.instructions) throw new Error("基础指令未对齐；请按配置提供子任务所需指令。未发送任务" + beforeSend);
@@ -390,7 +390,7 @@ export async function startChild(input: ChildTask, kind: "readonly" | "developme
 }
 
 export async function readyChild(rpc: ChildRpc, input: ChildTask, signal: AbortSignal, recordState: (state: RpcSessionState) => void) {
-	await rpc.control(CHILD_READY, input.entryPath, signal, input.id);
+	await rpc.control(CHILD_READY, input.entryPath, signal, JSON.stringify({ id: input.id, tools: input.environment.tools.map((tool) => tool.name) }));
 	const state = await rpc.request<RpcSessionState>({ type: "get_state" }, signal);
 	recordState(state);
 	const { entries } = await rpc.request<{ entries: SessionEntry[] }>({ type: "get_entries" }, signal);

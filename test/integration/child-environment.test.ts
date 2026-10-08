@@ -7,6 +7,21 @@ import { createPiFixture } from "../support/pi-fixture.ts";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
+test("真实 CLI 子启动关闭动态网页工具后，承接父选择并执行四个工具替身", { timeout: 40_000 }, async (t) => {
+	const fixture = await createPiFixture(source, "dynamic-tools");
+	t.after(() => fixture.rpc.stop());
+	await fixture.rpc.send("prompt", { message: `/fixture-next-tool ${JSON.stringify({ type: "toolCall", id: "dynamic-web", name: "delivery_readonly", arguments: { task: "fixture-dynamic-web" } })}` });
+	await fixture.rpc.send("prompt", { message: "核对动态网页工具继承" });
+	await fixture.rpc.waitFor((row) => row.type === "agent_settled");
+	const result = fixture.rpc.records.find((row) => row.type === "tool_execution_end" && row.toolName === "delivery_readonly");
+	assert.equal(result?.isError, false, JSON.stringify(result));
+	const rows = (await readFile(result!.result.details.sessionFile, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	assert.deepEqual(rows.filter((row) => row.message?.role === "toolResult").map((row) => row.message.toolName), ["web_search", "source_check", "fetch_content", "get_search_content"]);
+	const audit = (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
+	assert.ok(audit.some((row) => row.child && row.phase === "dynamic-tools-reset" && !row.active.includes("web_search")));
+	assert.throws(() => process.kill(result!.result.details.pid, 0), { code: "ESRCH" });
+});
+
 test("项目显式启用查找工具后，真实父子保留 read/grep/find/ls 并实际查找读回", { timeout: 40_000 }, async (t) => {
 	const fixture = await createPiFixture(source, "readonly-search");
 	const { rpc } = fixture;

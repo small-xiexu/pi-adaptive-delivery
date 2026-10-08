@@ -17,6 +17,18 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 	const development = scenario.startsWith("development-");
 
 	const isChild = () => Boolean(process.env.PI_ADAPTIVE_DELIVERY_CHILD);
+	const webNames = ["web_search", "source_check", "fetch_content", "get_search_content"];
+	const dynamicTools = scenario.includes("dynamic-tools");
+	if (dynamicTools || scenario === "missing-tools" && !isChild()) {
+		for (const name of dynamicTools ? webNames : ["fixture_unavailable"]) pi.registerTool({
+			name, label: name, description: "隔离网页工具替身，不调用网络或模型",
+			parameters: Type.Object({}),
+			execute: async () => {
+				audit("dynamic-web-executed", { toolName: name });
+				return { content: [{ type: "text", text: `FIXTURE_${name}` }], details: {} };
+			},
+		});
+	}
 	let dialogAsked = false;
 	let nextTool: ToolCall | undefined;
 	let streamFailures = 0;
@@ -42,6 +54,10 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 		audit("start", { sessionId: ctx.sessionManager.getSessionId(), commands: pi.getCommands().map((command) => command.name),
 			tools: pi.getAllTools().map((tool) => tool.name), ...(isChild() ? { readPaths: JSON.parse(process.env.PI_ADAPTIVE_DELIVERY_READ_PATHS ?? "[]") } : {}) });
 		if (isChild() && scenario === "missing-tools") pi.setActiveTools([]);
+		if (isChild() && dynamicTools) {
+			pi.setActiveTools(pi.getActiveTools().filter((name) => !webNames.includes(name)));
+			audit("dynamic-tools-reset", { active: pi.getActiveTools() });
+		}
 		if (isChild() && ["development-selection-mismatch", "development-selection-mismatch-stop-error"].includes(scenario)) pi.setThinkingLevel("low");
 		if (isChild() && scenario === "boot-failure") process.exit(13);
 		if (isChild() && (scenario === "environment-tool-replaced" || process.env.PI_ADAPTIVE_DELIVERY_CHILD !== "development" && scenario.endsWith("review-tool-replaced"))) {
@@ -180,7 +196,8 @@ export default function isolationProvider(pi: ExtensionAPI): void {
 				}
 				const reviewEvidence = reviewChild ? JSON.parse(taskText.split("\n").find((line) => line.startsWith("审查证据："))!.slice("审查证据：".length)) : undefined;
 				const readonlyEscalation = development && isChild() && !developmentChild && JSON.stringify(user?.content).includes("fixture-read-then-write");
-				const inheritedCalls = isChild() && taskText.includes("fixture-inherited-tools") ? [
+				const inheritedCalls = isChild() && taskText.includes("fixture-dynamic-web") ? webNames.map((name) => ({ name, arguments: {} }))
+				: isChild() && taskText.includes("fixture-inherited-tools") ? [
 					{ name: "web_search", arguments: { query: "library version" } },
 					{ name: "fetch_content", arguments: { url: "https://example.invalid/docs" } },
 					{ name: "plugin_echo", arguments: {} },

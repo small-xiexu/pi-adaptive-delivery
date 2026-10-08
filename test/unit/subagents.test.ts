@@ -7,9 +7,10 @@ import { access, mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/pr
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { createReadTool, type BuildSystemPromptOptions, type ExtensionUIContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
+import { createReadTool, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionUIContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import test from "node:test";
-import { ChildRpc, createChildDialogs, delegateReadOnly, parseReadOnlySession, persistedAssistantFacts, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
+import adaptiveDelivery from "../../extensions/delivery-gate/index.ts";
+import { CHILD_ENV, CHILD_READY, ChildRpc, createChildDialogs, delegateReadOnly, parseReadOnlySession, persistedAssistantFacts, snapshotReadOnlyEnvironment, assertReadOnlyEnvironment, startChild } from "../../extensions/delivery-gate/src/subagents.ts";
 
 test("持久模型终态事实保留 Provider 原始错误，不把不同失败合并成一个原因", () => {
 	assert.equal(persistedAssistantFacts({ stopReason: "error", errorMessage: "upstream_http2_stream_error" }), "模型终态：error\n模型原始错误：upstream_http2_stream_error");
@@ -181,6 +182,30 @@ function environmentFixture() {
 			sourceInfo: { ...sourceInfo, path: "/repo/skills/proof/SKILL.md", source: "local" }, disableModelInvocation: false }] };
 	return { tools, options };
 }
+
+test("子 READY 承接父明确选择，恢复启动时关闭的注册工具并移除未请求工具", async () => {
+	const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "child-selection-")));
+	execFileSync("git", ["init", "--quiet"], { cwd });
+	const { tools, options } = environmentFixture();
+	const registered = [...tools, { ...tools[0]!, name: "web_search" }, { ...tools[0]!, name: "unrequested" }];
+	let active = ["read", "unrequested"];
+	const commands = new Map<string, any>(), entries: any[] = [];
+	const pi = { on: () => () => {}, registerCommand: (name: string, command: any) => commands.set(name, command),
+		getAllTools: () => registered, getActiveTools: () => active,
+		setActiveTools: (names: string[]) => { active = names.filter((name) => registered.some((tool) => tool.name === name)); },
+		appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }) };
+	const previous = process.env[CHILD_ENV];
+	try { process.env[CHILD_ENV] = "1"; adaptiveDelivery(pi as unknown as ExtensionAPI); }
+	finally { if (previous === undefined) delete process.env[CHILD_ENV]; else process.env[CHILD_ENV] = previous; }
+	await commands.get(CHILD_READY).handler(JSON.stringify({ id: "run", tools: ["read", "web_search"] }), {
+		cwd, sessionManager: { getSessionId: () => "child-session" }, isProjectTrusted: () => false,
+		getSystemPromptOptions: () => ({ ...options, cwd }),
+	});
+	assert.deepEqual(active, ["read", "web_search"]);
+	assert.equal(entries.length, 1);
+	assert.equal(entries[0].customType, CHILD_READY);
+	assertReadOnlyEnvironment(snapshotReadOnlyEnvironment({ ...options, cwd }, registered.slice(0, 2)), entries[0].data.environment);
+});
 
 test("只读环境快照独立于可变对象且不持久复制规则或指令正文", () => {
 	const { tools, options } = environmentFixture();
