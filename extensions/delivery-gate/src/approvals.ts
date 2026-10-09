@@ -93,26 +93,6 @@ export function installApprovals(pi: ExtensionAPI) {
 		if (!approvalId || design?.approval.id !== approvalId || ctx.mode !== "tui" || !ctx.hasUI || event.outcome !== "completed" || ctx.hasPendingMessages()) return;
 		return { entries: [...event.entries, { type: "custom_message", customType: "delivery-continuation", content: executionInstruction, display: false, details: { stage: "design", approvalId } }], continue: true };
 	});
-	pi.registerCommand("delivery-resume", {
-		description: "继续当前会话尚未确认的方案审阅，不恢复旧权限或自动开始实施",
-		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui" || !ctx.hasUI) { ctx.ui.notify("方案审阅需要父 Pi TUI。", "warning"); return; }
-			if (pending || !ctx.isIdle() || ctx.hasPendingMessages()) { ctx.ui.notify("当前仍有任务或消息待处理，请结束后再恢复方案审阅。", "warning"); return; }
-			const controller = new AbortController(); pending = controller;
-			const sessionId = ctx.sessionManager.getSessionId(), sessionFile = ctx.sessionManager.getSessionFile(), cwd = ctx.cwd;
-			const branch = structuredClone(ctx.sessionManager.getBranch());
-			try {
-				const latest = branch.findLast((row): row is CustomEntry<Proposal> => row.type === "custom" && row.customType === PROPOSAL_ENTRY && (row.data as Proposal)?.stage === "design");
-				if (!latest?.data || branch.some((row) => row.type === "custom" && row.customType === APPROVAL_ENTRY && (row.data as Approval)?.proposalId === latest.data!.id)) { ctx.ui.notify("没有可恢复的方案审阅。请重新整理方案并提交 design 提案。", "info"); return; }
-				const proposal = structuredClone(latest.data), workspace = await resolveWorkspaceIdentity(cwd), [saved] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]);
-				controller.signal.throwIfAborted();
-				if (ctx.sessionManager.getSessionId() !== sessionId || ctx.sessionManager.getSessionFile() !== sessionFile || ctx.cwd !== cwd || !isDeepStrictEqual(ctx.sessionManager.getBranch(), branch) || !isDeepStrictEqual(saved.data, proposal) || proposal.workspaceKey !== workspace.key || proposal.sessionId !== sessionId || proposal.cwd !== workspace.cwdPath) throw new Error("方案审阅记录或会话归属已变化");
-				if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new Error("当前已有任务或消息待处理");
-				pi.sendUserMessage(`继续审阅当前会话的方案。先读取 adaptive-delivery Skill，${proposal.paths.length ? `读取最新方案文件和已有台账（规划文档：${JSON.stringify(proposal.paths)}），` : "本任务没有规划文档，以会话中的方案正文为起点，"}核对已有修改意见及现场，再形成新的 design 审阅提案。以下只是历史提案，不能直接当作当前结论或批准依据。\n\n${proposal.body}\n\n本次只恢复方案审阅，不确认方案或自动进入开发；旧批准仍须重新取得。`, { expandPromptTemplates: false });
-			} catch (error) { ctx.ui.notify(`无法恢复方案审阅：${error instanceof Error ? error.message : String(error)}`, "error"); }
-			finally { if (pending === controller) pending = undefined; }
-		},
-	});
 	pi.registerEntryRenderer<Proposal>(PROPOSAL_ENTRY, (entry, { expanded }) => new Text(displayText(expanded ? presentation(entry.data!, true) : "方案确认提案已保存"), 0, 0));
 	pi.registerTool({
 		name: APPROVAL_TOOL, label: "确认方案并开始实施",
@@ -131,7 +111,7 @@ export function installApprovals(pi: ExtensionAPI) {
 			const summary = isPartial ? "等待方案审阅结果"
 				: details?.approved ? "已确认方案，开始实施"
 				: details?.feedback ? "已收到修改意见，尚未确认方案"
-				: details?.paused ? "方案审阅已暂停，可用 /delivery-resume 继续" : "方案尚未确认";
+				: details?.paused ? "方案审阅已暂停，说“继续看方案”即可恢复" : "方案尚未确认";
 			return new Text(theme.fg("toolOutput", summary), 0, 0);
 		},
 		execute: async (toolCallId, request, signal, _onUpdate, ctx) => {
@@ -163,7 +143,7 @@ export function installApprovals(pi: ExtensionAPI) {
 				});
 				current(); const [confirmed] = await persisted<Proposal>(ctx, [PROPOSAL_ENTRY, proposal.id]); if (!isDeepStrictEqual(confirmed.data, proposal)) throw new Error("确认正文与原展示正文不一致");
 				if (typeof choice === "object" && choice.feedback.trim()) return { content: [{ type: "text", text: `用户对本次方案的修改意见：\n${choice.feedback}\n\n尚未确认方案。请修订同一份方案后重新提交 design 提案；不要进入实施或开发。` }], details: { approved: false, proposalId: proposal.id, feedback: choice.feedback } };
-				if (choice !== action) return { content: [{ type: "text", text: "方案审阅已暂停，方案正文与已发送意见保留。用户可输入继续看方案、直接提出意见，或用 /delivery-resume 恢复；现在停止推进，不自动重问。" }], details: { approved: false, proposalId: proposal.id, paused: true }, terminate: true };
+				if (choice !== action) return { content: [{ type: "text", text: "方案审阅已暂停，方案正文与已发送意见保留。用户可输入“继续看方案”或直接提出意见；现在停止推进，不自动重问。" }], details: { approved: false, proposalId: proposal.id, paused: true }, terminate: true };
 				const approval: Approval = { id: randomUUID(), proposalId: proposal.id, sessionId, workspaceKey: workspace.key, source: { mode: "tui", interaction: "custom", toolCallId } }; pi.appendEntry(APPROVAL_ENTRY, structuredClone(approval));
 				const [saved] = await persisted<Approval>(ctx, [APPROVAL_ENTRY, approval.id]); if (!isDeepStrictEqual(saved.data, approval)) throw new Error("确认记录与持久记录不一致"); current();
 				design = { approval, proposal, sessionFile: sessionFile!, controller: new AbortController() }; continuation = approval.id;

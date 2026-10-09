@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // 真实模型全流程验证：真实 SDK 父会话 + 真实子 Pi CLI + 真实项目检查 + 真实 writer lease。
 // 覆盖：拷问式对齐 → 规划文档落盘 → 意见轮 → 一次方案确认并开始实施 → 开发 → 注入缺陷 → 审查报缺陷 →
-//       返工（按新默认规则）→ 状态/任务弹层 → 残留 lease → 退出被拒 → /delivery-unlock → 正常退出。
+//       返工（按新默认规则）→ 状态/任务弹层 → 残留占用 → 结束被拒 → 面板明确解除占用 → 正常结束。
 // 认证由 Pi 自己从符号链接的 auth.json 读取；本脚本不读取、不复制、不打印任何凭证。
 // 用法：node --import tsx test/demo/real-model-full.ts
 import { execFileSync, spawnSync } from "node:child_process";
@@ -89,6 +89,7 @@ let feedbackGiven = false;
 let injected = false;
 let injectNote = "";
 let unlockConfirmed = false;
+let statusAction = "关闭";
 const custom = (async (factory: any, options: any) => {
 	let done!: (value: unknown) => void;
 	const result = new Promise<unknown>((resolve) => { done = resolve; });
@@ -112,9 +113,16 @@ const custom = (async (factory: any, options: any) => {
 			panel.handleInput?.("\r");
 			return await result;
 		}
-		say(`\n【面板】${panel.title} → ${choices[0]}`);
-		const index = choices.indexOf(choices[0]!);
-		if (index === 0) for (let i = 1; i < choices.length; i++) panel.handleInput?.("\x1b[A");
+		const label = panel.title === "交付状态" ? statusAction : choices[0]!;
+		if (panel.title === "解除上次任务的占用") {
+			unlockConfirmed = true;
+			confirmations.push(panel.render(100).join("\n"));
+		}
+		say(`\n【面板】${panel.title} → ${label}`);
+		const index = choices.indexOf(label);
+		if (index < 0) throw new Error(`状态操作不存在：${label}`);
+		const delta = index - (panel.title === "交付状态" ? 0 : choices.length - 1);
+		for (let i = 0; i < Math.abs(delta); i++) panel.handleInput?.(delta < 0 ? "\x1b[A" : "\x1b[B");
 		panel.handleInput?.("\r");
 		return await result;
 	} finally { panel.dispose?.(); }
@@ -232,8 +240,8 @@ for (let index = 0; index < 8 && Date.now() < deadline; index += 1) {
 	if (![...notices].at(-1)?.includes("")) { /* noop */ }
 	const text = lastAssistant();
 	if (/？|\?/.test(text)) { await step("追问", answers.shift() ?? "按你的推荐。", 4000); continue; }
-	if (!developed && index >= 2) await step("推动", "/delivery-run", 4000);
-	else if (developed && !reviewed && index >= 4) await step("推动审查", "/delivery-run", 4000);
+	if (!developed && index >= 2) await step("推动", "继续，先核对方案确认和当前执行，再推进剩余工作。", 4000);
+	else if (developed && !reviewed && index >= 4) await step("推动审查", "继续核对实际改动，按已确认范围安排独立审查。", 4000);
 }
 
 section("4 · 结果核对");
@@ -251,21 +259,25 @@ say(`git status：\n${spawnSync("/usr/bin/git", ["status", "--short"], { cwd, en
 section("5 · 状态、任务弹层、退出与人工解锁");
 await step("/delivery-status", "/delivery-status", 2000);
 say(`\n[通知] ${brief(notices.at(-1) ?? "", 400)}`);
-await step("/delivery-status details", "/delivery-status details", 2000);
-say(`\n[通知] ${brief(notices.at(-1) ?? "", 600)}`);
-await step("/delivery-tasks", "/delivery-tasks", 4000);
+statusAction = "查看任务";
+await step("状态面板查看任务", "/delivery-status", 4000);
+statusAction = "关闭";
 const detail = panels.at(-1);
 if (detail) say(`\n【任务弹层】${detail.title}\n${detail.lines.slice(0, 12).join("\n")}`);
 // 造残留现场：真实 lease + 操作锁
 const stale = await leases.acquire(workspace, { kind: "parent", sessionId: "demo-crashed", pid: process.pid, runId: "demo-stale" });
 if (stale.ok) await mkdir(path.join(await getWriterStateRoot(workspace), "leases", `${workspace.key}.operation-lock`), { recursive: true });
-await step("退出（应被拒）", "/delivery-exit", 2500);
+statusAction = "结束交付";
+await step("结束（应被拒）", "/delivery-status", 2500);
 say(`\n[通知] ${brief(notices.at(-1) ?? "", 300)}`);
-await step("人工解锁", "/delivery-unlock", 2500);
+statusAction = "解除占用";
+await step("明确解除占用", "/delivery-status", 2500);
 say(`\n[确认框原文]\n${confirmations.at(-1) ?? "（未触发）"}`);
 say(`[通知] ${brief(notices.at(-1) ?? "", 300)}`);
 say(`解锁后残留 lease：${(await leases.read(workspace.key)) ? "仍有" : "已清理"}`);
-await step("再次退出", "/delivery-exit", 5000);
+statusAction = "结束交付";
+await step("再次结束", "/delivery-status", 5000);
+statusAction = "关闭";
 say(`\n[通知] ${brief(notices.at(-1) ?? "", 300)}`);
 
 section("6 · 证据位置");

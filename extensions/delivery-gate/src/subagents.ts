@@ -70,7 +70,7 @@ export function assertReadOnlyEnvironment(expected: ReadOnlyEnvironment, actual?
 		const changed = [...parent.keys()].filter((name) => child.has(name) && parent.get(name) !== child.get(name));
 		throw new Error("父子工具定义或来源未对齐，未发送任务。"
 			+ `\n子会话缺少：${missing.join(", ") || "无"}；子会话额外启用：${extra.join(", ") || "无"}；定义或来源不同：${changed.join(", ") || "无"}。`
-			+ "\n请核对工具是否已注册、配置是否禁用，或父会话是否仍保留更新前的插件。先用 /delivery-status details 核对收尾；空闲且执行已收尾后，在父终端用 /delivery-exit 恢复进入前工具并重载。继续开发时再用 /delivery-shape 进入。"
+			+ "\n请核对工具是否已注册、配置是否禁用，或父会话是否仍保留更新前的插件。先用 /delivery-status 展开详情核对收尾；空闲且执行已收尾后，可在面板选择“结束交付”恢复进入前工具并重载。继续开发时再用 /delivery-shape 进入。"
 			+ "\n单独 /reload 会保留当前启用的工具列表；若退出后仍不一致，按上述差异核对插件配置与实现，不补启父未选择的工具或重复委派。"
 			+ beforeSend);
 	}

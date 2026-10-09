@@ -19,65 +19,71 @@ function host(entries: any[] = [], cwd = repo) {
 	const messages: any[] = [];
 	let tools = ["read", "bash", "plugin"];
 	let starts = 0, reloads = 0;
-	let idle = true, queued = false, blocked = false;
+	let idle = true, queued = false, blocked = false, endRequested = false;
 	let autocompleteProvider: CombinedAutocompleteProvider;
 	const pi: any = { on: (name: string, fn: Function) => handlers.set(name, fn), registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
 		getActiveTools: () => [...tools], getAllTools: () => ["read", "bash", "plugin"].map((name) => ({ name })), setActiveTools: (names: string[]) => { tools = names; },
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }), sendUserMessage: (...args: any[]) => messages.push(args), sendMessage: (...args: any[]) => messages.push(args) };
-	const ctx: any = { hasUI: true, cwd, sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
+	const ctx: any = { mode: "tui", hasUI: true, cwd, sessionManager: { getEntries: () => entries }, isIdle: () => idle, hasPendingMessages: () => queued,
 		ui: { notify: (text: string) => notices.push(text), addAutocompleteProvider: (factory: any) => { autocompleteProvider = factory(autocompleteProvider); } }, reload: async () => { reloads++; } };
-	installActivation(pi, (current) => { assert.equal(current, ctx); starts++; return { initialize: async () => { tools = ["read"]; }, assertCanExit: async () => { if (blocked) throw new Error("未知 writer"); } }; });
+	installActivation(pi, (current) => { assert.equal(current, ctx); starts++; return { initialize: async () => { tools = ["read"]; },
+		showStatus: async () => endRequested, assertCanExit: async () => { if (blocked) throw new Error("未知 writer"); } }; });
 	autocompleteProvider = new CombinedAutocompleteProvider([...commands].map(([name, command]) => ({ name, description: command.description })), "/tmp");
-	return { pi, ctx, entries, notices, messages, handlers, command: (name: string, args = "") => commands.get(name).handler(args, ctx),
+	return { pi, ctx, entries, notices, messages, handlers, commands, command: (name: string, args = "") => commands.get(name).handler(args, ctx),
 		completions: async () => (await autocompleteProvider.getSuggestions(["/delivery-"], 0, 10, { signal: new AbortController().signal }))?.items.map((item) => item.value),
-		starts: () => starts, reloads: () => reloads, setBusy: (value: boolean) => { idle = !value; }, setQueued: (value: boolean) => { queued = value; }, setBlocked: () => { blocked = true; } };
+		starts: () => starts, reloads: () => reloads, requestEnd: () => { endRequested = true; },
+		setBusy: (value: boolean) => { idle = !value; }, setQueued: (value: boolean) => { queued = value; }, setBlocked: () => { blocked = true; } };
 }
 
 test("普通启动和状态查询不安装运行逻辑、不改工具、不发送模型消息", async () => {
 	const h = host();
 	await h.handlers.get("session_start")!({}, h.ctx);
 	await h.command("delivery-status");
-	await h.command("delivery-tasks");
-	await h.command("delivery-resume");
-	await h.command("delivery-exit");
 	assert.equal(h.starts(), 0);
 	assert.deepEqual(h.pi.getActiveTools(), ["read", "bash", "plugin"]);
 	assert.deepEqual(h.entries, []);
 	assert.deepEqual(h.messages, []);
 });
 
-test("启动时建立的补全已包含任务与恢复入口，首次 shape 后仍可发现，无须重建", async () => {
+test("启动与首次启用后的补全只有进入和状态两个命令", async () => {
 	const h = host();
 	await h.handlers.get("session_start")!({}, h.ctx);
+	assert.deepEqual([...h.commands.keys()].sort(), ["delivery-shape", "delivery-status"]);
 	const before = await h.completions();
-	assert.ok(before?.includes("delivery-tasks"));
-	assert.ok(before?.includes("delivery-resume"));
-	assert.ok(before?.includes("delivery-unlock"));
-	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-tasks"));
-	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-resume"));
-	assert.ok(before!.indexOf("delivery-shape") < before!.indexOf("delivery-unlock"));
+	assert.deepEqual(before, ["delivery-shape", "delivery-status"]);
 	await h.command("delivery-shape");
 	assert.deepEqual(await h.completions(), before);
 });
 
 test("仅 shape 安装一次运行逻辑，需求按字面发送、不展开命令或批准", async () => {
 	const h = host();
-	await h.command("delivery-shape", "/delivery-exit literal");
+	await h.command("delivery-shape", "/delivery-status literal");
 	await h.command("delivery-shape");
 	assert.equal(h.starts(), 1);
 	assert.equal(h.entries.length, 1);
 	assert.equal(h.messages[0][1].expandPromptTemplates, false);
-	assert.match(h.messages[0][0], /\/delivery-exit literal/);
+	assert.match(h.messages[0][0], /\/delivery-status literal/);
 	assert.deepEqual(h.entries[0].data, { enabled: true, tools: ["read", "bash", "plugin"] });
 });
 
-for (const busy of ["running", "queued", "writer"]) test(`退出拒绝 ${busy}，不写停用记录、不重载或解锁`, async () => {
+test("查看状态或关闭面板不结束交付、不恢复工具或重载", async () => {
 	const h = host();
 	await h.command("delivery-shape");
+	await h.command("delivery-status");
+	assert.equal(h.reloads(), 0);
+	assert.equal(h.entries.length, 1);
+	assert.deepEqual(h.pi.getActiveTools(), ["read"]);
+	assert.equal(h.messages.length, 0);
+});
+
+for (const busy of ["running", "queued", "writer"]) test(`明确结束仍拒绝 ${busy}，不写停用记录、不重载或解锁`, async () => {
+	const h = host();
+	await h.command("delivery-shape");
+	h.requestEnd();
 	if (busy === "running") h.setBusy(true);
 	if (busy === "queued") h.setQueued(true);
 	if (busy === "writer") h.setBlocked();
-	await h.command("delivery-exit");
+	await h.command("delivery-status");
 	assert.equal(h.reloads(), 0);
 	assert.equal(h.entries.length, 1);
 	assert.deepEqual(h.pi.getActiveTools(), ["read"]);
@@ -93,10 +99,11 @@ test("非 Git 目录不启用交付，说明 Git 要求且不写启用记录", a
 	assert.match(h.notices.at(-1)!, /Git/);
 });
 
-test("退出经重载恢复原工具集合，只消费一次恢复记录", async () => {
+test("状态面板明确结束后经重载恢复原工具集合，只消费一次恢复记录", async () => {
 	const h = host();
 	await h.command("delivery-shape");
-	await h.command("delivery-exit");
+	h.requestEnd();
+	await h.command("delivery-status");
 	assert.equal(h.reloads(), 1);
 	const resumed = host(h.entries);
 	await resumed.handlers.get("session_start")!({}, resumed.ctx);
@@ -111,11 +118,11 @@ test("退出经重载恢复原工具集合，只消费一次恢复记录", async
 	assert.deepEqual(resumed.pi.getActiveTools(), ["read"]);
 });
 
-test("重载说明确认失效与退出恢复入口，提示不重新启用被停用工具", async () => {
+test("重载说明重新确认及状态入口，不重新启用被停用工具或自动调用模型", async () => {
 	const h = host([{ type: "custom", customType: "delivery-activation", data: { enabled: true, tools: ["read", "bash", "plugin"] } }]);
 	await h.handlers.get("session_start")!({ reason: "reload" }, h.ctx);
-	assert.match(h.notices.at(-1)!, /确认.*重新/);
-	assert.match(h.notices.at(-1)!, /保留.*工具.*\/delivery-exit/);
+	assert.match(h.notices.at(-1)!, /重新确认/);
+	assert.match(h.notices.at(-1)!, /\/delivery-status/);
 	assert.deepEqual(h.pi.getActiveTools(), ["read"]);
 	assert.equal(h.messages.length, 0);
 	assert.equal(h.entries.length, 1);

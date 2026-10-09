@@ -28,7 +28,6 @@
     "docs/技术方案.md",
     "docs/实施计划.md",
     "extensions",
-    "prompts",
     "skills"
   ],
   "pi": {
@@ -38,9 +37,6 @@
     "image": "https://raw.githubusercontent.com/small-xiexu/pi-adaptive-delivery/main/docs/images/preview.png",
     "skills": [
       "./skills"
-    ],
-    "prompts": [
-      "./prompts"
     ]
   },
   "scripts": {

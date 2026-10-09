@@ -72,8 +72,9 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		initTheme("dark");
 		const notices: string[] = [];
 		const choices: string[] = [];
-		let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[0]; };
-		let custom = approvalUI((...args) => select(...args));
+		let select: ExtensionUIContext["select"] = async (title, items) => { if (title !== "交付状态") choices.push(title); return items[0]; };
+		let custom = approvalUI((...args) => select(...args), undefined, 32,
+			(panel) => { if (panel.title === "交付状态") notices.push(`${panel.body}\n\n${panel.detail}`); });
 		let confirm: ExtensionUIContext["confirm"] = async () => true;
 		let input: ExtensionUIContext["input"] = async () => "fixture-answer";
 		await session.bindExtensions({ mode: "tui", commandContextActions: { reload: () => session!.reload() } as ExtensionCommandContextActions, abortHandler: () => { session!.clearQueue(); void session!.abort(); },
@@ -111,9 +112,15 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		const prepare = async () => {
 			assert.equal((await approve("design", ["plan.md"])).isError, false);
 		};
+		const status = async (action = "关闭") => {
+			const previous = select;
+			select = async (title, items, options) => title === "交付状态" ? action : previous(title, items, options);
+			try { await session!.prompt("/delivery-status"); }
+			finally { select = previous; }
+		};
 		const audit = async () => (await readFile(path.join(fixture.agentDir, "fixture-events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
 		t.diagnostic(JSON.stringify({ root: fixture.root, parentPid: process.pid, ui: "simulated", child: "standard-cli" }));
-		return { ...fixture, session, sm, api, notices, choices, call, approve, prepare, audit, readLease: () => leases.read(workspace.key),
+		return { ...fixture, session, sm, api, notices, choices, call, approve, prepare, status, audit, readLease: () => leases.read(workspace.key),
 			setSelect: (value: typeof select) => { select = value; }, setConfirm: (value: typeof confirm) => { confirm = value; },
 			setCustom: (value: typeof custom) => { custom = value; },
 			setInput: (value: typeof input) => { input = value; } };

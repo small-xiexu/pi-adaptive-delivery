@@ -192,7 +192,7 @@ export async function createPiFixture(packageSource?: string, scenario?: string,
 		productDir = path.join(root, "product-package");
 		await mkdir(productDir);
 		// 仅复制本仓库交付资源，不携带 node_modules、.pi、.env 或用户配置。
-		for (const file of ["package.json", "extensions", "prompts", "skills"]) {
+		for (const file of ["package.json", "extensions", "skills"]) {
 			await cp(path.join(packageSource, file), path.join(productDir, file), { recursive: true });
 		}
 	}

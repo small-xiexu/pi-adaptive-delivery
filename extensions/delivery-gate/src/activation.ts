@@ -5,7 +5,7 @@ import { resolveWorkspaceIdentity } from "./workspace.ts";
 
 const ENTRY = "delivery-activation";
 type Activation = { enabled: boolean; tools?: string[] };
-type Runtime = { initialize(): Promise<void>; assertCanExit(ctx: ExtensionContext): Promise<void>; cleanup?(ctx: ExtensionContext): Promise<void> };
+type Runtime = { initialize(): Promise<void>; showStatus(ctx: ExtensionContext): Promise<boolean>; assertCanExit(ctx: ExtensionContext): Promise<void>; cleanup?(ctx: ExtensionContext): Promise<void> };
 
 function prioritizeDeliveryShape(suggestions: AutocompleteSuggestions | null): AutocompleteSuggestions | null {
 	if (!suggestions) return suggestions;
@@ -49,7 +49,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		if (state.enabled) {
 			originalTools = state.tools ?? [];
 			await enter(ctx);
-			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载；旧方案确认已失效，继续开发须重新确认方案。当前仍保留交付工具；任务收尾后用 /delivery-exit 恢复普通工具，工具不一致时先用 /delivery-status details 核对。", "info");
+			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载。说“继续”即可核对已有方案和进度；继续开发需要重新确认。用 /delivery-status 查看任务、处理占用或结束交付。", "info");
 		} else if (state.tools) {
 			restoreTools = state.tools;
 		}
@@ -62,17 +62,27 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		restoreTools = undefined;
 	});
 	pi.registerCommand("delivery-status", {
-		description: "查看交付是否启用及当前状态",
-		handler: async (_args, ctx) => { ctx.ui.notify("交付未启用，当前沿用 Pi 原有工具。使用 /delivery-shape 进入交付流程。", "info"); },
-	});
-	// Pi 在启动时建立命令补全；先声明入口，进入交付后由实际处理器接管。
-	for (const [name, description] of [
-		["delivery-tasks", "查看交付子任务的实时输出，Esc 关闭详情"],
-		["delivery-resume", "继续尚未确认的方案审阅"],
-		["delivery-unlock", "人工核对并强制清理残留的 writer 记录"],
-	] as const) pi.registerCommand(name, {
-		description,
-		handler: async (_args, ctx) => { ctx.ui.notify("请先用 /delivery-shape 进入交付流程。当前仍沿用 Pi 原有工具。", "info"); },
+		description: "查看交付状态、任务详情，处理占用或结束交付",
+		handler: async (_args, ctx) => {
+			if (!runtime) { ctx.ui.notify("交付未启用，当前沿用 Pi 原有工具。使用 /delivery-shape 进入交付流程。", "info"); return; }
+			if (!await runtime.showStatus(ctx)) return;
+			if (changing || !ctx.isIdle() || ctx.hasPendingMessages()) {
+				ctx.ui.notify("暂不能结束交付：仍有执行或排队消息。请等收尾后在 /delivery-status 中选择“结束交付”。", "warning");
+				return;
+			}
+			changing = true;
+			try { await runtime.assertCanExit(ctx); await runtime.cleanup?.(ctx); }
+			catch (error) {
+				changing = false;
+				ctx.ui.notify(`暂不能结束交付：${String(error)}`, "warning");
+				return;
+			}
+			pi.appendEntry(ENTRY, { enabled: false, tools: originalTools });
+			pi.sendMessage({ customType: "delivery-mode", content: "用户已在状态面板中选择结束本轮受控交付。后续普通请求沿用 Pi 原有工具与项目规则，不再要求交付阶段确认；旧交付记录只供查阅，不授予新权限。", display: false }, { triggerTurn: false });
+			pi.setActiveTools(originalTools);
+			ctx.ui.notify("交付已结束，正在重载并恢复原工具；执行记录保留，旧批准不再有效。", "info");
+			await ctx.reload();
+		},
 	});
 	pi.registerCommand("delivery-shape", {
 		description: "启用当前会话的受控交付，可附带需求",
@@ -94,31 +104,9 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 					pi.appendEntry(ENTRY, { enabled: true, tools: originalTools });
 					await enter(ctx);
 				}
-				ctx.ui.notify("交付已启用。这条流程适合需要先确认范围、验收或独立审查的任务；小改动、低风险任务可以继续使用普通 Pi。下一步：提交方案确认并开始实施；任务完成并核对结果后用 /delivery-exit 恢复普通工具。", "info");
+				ctx.ui.notify("交付已启用。确认方案后开始实施；之后直接说“继续”或提出修改意见。用 /delivery-status 查看任务、处理占用或结束交付。", "info");
 				if (args.trim()) pi.sendUserMessage(`先读取并遵循 ${fileURLToPath(new URL("../../../skills/adaptive-delivery/SKILL.md", import.meta.url))}，核实项目事实并对齐需求；明确需求可以零追问，简单任务无须规划文档。当前需求：\n${args}`, { expandPromptTemplates: false });
 			} finally { changing = false; }
-		},
-	});
-	pi.registerCommand("delivery-exit", {
-		description: "交付执行收尾后退出，并重载恢复原工具",
-		handler: async (_args, ctx) => {
-			if (!runtime) { ctx.ui.notify("交付未启用。", "info"); return; }
-			if (changing || !ctx.isIdle() || ctx.hasPendingMessages()) {
-				ctx.ui.notify("暂不能退出：仍有执行或排队消息。等收尾后重试 /delivery-exit；可用 /delivery-status 查看。", "warning");
-				return;
-			}
-			changing = true;
-			try { await runtime.assertCanExit(ctx); await runtime.cleanup?.(ctx); }
-			catch (error) {
-				changing = false;
-				ctx.ui.notify(`暂不能退出交付：${String(error)}`, "warning");
-				return;
-			}
-			pi.appendEntry(ENTRY, { enabled: false, tools: originalTools });
-			pi.sendMessage({ customType: "delivery-mode", content: "用户已通过 /delivery-exit 结束本轮受控交付。后续普通请求沿用 Pi 原有工具与项目规则，不再要求交付阶段确认；旧交付记录只供查阅，不授予新权限。", display: false }, { triggerTurn: false });
-			pi.setActiveTools(originalTools);
-			ctx.ui.notify("交付已退出，正在重载并恢复原工具；执行记录保留，旧批准不再有效。", "info");
-			await ctx.reload();
 		},
 	});
 }

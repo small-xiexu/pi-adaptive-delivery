@@ -292,6 +292,5 @@ export function installTaskDetails(pi: ExtensionAPI, live: () => TaskProgress[],
 			}, { overlay: true, overlayOptions: { width: 110, maxHeight: "90%", margin: 1, anchor: "center" } });
 		} finally { close = undefined; }
 	};
-	pi.registerCommand("delivery-tasks", { description: "查看交付子任务详情，Esc 关闭详情", handler: (args, ctx) => open(args.trim() || undefined, ctx) });
-	return (id: string) => { void open(id).catch((error) => current?.ui.notify(`无法打开任务详情：${String(error)}`, "error")); };
+	return (id?: string, ctx = current) => open(id, ctx).catch((error) => ctx?.ui.notify(`无法打开任务详情：${String(error)}`, "error"));
 }

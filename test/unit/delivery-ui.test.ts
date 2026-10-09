@@ -212,6 +212,21 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的
 	} finally { renderer.stop(); }
 });
 
+test("状态面板默认关闭，展开和翻页不选择结束或解除占用", () => {
+	for (const choices of [["关闭", "查看任务", "结束交付"], ["关闭", "查看任务", "解除占用", "结束交付"]]) {
+		const answers: unknown[] = [];
+		const panel = new DeliveryPanel("交付状态", "当前阶段：等待核对", "诊断证据\n".repeat(80), choices, tui, plainTheme,
+			(value) => answers.push(value), 0);
+		panel.render(100);
+		panel.handleInput("\x0f");
+		panel.render(100);
+		panel.handleInput("\x1b[F");
+		assert.deepEqual(answers, []);
+		panel.handleInput("\r");
+		assert.deepEqual(answers, ["关闭"]);
+	}
+});
+
 test("真实工具卡片点击按 toolCallId 打开对应详情，折叠仍保持两行", () => {
 	initTheme("dark");
 	const opened: string[] = [];
@@ -221,7 +236,7 @@ test("真实工具卡片点击按 toolCallId 打开对应详情，折叠仍保�
 	card.updateResult({ content: [{ type: "text", text: "结束" }], details: {}, isError: false });
 	const rows = card.render(80);
 	assert.equal(rows.filter((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trim()).length, 2);
-	assert.match(rows.join("\n"), /\/delivery-tasks/);
+	assert.match(rows.join("\n"), /\/delivery-status/);
 	// Pi 的 ToolExecutionComponent 本身沿 Container 的公开鼠标分派到 MouseRegion。
 	for (let y = 0; y < rows.length && !opened.length; y++) card.handleMouse(mouse("click", y));
 	assert.deepEqual(opened, ["task-a"]);
@@ -247,14 +262,13 @@ test("首次按需安装即能从卡片打开详情，分支切换更新上下�
 
 test("子任务列表显示当前模型和推理级别", async () => {
 	let choice: string | undefined;
-	let command!: (args: string, context: any) => Promise<void>;
-	const pi: any = { on: () => {}, registerCommand: (_name: string, definition: any) => { command = definition.handler; } };
+	const pi: any = { on: () => {} };
 	const context: any = { mode: "tui", hasUI: true, sessionManager: { getBranch: () => [
 		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "a", name: "delivery_readonly", arguments: { task: "检查当前仓库" } }] } },
 		{ type: "custom", customType: "delivery-delegation", data: { id: "a", agent: { provider: "openai", id: "gpt-6-astra", thinking: "high", reason: "复杂度高" } } },
 	] }, ui: { select: async (_title: string, choices: string[]) => { choice = choices[0]; return undefined; }, notify() {}, custom: async () => {} } };
-	installTaskDetails(pi, () => [], context);
-	await command("", context);
+	const open = installTaskDetails(pi, () => [], context);
+	await open();
 	assert.match(choice!, /模型：gpt-6-astra · 推理：high/);
 });
 

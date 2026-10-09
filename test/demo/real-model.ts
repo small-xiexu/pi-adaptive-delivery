@@ -114,9 +114,9 @@ const custom = (async (factory: any, options: any) => {
 			const label = choices[0]!;
 			say(`\n【交互替身】面板：${panel.title} → 选择「${label}」`);
 			const index = choices.indexOf(label);
-			// 面板默认停在最后一项（不批准）；选第一项需要上移 (choices.length - 1) 次。
-			if (index === 0) for (let i = 1; i < choices.length; i++) panel.handleInput?.("\x1b[A");
-			panel.handleInput?.(index === 0 ? "\r" : "\x1b");
+			const delta = index - (panel.title === "交付状态" ? 0 : choices.length - 1);
+			for (let i = 0; i < Math.abs(delta); i++) panel.handleInput?.(delta < 0 ? "\x1b[A" : "\x1b[B");
+			panel.handleInput?.("\r");
 		}
 		return await result;
 	} finally { panel.dispose?.(); }
@@ -162,7 +162,7 @@ say(`模型回复：${brief(smoke, 160)}`);
 if (!/收到/.test(smoke)) throw new Error("真实模型未按预期回复，停止后续流程");
 if (smokeOnly) { say("\n仅冒烟：跳过完整流程。"); session.dispose(); process.exit(0); }
 
-// 6. 驱动流程：每个回合后打印新增记录，必要时用 /delivery-plan、/delivery-run 推动。
+// 6. 驱动流程：每个回合后打印新增记录，必要时用普通对话表达继续意图。
 let printed = 0;
 const printNew = () => {
 	for (const row of sm.getBranch().slice(printed)) {
@@ -197,7 +197,7 @@ for (let index = 0; index < maxTurns; index++) {
 	const settled = approvals() >= 1 && (delegations() > 0 || dirty);
 	if (settled && !(await leases.read(workspace.key))) { say("\n①方案确认完成、改动就位且 writer 已交回，停止驱动。"); break; }
 	const before = sm.getBranch().length;
-	await turn(index % 3 === 1 ? "/delivery-run" : "/delivery-plan");
+	await turn("继续，先核对当前方案确认和执行状态，再推进剩余工作。");
 	if (sm.getBranch().length === before) { say("（模型没有继续推进，停止驱动）"); break; }
 }
 

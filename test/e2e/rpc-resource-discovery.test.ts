@@ -9,21 +9,22 @@ import { createPiFixture, FixtureRpc, testEnvironment } from "../support/pi-fixt
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 
-test("正式 Package 进入和退出均保留 RPC Shell，交付批准独立处理", { timeout: 30_000 }, async (t) => {
+test("正式 Package 只暴露两个交付命令，RPC 状态查询不改变权限或普通 Shell", { timeout: 30_000 }, async (t) => {
 	const f = await createPiFixture(source, undefined, false);
 	t.after(() => f.rpc.stop());
 	const commands = (await f.rpc.send("get_commands")).data.commands;
 	assert.ok(commands.some((command: any) => command.name === "delivery-shape" && command.source === "extension"));
-	for (const name of ["delivery-tasks", "delivery-resume"]) {
-		assert.ok(commands.some((command: any) => command.name === name && command.source === "extension"));
-		await f.rpc.send("prompt", { message: `/${name}` });
-	}
+	assert.deepEqual(commands.filter((command: any) => command.name.startsWith("delivery-")).map((command: any) => command.name).sort(), ["delivery-shape", "delivery-status"]);
+	await f.rpc.send("prompt", { message: "/delivery-status" });
 	assert.ok(!f.rpc.records.some((row) => row.type === "agent_start"), "未启用时被动命令不启动模型");
 	assert.equal((await f.rpc.send("bash", { command: "printf before > normal.txt" })).data.exitCode, 0);
 	await f.rpc.send("prompt", { message: "/delivery-status" });
 	await f.rpc.send("prompt", { message: "/delivery-shape" });
 	assert.equal((await f.rpc.send("bash", { command: "printf original > blocked.txt" })).data.exitCode, 0);
-	await f.rpc.send("prompt", { message: "/delivery-exit" });
+	await f.rpc.send("prompt", { message: "/delivery-status" });
+	const activated = (await f.rpc.send("get_commands")).data.commands;
+	assert.deepEqual(activated.filter((command: any) => command.name.startsWith("delivery-")).map((command: any) => command.name).sort(), ["delivery-shape", "delivery-status"]);
+	assert.ok(!(await f.rpc.send("get_entries")).data.entries.some((row: any) => row.customType === "delivery-activation" && row.data.enabled === false));
 	assert.equal((await f.rpc.send("bash", { command: "printf after >> normal.txt" })).data.exitCode, 0);
 	assert.equal(await readFile(path.join(f.cwd, "normal.txt"), "utf8"), "beforeafter");
 	assert.equal(await readFile(path.join(f.cwd, "blocked.txt"), "utf8"), "original");
@@ -78,7 +79,9 @@ test("npm tarball 在无 node_modules 的隔离目录加载完整自有资源并
 	t.after(() => fixture.rpc.stop());
 	await assert.rejects(access(path.join(fixture.productDir!, "node_modules")), { code: "ENOENT" });
 	const commands = (await fixture.rpc.send("get_commands")).data.commands;
-	for (const name of ["delivery-status", "delivery-resume", "delivery-shape", "delivery-plan", "delivery-run", "skill:adaptive-delivery"]) assert.ok(commands.some((command: any) => command.name === name));
+	for (const name of ["delivery-status", "delivery-shape", "skill:adaptive-delivery"]) assert.ok(commands.some((command: any) => command.name === name));
+	assert.deepEqual(commands.filter((command: any) => command.name.startsWith("delivery-")).map((command: any) => command.name).sort(), ["delivery-shape", "delivery-status"]);
+	assert.ok(!files.some((file: string) => file.startsWith("prompts/")));
 	await fixture.rpc.send("prompt", { message: "读取 input.txt，验证打包制品加载" });
 	await fixture.rpc.waitFor((row) => row.type === "agent_settled");
 	assert.match((await fixture.rpc.send("get_last_assistant_text")).data.text, /fixture-read-ok/);
@@ -89,9 +92,10 @@ test("无 node_modules 的正式 Package 加载自身资源并完成真实只读
 	const fixture = await createPiFixture(source);
 	t.after(() => fixture.rpc.stop());
 	const commands = (await fixture.rpc.send("get_commands")).data.commands;
-	for (const name of ["delivery-status", "delivery-resume", "delivery-shape", "delivery-plan", "delivery-run", "skill:adaptive-delivery"]) {
+	for (const name of ["delivery-status", "delivery-shape", "skill:adaptive-delivery"]) {
 		assert.ok(commands.some((command: any) => command.name === name), name);
 	}
+	assert.deepEqual(commands.filter((command: any) => command.name.startsWith("delivery-")).map((command: any) => command.name).sort(), ["delivery-shape", "delivery-status"]);
 	assert.ok(!commands.some((command: any) => command.sourceInfo?.path?.includes("pi-subagents")));
 	await assert.rejects(access(path.join(fixture.productDir!, "node_modules")), { code: "ENOENT" });
 	await fixture.rpc.send("prompt", { message: "读取 input.txt" });

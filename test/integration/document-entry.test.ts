@@ -34,7 +34,7 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 	let api!: ExtensionAPI;
 	const notices: string[] = [];
 	const choices: string[] = [];
-	let select: ExtensionUIContext["select"] = async (title, items) => { choices.push(title); return items[0]; };
+	let select: ExtensionUIContext["select"] = async (title, items) => { if (title !== "交付状态") choices.push(title); return items[0]; };
 	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true,
 		extensionsOverride: (loaded) => ({ ...loaded, extensions: [...loaded.extensions].reverse() }),
 		additionalExtensionPaths: [entry], extensionFactories: [(pi) => {
@@ -94,8 +94,14 @@ async function host(t: TestContext, configure?: (pi: ExtensionAPI) => void, conf
 		const documentStrategy = stage === "design" ? paths.length ? "reuse" : "none" : latest?.data.documentStrategy ?? "reuse";
 		return call("delivery_approval", { stage, body: `待确认正文 ${stage}`, documentStrategy, ...(stage === "design" && paths.length ? { technicalPlanPath: paths[0], implementationPlanPath: paths[0] } : {}), paths });
 	};
+	const status = async (action = "关闭") => {
+		const previous = select;
+		select = async (title, items, options) => title === "交付状态" ? action : previous(title, items, options);
+		try { await session.prompt("/delivery-status"); }
+		finally { select = previous; }
+	};
 	t.diagnostic(JSON.stringify({ root, sdk: VERSION, ui: "simulated" }));
-	return { root, cwd, sm, session, api, notices, choices, call, approve, contexts, prompts, readLease: () => leases.read(workspace.key),
+	return { root, cwd, sm, session, api, notices, choices, call, approve, status, contexts, prompts, readLease: () => leases.read(workspace.key),
 		setFollowups: (steps: ToolCall[][]) => { followups = steps; },
 		setFeedback: (callback: typeof feedback) => { feedback = callback; },
 		setSelect: (callback: typeof select) => { select = callback; } };
@@ -114,9 +120,8 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	await h.session.prompt("普通明确需求，不使用交付流程");
 	await h.session.prompt("/delivery-status");
 	const beforeViewing = h.contexts.length;
-	await h.session.prompt("/delivery-tasks");
-	await h.session.prompt("/delivery-resume");
-	assert.equal(h.contexts.length, beforeViewing, "被动入口不调用模型或启用约束");
+	await h.session.prompt("/delivery-status");
+	assert.equal(h.contexts.length, beforeViewing, "查看状态不调用模型或启用约束");
 	assert.deepEqual(h.session.getActiveToolNames(), original);
 	assert.equal((await h.call("write", { path: "normal.txt", content: "正常写入" })).isError, false);
 	assert.equal((await h.call("bash", { command: "printf NORMAL_SHELL" })).isError, false);
@@ -130,7 +135,7 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.equal((await h.call("plugin_tool", {})).isError, false);
 	assert.match(h.prompts.at(-1)!, /交付已启用：小改动、低风险、范围明确的任务可以直接由父 Pi 完成/);
 	assert.ok(h.prompts.at(-1)!.includes(fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))));
-	await h.session.prompt("/delivery-exit");
+	await h.status("结束交付");
 	assert.deepEqual(h.session.getActiveToolNames(), original);
 	assert.ok(!h.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
 	assert.equal((await h.call("write", { path: "after.txt", content: "恢复" })).isError, false);
@@ -186,7 +191,7 @@ test("显式进入后的 reload 和重开保留交付入口及普通工具，旧
 	const reopened = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
 	assert.ok(reopened.session.getActiveToolNames().includes(documentWrite));
 	assert.ok(reopened.session.getActiveToolNames().includes("write"));
-	await reopened.session.prompt("/delivery-exit");
+	await reopened.status("结束交付");
 	const normal = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
 	assert.ok(normal.session.getActiveToolNames().includes("write"));
 	assert.ok(!normal.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
@@ -200,9 +205,9 @@ for (const failure of ["record", "lock"]) test(`真实 SDK 退出遇到未知 wr
 	const file = path.join(directory, `${workspace.key}.${failure === "record" ? "json" : "operation-lock"}`);
 	if (failure === "record") await writeFile(file, "broken");
 	else await mkdir(file);
-	await h.session.prompt("/delivery-exit");
+	await h.status("结束交付");
 	assert.ok(h.session.getActiveToolNames().includes("write"));
-	assert.ok(h.notices.some((text) => text.startsWith("暂不能退出交付")));
+	assert.ok(h.notices.some((text) => text.startsWith("暂不能结束交付")));
 	await access(file);
 	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-activation" && (row.data as any).enabled === false));
 });
@@ -323,9 +328,8 @@ test("无规划文档的真实 SDK 方案反馈、暂停和重载恢复仅使用
 	h.setSelect(async (_title, items) => items[0]);
 	const resumed = reviewCall("V3：核对现场后修正参数，接口保持", []);
 	h.setFollowups([[resumed]]);
-	await h.session.prompt("/delivery-resume");
-	for (let i = 0; i < 100 && !h.sm.getBranch().some((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === resumed.id); i++) await setTimeout(20);
-	await h.session.agent.waitForIdle();
+	await h.session.prompt("继续看方案，核对已有方案和现场后提交确认");
+	await h.session.waitForIdle();
 	const result = h.sm.getBranch().find((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === resumed.id);
 	assert.ok(result?.type === "message" && result.message.role === "toolResult", JSON.stringify(h.notices));
 	assert.equal(result.message.isError, false);
@@ -336,13 +340,14 @@ test("无规划文档的真实 SDK 方案反馈、暂停和重载恢复仅使用
 	const approved = rows.filter((row) => row.customType === "delivery-approval");
 	assert.equal(approved.length, 1);
 	assert.equal(approved[0].data.proposalId, designs[2].data.id);
-	assert.ok(h.contexts.some((messages) => messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes("V2：保留接口，只修参数"))));
+	assert.ok(h.contexts.some((messages) => messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes("继续看方案"))));
+	assert.match(h.prompts.at(-1)!, /本轮方案确认：未取得/);
 	assert.ok(!rows.some((row) => ["read", documentWrite, documentEdit].includes(row.message?.toolName)));
 	assert.deepEqual(await readdir(h.cwd), files);
 	assert.equal(await h.readLease(), undefined);
 });
 
-for (const mode of ["language", "command", "reload", "reopen"]) test(`真实 SDK 暂停后 ${mode} 读取用户最新文件，用新提案恢复审阅`, async (t) => {
+for (const mode of ["language", "reload", "reopen"]) test(`真实 SDK 暂停后 ${mode} 读取用户最新文件，用新提案恢复审阅`, async (t) => {
 	const original = await host(t);
 	await original.call(documentWrite, { path: "plan.md", content: "方案 V1\n用户段落\n" });
 	original.setSelect(async (_title, items) => items.at(-1));
@@ -360,12 +365,8 @@ for (const mode of ["language", "command", "reload", "reopen"]) test(`真实 SDK
 	h.setSelect(async (_title, items) => items.at(-1)); // 恢复后依然可稍后再看
 	const resumed = reviewCall("plan.md：V2，用户已调整；保留用户段落");
 	h.setFollowups([[readCall()], [resumed]]);
-	if (mode === "language") await h.session.prompt("继续看方案，我在项目中调整了文档");
-	else {
-		await h.session.prompt("/delivery-resume");
-		for (let i = 0; i < 100 && !h.sm.getBranch().some((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === resumed.id); i++) await setTimeout(20);
-		await h.session.agent.waitForIdle();
-	}
+	await h.session.prompt("继续看方案，我在项目中调整了文档");
+	await h.session.waitForIdle();
 	const rows = h.sm.getBranch();
 	const result = rows.find((row) => row.type === "message" && row.message.role === "toolResult" && row.message.toolCallId === resumed.id);
 	assert.ok(result?.type === "message" && result.message.role === "toolResult", JSON.stringify(h.notices));

@@ -98,7 +98,7 @@ test("方案卡片折叠只显示中文摘要，展开保留原参数、反馈�
 	assert.match(renderResult(feedback), /已收到修改意见，尚未确认/);
 	assert.match(renderResult(feedback, true), /补齐导出验收/);
 	h.ctx.ui.custom = approvalUI(async () => undefined);
-	assert.match(renderResult(await h.run()), /审阅已暂停.*delivery-resume/);
+	assert.match(renderResult(await h.run()), /审阅已暂停.*继续看方案/);
 	assert.match(renderResult({ content: [{ type: "text", text: "Session 归属已变化" }], details: {} }, false, true), /Session 归属已变化/);
 });
 

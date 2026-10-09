@@ -1,0 +1,129 @@
+diff --git a/src/serializer.ts b/src/serializer.ts
+--- a/src/serializer.ts
++++ b/src/serializer.ts
+@@ -1,6 +1,7 @@
+ import { createHash } from "node:crypto";
+ import type { AgentMessage } from "@earendil-works/pi-agent-core";
+ import { compact, convertToLlm } from "@earendil-works/pi-coding-agent";
++import { getSystemMessageText, renderSystemMessageUpdate } from "@earendil-works/pi-ai";
+ import type {
+ 	Api,
+ 	AssistantMessage,
+@@ -180,7 +181,20 @@
+ 	}
+ 
+ 	let messageIndex = 0;
++	let sourceIndex = 0;
+ 	for (const message of transformedMessages) {
++		const isLeadingSystemMessage = sourceIndex++ === 0 && message.role === "system";
++		if (message.role === "system") {
++			input.push({
++				role: model.reasoning ? "developer" : "system",
++				content: sanitizeSurrogates(isLeadingSystemMessage ? getSystemMessageText(message) : renderSystemMessageUpdate(message)),
++			});
++			if (!isLeadingSystemMessage) {
++				messageIndex++;
++			}
++			continue;
++		}
++
+ 		if (message.role === "user") {
+ 			const item = serializeUserMessage(message, model);
+ 			if (item) {
+@@ -272,7 +286,7 @@
+ 				continue;
+ 			}
+ 
+-			const normalizedContent = message.content.flatMap((block) => {
++			const normalizedContent = message.content.flatMap<AssistantMessage["content"][number]>((block) => {
+ 				if (block.type !== "thinking") {
+ 					return [block];
+ 				}
+@@ -505,7 +519,7 @@
+ 
+ function normalizeAssistantMessageId(id: string | undefined, messageIndex: number): string {
+ 	if (!id) {
+-		return `msg_${messageIndex}`;
++		return `msg_pi_${messageIndex}`;
+ 	}
+ 
+ 	if (id.length <= 64) {
+diff --git a/src/types.ts b/src/types.ts
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -93,7 +93,7 @@
+ 	sessionDir?: string;
+ };
+ 
+-export type ArtifactContext = ArtifactSessionInfo | Pick<ExtensionContext, "cwd" | "sessionManager">;
++export type ArtifactContext = ArtifactSessionInfo & Partial<Pick<ExtensionContext, "sessionManager">>;
+ 
+ export type DebugArtifactEnvelope = {
+ 	extension: string;
+@@ -136,7 +136,7 @@
+ 	requestMeta?: NativeCompactionRequestMeta;
+ };
+ 
+-export type NativeCompactionEntry = CompactionEntry<NativeCompactionDetails>;
++export type NativeCompactionEntry = CompactionEntry<NativeCompactionDetails> & { details: NativeCompactionDetails };
+ 
+ export type CreateNativeCompactionDetailsInput = NativeCompactionIdentity & {
+ 	compactedWindow: unknown[];
+@@ -257,14 +257,15 @@
+ 		return false;
+ 	}
+ 
++	const details = value;
+ 	return (
+-		(value.strategy === NATIVE_COMPACTION_STRATEGY || value.strategy === NATIVE_COMPACTION_STRATEGY_V2) &&
++		(details.strategy === NATIVE_COMPACTION_STRATEGY || details.strategy === NATIVE_COMPACTION_STRATEGY_V2) &&
+ 		isNativeCompactionIdentity(value) &&
+-		Array.isArray(value.compactedWindow) &&
+-		value.compactedWindow.every(isCompactedWindowItem) &&
+-		isNonEmptyString(value.createdAt) &&
+-		(value.compactResponseId === undefined || isNonEmptyString(value.compactResponseId)) &&
+-		(value.requestMeta === undefined || isNativeCompactionRequestMeta(value.requestMeta))
++		Array.isArray(details.compactedWindow) &&
++		details.compactedWindow.every(isCompactedWindowItem) &&
++		isNonEmptyString(details.createdAt) &&
++		(details.compactResponseId === undefined || isNonEmptyString(details.compactResponseId)) &&
++		(details.requestMeta === undefined || isNativeCompactionRequestMeta(details.requestMeta))
+ 	);
+ }
+ 
+diff --git a/src/extension-runtime.ts b/src/extension-runtime.ts
+--- a/src/extension-runtime.ts
++++ b/src/extension-runtime.ts
+@@ -1,3 +1,4 @@
++import { buildSessionContext } from "@earendil-works/pi-coding-agent";
+ import type {
+ 	BeforeProviderRequestEvent,
+ 	CompactionResult,
+@@ -147,7 +148,7 @@
+ 			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
+ 		request = serializeMessagesToCompactRequest({
+ 			model: runtime.currentModel,
+-			messages: ctx.sessionManager.buildSessionContext().messages,
++			messages: buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages,
+ 			instructions,
+ 		});
+ 	} else {
+@@ -300,7 +301,7 @@
+ 			latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-session-context";
+ 		request = serializeMessagesToCompactRequest({
+ 			model: runtime.currentModel,
+-			messages: ctx.sessionManager.buildSessionContext().messages,
++			messages: buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages,
+ 			instructions,
+ 		});
+ 	} else {
+@@ -583,6 +584,9 @@
+ 	}
+ 
+ 	const runtime = resolution.runtime;
++	if (!runtime.payload) {
++		return undefined;
++	}
+ 	const branchEntries = ctx.sessionManager.getBranch();
+ 	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
+ 		provider: runtime.provider,

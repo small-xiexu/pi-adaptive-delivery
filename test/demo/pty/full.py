@@ -117,7 +117,7 @@ def wait_for_exit(timeout=180):
     deadline = time.time() + timeout
     while time.time() < deadline and not driver.closed:
         driver.pump(quiet=0.5, timeout=1.5)
-        if has_exit_record() or re.search(r"交付未启用|交付已退出|请先用 /delivery-shape", screen()):
+        if has_exit_record() or re.search(r"交付未启用|交付已结束|请先用 /delivery-shape", screen()):
             return True
     log(f"[退出记录超时] 当前 Session 未出现 delivery-activation enabled=false\n{screen()}")
     return False
@@ -230,6 +230,26 @@ def accept(label=""):
     return False
 
 
+def status_action(label):
+    """进入状态面板并选择操作；每个按键后复核当前画面。"""
+    visible = lambda: "交付状态" in screen() and selector_footer_visible(screen())
+    if not send("/delivery-status", expect_session=False, confirmation=visible):
+        return False
+    log(f"=== 交付状态：{label} ===\n{screen()}")
+    for _ in range(14):
+        if not visible():
+            return False
+        if any("→" in line and label in line for line in screen().splitlines()):
+            driver.write("\r")
+            driver.pump(quiet=1.0, timeout=6)
+            if not visible():
+                return True
+            continue
+        driver.write("\x1b[B")
+        driver.pump(quiet=0.6, timeout=4)
+    return False
+
+
 os.makedirs(ROOT, exist_ok=True)
 log(f"\n########## 原生 Pi 真机终端全程 · {time.strftime('%F %T')} · root={ROOT} · {COLS}x{ROWS} · {MODEL} ##########")
 env = S.build(ROOT, MODEL, THINKING)
@@ -274,21 +294,23 @@ try:
     driver.wait_quiet(90, timeout=2400)      # 开发 + 审查跑完且正文静止
     log("=== 正文静止后的屏幕 ===\n" + screen())
     heart("回合结束")
-    for command, pattern in (("/delivery-status", r"当前阶段"), ("/delivery-tasks", r"子任务详情|还没有交付子任务")):
-        send(command, expect_session=False, confirmation=lambda pattern=pattern: re.search(pattern, screen()) is not None)
-        wait_for(pattern, timeout=90, note=command)
-        log(f"=== {command} ===\n" + screen())
-        if command == "/delivery-tasks":
-            driver.write("\x1b")
-            driver.pump(quiet=0.5, timeout=3)
-    exit_feedback = r"交付已退出|交付未启用|请先用 /delivery-shape|仍有执行或排队消息|暂不能退出"
-    send("/delivery-exit", expect_session=False, confirmation=lambda: has_exit_record() or re.search(exit_feedback, screen()) is not None)
+    if not status_action("查看任务"):
+        raise RuntimeError("状态面板未能选择查看任务")
+    if wait_for(r"子任务详情|还没有交付子任务", timeout=90, note="查看任务"):
+        if re.search(r"子任务详情\s*·\s*共", screen()):
+            driver.write("\r")
+            driver.pump(quiet=0.6, timeout=4)
+            wait_for(r"子任务详情", timeout=90, note="任务详情")
+        log("=== 任务详情 ===\n" + screen())
+        driver.write("\x1b")
+        driver.pump(quiet=0.5, timeout=3)
+    status_action("结束交付")
     if not wait_for_exit(timeout=120):
-        log("首次退出未形成收尾记录，等待回合完全空闲后重试；不自动调用 /delivery-unlock")
+        log("首次结束未形成收尾记录，等待回合完全空闲后重试；不自动解除占用")
         driver.wait_quiet(15, timeout=180)
-        send("/delivery-exit", expect_session=False, confirmation=lambda: has_exit_record() or re.search(exit_feedback, screen()) is not None)
+        status_action("结束交付")
         if not wait_for_exit(timeout=120):
-            log("退出重试仍未形成收尾记录，保留现场并结束驱动器；需要人工核对原 Session")
+            log("结束重试仍未形成收尾记录，保留现场并结束驱动器；需要人工核对原 Session")
     log("=== 最终屏幕 ===\n" + screen())
 finally:
     with open(os.path.join(ROOT, "raw.bin"), "wb") as handle:

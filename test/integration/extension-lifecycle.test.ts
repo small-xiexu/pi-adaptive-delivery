@@ -55,10 +55,10 @@ for (const scenario of ["normal", "task-command", "missing-tools", "path-changed
 			await rpc.send("prompt", { message: "/delivery-status" });
 			const brief = rpc.records.slice(briefCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify")?.message;
 			assert.match(brief, /当前阶段：等待方案确认\n下一步：等待当前任务收尾，再核对检查结论。\n当前任务：只读（运行中(?:，阶段：[^）]+)?）/);
-			assert.doesNotMatch(brief, /读取 input.txt|原始子 Session|工作区：|沿用 Pi 的工具/);
-			assert.equal(brief.split("\n").length, 5);
+			assert.ok(!brief.split("\n\n")[0].includes("读取 input.txt"));
+			assert.match(brief, /工作区：/);
 			const statusCursor = rpc.records.length;
-			await rpc.send("prompt", { message: "/delivery-status details" });
+			await rpc.send("prompt", { message: "/delivery-status" });
 			const status = rpc.records.slice(statusCursor).find((row) => row.type === "extension_ui_request" && row.method === "notify");
 			assert.ok(status?.message.includes(running.sessionFile));
 			assert.ok(status?.message.includes(running.id));

@@ -50,6 +50,6 @@ export default function(pi) {
 		assert.throws(() => process.kill((result.details as any).pid, 0), { code: "ESRCH" });
 	}
 	assert.equal(await h.readLease(), undefined);
-	await h.session.prompt("/delivery-exit");
+	await h.status("结束交付");
 	assert.deepEqual(h.session.getActiveToolNames(), original);
 });

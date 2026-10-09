@@ -10,6 +10,33 @@ import { plainTheme } from "../support/delivery-ui.ts";
 import type { DeliveryPanel, DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
+test("状态面板默认回车和查看详情只关闭，不结束交付或启动任务", { timeout: 40_000 }, async (t) => {
+	const h = await host(t);
+	await h.prepare();
+	const tools = h.session.getActiveToolNames();
+	const activations = h.sm.getEntries().filter((row) => row.type === "custom" && row.customType === "delivery-activation");
+	h.setCustom((async (factory) => {
+		let answer: unknown;
+		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
+			(value) => { answer = value; }) as DeliveryPanel;
+		assert.equal(panel.title, "交付状态");
+		assert.deepEqual(panel.choices, ["关闭", "查看任务", "结束交付"]);
+		assert.doesNotMatch(panel.body, /PID|Session|lease/);
+		panel.render(100);
+		panel.handleInput("\x0f");
+		panel.render(100);
+		panel.handleInput("\x1b[F");
+		panel.handleInput("\r");
+		assert.equal(answer, "关闭");
+		return answer;
+	}) as ExtensionUIContext["custom"]);
+	await h.session.prompt("/delivery-status");
+	assert.deepEqual(h.session.getActiveToolNames(), tools);
+	assert.deepEqual(h.sm.getEntries().filter((row) => row.type === "custom" && row.customType === "delivery-activation"), activations);
+	assert.ok(!(await h.audit()).some((row) => row.child));
+	assert.equal(await h.readLease(), undefined);
+});
+
 test("没有方案确认时不启动开发或审查子 Agent", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	assert.equal((await h.call("delivery_develop", { task: "未批准开发", paths: ["src"], inputs: [] })).isError, true);
@@ -84,6 +111,28 @@ test("复杂开发由独立子 Agent 完成并核实 writer 收尾", { timeout: 
 	const child = (await h.audit()).find((row) => row.child && row.phase === "start");
 	assert.ok(child);
 	assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+	let opened = false;
+	h.setCustom((async (factory, options) => {
+		let answer: unknown;
+		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
+			(value) => { answer = value; }) as any;
+		if (options?.overlay) {
+			opened = true;
+			assert.match(panel.render(100).join("\n"), /子任务详情.*开发/);
+			panel.handleInput("\x1b");
+			panel.dispose?.();
+		} else {
+			assert.equal(panel.title, "交付状态");
+			panel.render(100);
+			panel.handleInput("\x1b[B");
+			panel.handleInput("\r");
+			assert.equal(answer, "查看任务");
+		}
+		return answer;
+	}) as ExtensionUIContext["custom"]);
+	await h.status("查看任务");
+	assert.equal(opened, true);
+	assert.equal(await h.readLease(), undefined);
 	const paths = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === EXECUTION_PATH_ENTRY).map((row: any) => row.data);
 	assert.ok(paths.some((row: any) => row.path === "delivery_develop" && row.phase === "started"));
 	assert.ok(paths.some((row: any) => row.path === "delivery_develop" && row.phase === "ended" && row.status === "completed"));
@@ -102,7 +151,7 @@ test("父 Pi 直改节点记录 parent_direct，状态详情显示声明但不�
 	assert.equal(data.independentReview, true);
 	await h.session.prompt("/delivery-status");
 	assert.match(h.notices.at(-1)!, /交付已启用，当前无在途任务/);
-	await h.session.prompt("/delivery-status details");
+	await h.session.prompt("/delivery-status");
 	assert.match(h.notices.at(-1)!, /parent_direct.*局部配置迁移/);
 	assert.match(h.notices.at(-1)!, /父 Pi 已声明/);
 	assert.match(h.notices.at(-1)!, /不代表已执行/);
@@ -144,12 +193,12 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	const blockedLease = path.join(leaseDirectory, `${workspace.key}.json`);
 	await mkdir(leaseDirectory, { recursive: true });
 	await writeFile(blockedLease, "broken");
-	await h.session.prompt("/delivery-exit");
-	assert.match(h.notices.at(-1)!, /\/delivery-status details.*\/delivery-unlock.*\/delivery-exit/);
+	await h.status("结束交付");
+	assert.match(h.notices.at(-1)!, /展开详情.*解除占用.*结束交付/);
 	await access(path.dirname(diffFile));
 	assert.ok(h.session.getActiveToolNames().includes("write"));
 	await rm(blockedLease);
-	await h.session.prompt("/delivery-exit");
+	await h.status("结束交付");
 	await h.session.waitForIdle();
 	await assert.rejects(access(path.dirname(diffFile)), { code: "ENOENT" });
 });
@@ -246,6 +295,14 @@ test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeo
 		let answer: unknown;
 		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
 			(value) => { answer = value; }) as DeliveryPanel;
+		if (panel.title === "交付状态") {
+			panel.render(100);
+			const index = panel.choices.indexOf("解除占用");
+			assert.ok(index > 0);
+			for (let i = 0; i < index; i++) panel.handleInput("\x1b[B");
+			panel.handleInput("\r");
+			return answer;
+		}
 		assert.equal(panel.title, "解除上次任务的占用");
 		const body = panel.render(100).join("\n");
 		assert.match(body, /保留现有代码改动/);
@@ -263,12 +320,12 @@ test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeo
 		return answer;
 	}) as ExtensionUIContext["custom"]);
 
-	await h.session.prompt("/delivery-unlock");
+	await h.status("解除占用");
 	assert.match(h.notices.at(-1)!, /未解除占用，现场保持原样/);
 	assert.deepEqual(await h.readLease(), originalLease, "查看证据及默认回车均不清理占用");
 	assert.equal(h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-unlock"), false);
 	accept = true;
-	await h.session.prompt("/delivery-unlock");
+	await h.status("解除占用");
 	await h.session.waitForIdle();
 	assert.match(h.notices.at(-1)!, /已复位父进程中的已知失败运行态/);
 	assert.match(h.notices.at(-1)!, /方案确认仍有效/);
@@ -298,7 +355,7 @@ test("lease ID 不匹配时解锁不复位 fault，仍阻止重放交付任务",
 	record.leaseId = "replacement-lease-for-test";
 	await writeFile(leaseFile, `${JSON.stringify(record)}\n`);
 
-	await h.session.prompt("/delivery-unlock");
+	await h.status("解除占用");
 	await h.session.waitForIdle();
 	assert.match(h.notices.at(-1)!, /仍保留未能安全复位的交付状态/);
 	const unlock = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");

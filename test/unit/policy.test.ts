@@ -6,7 +6,7 @@ test("运行提示与一次方案确认契约一致", () => {
 	assert.match(CAPABILITY_NOTICE, /方案确认后立即授权本轮实施/);
 	assert.match(CAPABILITY_NOTICE, /不另设第二次确认/);
 	assert.match(CAPABILITY_NOTICE, /paths 只放源码、测试和配置/);
-	assert.match(CAPABILITY_NOTICE, /delivery-exit 不负责清理 lease/);
+	assert.match(CAPABILITY_NOTICE, /结束交付不会强制清理占用/);
 	assert.doesNotMatch(CAPABILITY_NOTICE, /方案与实施仍分别确认/);
 });
 
