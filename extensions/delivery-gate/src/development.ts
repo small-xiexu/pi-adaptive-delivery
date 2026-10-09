@@ -9,7 +9,7 @@ import { CHILD_EXIT, DELEGATION_ENTRY, createChildDialogs, delegateReadOnly, par
 import { ABNORMAL_STATUS, COMPLETED_STATUS, createTaskProgress, summarizeToolErrors, TOOL_ERROR_GUIDANCE, type ProgressUpdate } from "./progress.ts";
 import { captureCandidate, type CandidateSnapshot, type CandidateScope } from "./candidate.ts";
 import { prepareReview } from "./review.ts";
-import { getWriterStateRoot, parseWriterLeaseReference, resolveWorkspaceIdentity, WriterLeaseManager, type WorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseReference } from "./workspace.ts";
+import { getWriterStateRoot, parseWriterLeaseReference, resolveWorkspaceIdentity, WriterLeaseManager, type WorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseRecord, type WriterLeaseReference } from "./workspace.ts";
 import { appendExecutionPath, type ExecutionPathKind } from "./execution-path.ts";
 
 export const DEVELOPMENT_TOOL = "delivery_develop";
@@ -72,6 +72,7 @@ export function createChildDevelopment() {
 }
 
 interface DevelopmentRun extends SessionBinding {
+	workspace: WorkspaceIdentity;
 	progress?: ReturnType<typeof createTaskProgress>;
 	id: string;
 	name: string;
@@ -163,7 +164,8 @@ export async function verifyRecordedResult(state: DevelopmentRun, ctx: Extension
 	if (records.branch.findIndex((row) => row.id === result.id) <= records.branch.findIndex((row) => row.id === state.call!.id)) throw new Error("父交付工具终态不在本次调用之后");
 }
 
-export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnType<typeof installApprovals>, recoverResidual?: (ctx: ExtensionContext) => Promise<void>) {
+export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnType<typeof installApprovals>, recoverResidual?: (ctx: ExtensionContext, signal?: AbortSignal) => Promise<void>) {
+	let starting = false;
 	let active: DevelopmentRun | undefined;
 	let stopped = false;
 	let finishing: Promise<void> | undefined;
@@ -181,54 +183,72 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 	});
 
 	async function execute(name: string, input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext, update: ProgressUpdate): Promise<AgentToolResult<unknown>> {
-		if (stopped) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
+		if (stopped || starting || (active && (!active.fault || !recoverResidual))) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
+		starting = true;
+		try { return await executeStarted(name, input, signal, ctx, update); }
+		finally { starting = false; }
+	}
+
+	async function executeStarted(name: string, input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext, update: ProgressUpdate): Promise<AgentToolResult<unknown>> {
 		signal?.throwIfAborted();
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("没有持久父 Session，未启动交付任务");
 		const grant = await approvals.readApproval(ctx, signal);
-		await recoverResidual?.(ctx);
-		if (active) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
-		const state: DevelopmentRun = { id: input.id, name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), sessionFile, lifetime: new AbortController(), finished: false, attemptedLease: false };
-		active = state;
+		const state: DevelopmentRun = { id: input.id, name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), sessionFile, lifetime: new AbortController(), workspace: grant.workspace, finished: false, attemptedLease: false };
 		const progress = state.progress = createTaskProgress(input.id, name === REVIEW_TOOL ? "审查" : "开发", input.task, update);
 		progress.phase("准备中");
 		const setStage = (value: string, detail?: string) => { state.stage = value; progress.stage(value, detail); };
 		setStage("调用前范围校验");
+		let call!: SessionEntry;
+		let paths!: string[], inputs!: string[];
+		try {
+			const rawPaths = input.paths ?? [], rawInputs = input.inputs ?? [];
+			if (rawPaths.some((value) => !value.trim()) || rawInputs.some((value) => !value.trim())) throw new Error("调用前范围校验失败：开发或审查路径不能是空白字符串。");
+			paths = rawPaths.map((value) => path.resolve(ctx.cwd, value));
+			inputs = rawInputs.map((value) => path.resolve(ctx.cwd, value));
+			if (!paths.length) throw new Error("调用前范围校验失败：本次开发或审查必须提供非空 paths；实施计划由 AI 内部维护，不再通过第二次确认声明范围。");
+			const outside = (value: string) => { const relative = path.relative(grant.workspace.workspacePath, value); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); };
+			if ([...paths, ...inputs].some(outside)) throw new Error("调用前范围校验失败：开发或审查路径必须在当前 worktree 内。");
+			const overlaps = (left: string, right: string) => { const relative = path.relative(left, right); return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`)); };
+			const conflicts = [
+				...paths.map((value) => ({ field: "paths", value })),
+				...inputs.map((value) => ({ field: "inputs", value })),
+			].filter(({ value }) => grant.planningPaths.some((planning) => overlaps(planning, value) || overlaps(value, planning)));
+			if (conflicts.length) {
+				const ranges = [...new Set(conflicts.map(({ field, value }) => `${field}=${path.relative(grant.workspace.workspacePath, value) || "."}`))];
+				const shown = ranges.slice(0, 8);
+				const suffix = ranges.length > shown.length ? `；另有 ${ranges.length - shown.length} 项` : "";
+				throw new Error(`调用前范围校验失败：开发或审查路径不能包含父维护规划文档。\n冲突范围：${shown.join("、")}${suffix}\n请只把需要核对的源码、测试或配置放入 paths；额外只读文件放入 inputs。父维护规划文档由父会话维护，不放入本次范围。\n子 Session 尚未启动。`);
+			}
+			const records = await nativeEntries(state, ctx);
+			const candidate = records.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
+			const toolCalls = candidate?.type === "message" && candidate.message.role === "assistant" ? candidate.message.content.filter((part) => part.type === "toolCall" && part.id === input.id && part.name === name && isDeepStrictEqual(snapshot(part.arguments), snapshot(input.toolInput))) : [];
+			if (!candidate || toolCalls.length !== 1) throw new Error("本次交付工具调用未核实");
+			records.requireEntry(candidate);
+			if (records.entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === input.id)) throw new Error("交付工具调用已有终态，不能重放");
+			call = candidate;
+			await recoverResidual?.(ctx, AbortSignal.any([grant.signal, ...(signal ? [signal] : [])]));
+			current(state, ctx);
+			grant.signal.throwIfAborted();
+			signal?.throwIfAborted();
+			if (stopped || active) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			state.result = { content: [{ type: "text", text: message }], details: {}, isError: true };
+			state.finished = true;
+			progress.end(ABNORMAL_STATUS, message);
+			return { content: state.result.content, details: { progress: progress.snapshot(), executionFacts: { stage: state.stage } }, isError: true };
+		}
+		active = state;
 		const operation = signal ? AbortSignal.any([signal, state.lifetime.signal]) : state.lifetime.signal;
 		state.run = Promise.resolve().then(async () => {
 			let executionSignal = operation;
 			let dialogs: ReturnType<typeof createChildDialogs> | undefined;
 			try {
 				setStage("批准与候选准备");
-				setStage("调用前范围校验");
-				const rawPaths = input.paths ?? [], rawInputs = input.inputs ?? [];
-				if (rawPaths.some((value) => !value.trim()) || rawInputs.some((value) => !value.trim())) throw new Error("调用前范围校验失败：开发或审查路径不能是空白字符串。");
-				const paths = rawPaths.map((value) => path.resolve(ctx.cwd, value));
-				const inputs = rawInputs.map((value) => path.resolve(ctx.cwd, value));
-				if (!paths.length) throw new Error("调用前范围校验失败：本次开发或审查必须提供非空 paths；实施计划由 AI 内部维护，不再通过第二次确认声明范围。");
-				const outside = (value: string) => { const relative = path.relative(grant.workspace.workspacePath, value); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); };
-				if ([...paths, ...inputs].some(outside)) throw new Error("调用前范围校验失败：开发或审查路径必须在当前 worktree 内。");
-				const overlaps = (left: string, right: string) => { const relative = path.relative(left, right); return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`)); };
-				const conflicts = [
-					...paths.map((value) => ({ field: "paths", value })),
-					...inputs.map((value) => ({ field: "inputs", value })),
-				].filter(({ value }) => grant.planningPaths.some((planning) => overlaps(planning, value) || overlaps(value, planning)));
-				if (conflicts.length) {
-					const ranges = [...new Set(conflicts.map(({ field, value }) => `${field}=${path.relative(grant.workspace.workspacePath, value) || "."}`))];
-					const shown = ranges.slice(0, 8);
-					const suffix = ranges.length > shown.length ? `；另有 ${ranges.length - shown.length} 项` : "";
-					throw new Error(`调用前范围校验失败：开发或审查路径不能包含父维护规划文档。\n冲突范围：${shown.join("、")}${suffix}\n请只把需要核对的源码、测试或配置放入 paths；额外只读文件放入 inputs。父维护规划文档由父会话维护，不放入本次范围。\n子 Session 尚未启动。`);
-				}
-				setStage("父调用与 Session 核验");
 				state.approvalId = grant.approvalId;
 				state.designApprovalId = grant.approvalId;
 				const running = executionSignal = AbortSignal.any([operation, grant.signal]);
-				const records = await nativeEntries(state, ctx);
-				const call = records.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
-				const toolCalls = call?.type === "message" && call.message.role === "assistant" ? call.message.content.filter((part: any) => part.type === "toolCall" && part.id === input.id && part.name === name && isDeepStrictEqual(snapshot(part.arguments), snapshot(input.toolInput))) : [];
-				if (!call || call.type !== "message" || call.message.role !== "assistant" || toolCalls.length !== 1) throw new Error("本次交付工具调用未核实");
-				records.requireEntry(call);
-				if (records.entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === input.id)) throw new Error("交付工具调用已有终态，不能重放");
 				setStage("writer 与候选准备");
 				state.call = call;
 				state.executionPath = { path: name === REVIEW_TOOL ? "delivery_review" : "delivery_develop", node: input.task,
@@ -420,16 +440,24 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		review: (input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext, update: ProgressUpdate) => execute(REVIEW_TOOL, input, signal, ctx, update),
 		get progress() { return active?.progress?.snapshot(); },
 		get pending() { return active !== undefined; },
-		// 仅在用户确认并成功清理与本运行态绑定的 lease 后，复位已结束的内存 fault；未知或仍在途状态继续关闭。
-		canReconcileAfterUnlock(workspaceKey: string, leaseId: string): boolean {
+		// 恢复沿用原终态核验；没有 lease 时只能由调用方请求明确确认后清理。
+		async verifyRecovery(ctx: ExtensionContext, workspace: WorkspaceIdentity, record?: WriterLeaseRecord) {
 			const state = active;
-			return Boolean(state && state.finished && state.fault && state.terminalVerified && state.lease?.workspaceKey === workspaceKey && state.lease.leaseId === leaseId);
+			if (stopped || !state?.finished || !state.fault || !state.terminalVerified || !state.lease
+				|| !isDeepStrictEqual(state.workspace, workspace) || state.lease.workspaceKey !== workspace.key
+				|| (record && (state.lease.leaseId !== record.leaseId || !isDeepStrictEqual(record.workspace, workspace)
+					|| !isDeepStrictEqual(record.owner, state.owner)
+					|| !isDeepStrictEqual(record.coordinator, state.owner?.kind === "child" ? state.parent : undefined)))) {
+				throw new Error("上次交付的结束状态与当前占用记录不一致，暂未清理；请查看详情后再继续。");
+			}
+			await verifyRecordedResult(state, ctx);
+			current(state, ctx);
+			if (active !== state) throw new Error("恢复期间交付运行态已变化，未清理。");
+			return { runId: state.id, leaseId: state.lease.leaseId };
 		},
-		reconcileAfterUnlock(workspaceKey: string, leaseId: string): { runId: string; fault: string } | undefined {
-			const state = active;
-			if (!state || !state.finished || !state.fault || !state.terminalVerified || state.lease?.workspaceKey !== workspaceKey || state.lease.leaseId !== leaseId) return undefined;
+		reconcileAfterUnlock(workspaceKey: string, leaseId: string): void {
+			if (!active?.finished || !active.fault || !active.terminalVerified || active.lease?.workspaceKey !== workspaceKey || active.lease.leaseId !== leaseId) throw new Error("交付运行态已变化，未复位。");
 			active = undefined;
-			return { runId: state.id, fault: state.fault };
 		},
 		// 已结束且未自动收尾的失败是终态记录，不是仍在途的执行。
 		get fault() { return active?.fault; },

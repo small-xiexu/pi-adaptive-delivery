@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -97,6 +99,28 @@ test("人工强制重置清理残留 lease 与操作锁，现场变化时拒绝"
 	await assert.rejects(access(lock), { code: "ENOENT" });
 	await manager.assertIdle(workspace.key);
 	assert.equal((await manager.acquire(workspace, { kind: "parent", sessionId: "session-2", pid: process.pid })).ok, true);
+});
+
+test("强制清理操作锁失败时保留 lease，现场仍可再次核对", async (t) => {
+	const repo = await gitRepo("adaptive-discard-lock-failure-");
+	const workspace = await resolveWorkspaceIdentity(repo);
+	const root = await getWriterStateRoot(workspace);
+	const manager = new WriterLeaseManager(root);
+	const acquired = await manager.acquire(workspace, { kind: "parent", sessionId: "session", pid: process.pid, runId: "call" });
+	assert.ok(acquired.ok);
+	const lock = path.join(root, "leases", `${workspace.key}.operation-lock`);
+	await mkdir(lock);
+	const blockage = await manager.inspectBlockage(workspace.key);
+	const remove = fs.rm;
+	t.mock.method(fs, "rm", async (...args: Parameters<typeof remove>) => {
+		if (String(args[0]) === lock) throw new Error("fixture operation lock cleanup failure");
+		return remove(...args);
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	await assert.rejects(manager.discard(workspace.key, blockage), /残留操作锁未清理/);
+	assert.ok(await manager.read(workspace.key));
+	await access(lock);
 });
 
 test("损坏的残留记录仍可查看和清理，不永久阻塞", async () => {

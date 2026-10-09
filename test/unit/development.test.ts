@@ -93,7 +93,7 @@ test("任务发送前的父 writer 交接核实子关闭证明，退出异常或
 	h.sm.appendMessage({ role: "toolResult", toolCallId: "startup", toolName: "delivery_develop", ...result, timestamp: Date.now() });
 	const rpc = { process: { pid: 42 }, exit: { code: 0, signal: null }, openTools: new Set<string>() } as ChildRpc;
 	const proof = createHash("sha256").update(JSON.stringify({ pid: 42, exit: rpc.exit, taskSent: false })).digest("hex");
-	const state: Parameters<typeof verifyRecordedResult>[0] = { id: "startup", name: "delivery_develop", cwd: h.cwd,
+	const state: Parameters<typeof verifyRecordedResult>[0] = { id: "startup", name: "delivery_develop", cwd: h.cwd, workspace: h.workspace,
 		sessionId: h.sm.getSessionId(), sessionFile: h.sm.getSessionFile()!, lifetime: new AbortController(),
 		finished: true, attemptedLease: true, owner: h.grant.parent, call, result, rpc, childTerminal: proof };
 	await verifyRecordedResult(state, h.ctx);
@@ -116,7 +116,7 @@ for (const field of ["content", "isError"]) test(`失败结果的证据或错误
 	const call = structuredClone(h.sm.getBranch().at(-1)!);
 	const result = { content: [{ type: "text" as const, text: `工具失败\n原始子 Session：${path.join(h.root, "original.jsonl")}` }], details: {}, isError: true };
 	h.sm.appendMessage({ role: "toolResult", toolCallId: "failed-run", toolName: "delivery_develop", ...structuredClone(result), timestamp: Date.now() });
-	const state: Parameters<typeof verifyRecordedResult>[0] = { id: "failed-run", name: "delivery_develop", cwd: h.cwd,
+	const state: Parameters<typeof verifyRecordedResult>[0] = { id: "failed-run", name: "delivery_develop", cwd: h.cwd, workspace: h.workspace,
 		sessionId: h.sm.getSessionId(), sessionFile: h.sm.getSessionFile()!, lifetime: new AbortController(),
 		finished: true, attemptedLease: false, call, result: structuredClone(result) };
 	await verifyRecordedResult(state, h.ctx);

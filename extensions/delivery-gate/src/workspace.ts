@@ -327,20 +327,21 @@ export class WriterLeaseManager {
 	}
 
 	// 仅由用户显式确认后调用：这是强制重置，不是安全释放，也不判断原进程是否已停止。
-	async discard(workspaceKey: string, expectation: WriterLeaseBlockage): Promise<{ lease: boolean; operationLock: boolean }> {
+	async discard(workspaceKey: string, expectation: WriterLeaseBlockage, verifyBeforeDelete?: () => Promise<void>): Promise<{ lease: boolean; operationLock: boolean }> {
 		const discardCurrent = async (ignoreOperationLock: boolean) => {
 			const current = await this.inspectBlockage(workspaceKey);
 			if ((!ignoreOperationLock && current.operationLock !== expectation.operationLock)
 				|| (current.lease?.digest ?? null) !== (expectation.lease?.digest ?? null)) {
 				throw new Error("现场已变化，未清理；请重新查看后再确认");
 			}
-			if (current.lease) await unlink(this.leasePath(workspaceKey));
+			if (verifyBeforeDelete) await verifyBeforeDelete();
 			if (!ignoreOperationLock && current.operationLock) {
 				try { await rm(this.operationLockPath(workspaceKey), { recursive: true }); }
 				catch (error) {
-					throw new Error(`lease 记录已删除，但残留操作锁未清理：${error instanceof Error ? error.message : String(error)}`, { cause: error });
+					throw new Error(`残留操作锁未清理，lease 记录保留：${error instanceof Error ? error.message : String(error)}`, { cause: error });
 				}
 			}
+			if (current.lease) await unlink(this.leasePath(workspaceKey));
 			return { lease: Boolean(current.lease), operationLock: ignoreOperationLock ? false : current.operationLock };
 		};
 		// 没有残留操作锁时，先取得同一把正常操作锁，阻止新 writer 在快照与删除之间进入。

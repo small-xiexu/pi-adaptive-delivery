@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import { createDevelopmentHost as host } from "../support/development-host.ts";
@@ -280,6 +283,79 @@ for (const name of ["delivery_develop", "delivery_review"] as const) {
 	});
 }
 
+test("并发开发调用不会把在途 writer 当作残留恢复", { timeout: 90_000 }, async (t) => {
+	const h = await host(t, "cancel");
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await h.prepare();
+	const definition = h.session.extensionRunner.getAllRegisteredTools().find((tool) => tool.definition.name === "delivery_develop")?.definition;
+	assert.ok(definition);
+	const firstId = randomUUID();
+	const firstArgs = { task: "保持开发任务在途以验证并发保护。", paths: ["src"], inputs: [] };
+	h.sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: firstId, name: "delivery_develop", arguments: firstArgs }], api: "openai-completions", provider: "fixture", model: "fake", stopReason: "toolUse", timestamp: Date.now(), usage: {} } as any);
+	const abort = new AbortController();
+	const first = definition.execute(firstId, firstArgs as any, abort.signal, undefined, h.session.extensionRunner.createToolContext(firstId, abort.signal));
+	const deadline = Date.now() + 15_000;
+	while (!(await h.audit()).some((row) => row.child && row.phase === "start")) {
+		assert.ok(Date.now() < deadline, "未观察到在途开发子任务");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	const lease = await h.readLease();
+	assert.ok(lease);
+	const secondId = randomUUID();
+	const secondArgs = { task: "并发开发不得清理第一项任务。", paths: ["src"], inputs: [] };
+	h.sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: secondId, name: "delivery_develop", arguments: secondArgs }], api: "openai-completions", provider: "fixture", model: "fake", stopReason: "toolUse", timestamp: Date.now(), usage: {} } as any);
+	await assert.rejects(definition.execute(secondId, secondArgs as any, undefined, undefined, h.session.extensionRunner.createToolContext(secondId, undefined)), /writer|未启动/);
+	assert.equal((await h.readLease())?.leaseId, lease.leaseId);
+	assert.equal(h.choices.includes("恢复交付"), false);
+	abort.abort();
+	await assert.rejects(first, /收尾失败|终态未知|aborted/i);
+	assert.equal((await h.readLease())?.leaseId, lease.leaseId);
+});
+test("已核实的 writer fault 在继续时自动清理同一 lease 并恢复内存状态", { timeout: 90_000 }, async (t) => {
+	const h = await host(t);
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const leaseFile = path.join(await getWriterStateRoot(workspace), "leases", `${workspace.key}.json`);
+	let blocked = true;
+	const unlink = fs.unlink;
+	t.mock.method(fs, "unlink", async (...args: Parameters<typeof unlink>) => {
+		if (blocked && String(args[0]) === leaseFile) throw new Error("fixture release unlink failure");
+		return unlink(...args);
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	await h.prepare();
+	const first = await h.call("delivery_develop", { task: "制造已核实但未交回的 writer fault。", paths: ["src"], inputs: [] });
+	assert.equal(first.isError, false, JSON.stringify(first));
+	const retained = await h.readLease();
+	assert.ok(retained);
+	assert.ok(h.notices.some((notice) => /writer 未交回/.test(notice)));
+	const retainedSource = JSON.parse(await readFile(leaseFile, "utf8"));
+	for (const mutate of [
+		(record: any) => { record.owner.sessionId = "replacement-session"; },
+		(record: any) => { record.owner.runId = "replacement-run"; record.coordinator.runId = "replacement-run"; },
+	]) {
+		const tampered = structuredClone(retainedSource);
+		mutate(tampered);
+		await writeFile(leaseFile, `${JSON.stringify(tampered)}\n`);
+		const refused = await h.call("delivery_develop", { task: "归属变化时不得自动恢复。", paths: ["src"], inputs: [] });
+		assert.equal(refused.isError, true, JSON.stringify(refused));
+		assert.match(JSON.stringify(refused.content), /结束状态与当前占用记录不一致|暂未清理/);
+		assert.equal((await h.readLease())?.owner.sessionId, tampered.owner.sessionId);
+		await writeFile(leaseFile, `${JSON.stringify(retainedSource)}\n`);
+	}
+	blocked = false;
+	const second = await h.call("delivery_develop", { task: "继续并核对自动恢复后的 writer。", paths: ["src"], inputs: [] });
+	assert.equal(second.isError, false, JSON.stringify(second));
+	assert.equal(await h.readLease(), undefined);
+	const unlock = h.sm.getEntries().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");
+	assert.equal(unlock?.type, "custom");
+	assert.equal((unlock.data as any).recovery, "automatic");
+	assert.equal((unlock.data as any).reconciledRunId, first.toolCallId);
+	assert.ok(h.notices.some((notice) => /已自动恢复上次交付/.test(notice)));
+});
 test("继续遇到未知收尾时保持占用，不启动替代审查", { timeout: 90_000 }, async (t) => {
 	const h = await host(t, "review-crash");
 	await mkdir(path.join(h.cwd, "src"));

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -181,6 +183,29 @@ test("一次确认后父 Pi 创建内部台账、修改并检查，台账更新�
 	assert.ok(!h.sm.getBranch().some((row) => row.type === "message" && row.message.role === "toolResult" && row.message.isError));
 });
 
+test("父文档 writer 的已核实 fault 在继续写入前自动恢复", async (t) => {
+	const h = await host(t);
+	assert.equal((await h.approve("design", [])).isError, false);
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const leaseFile = path.join(await getWriterStateRoot(workspace), "leases", `${workspace.key}.json`);
+	let blocked = true;
+	const unlink = fs.unlink;
+	t.mock.method(fs, "unlink", async (...args: Parameters<typeof unlink>) => {
+		if (blocked && String(args[0]) === leaseFile) throw new Error("fixture parent release unlink failure");
+		return unlink(...args);
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	const first = await h.call(documentWrite, { path: "plan.md", content: "第一次写入\n" });
+	assert.equal(first.isError, false, JSON.stringify(first));
+	assert.ok(await h.readLease());
+	blocked = false;
+	const second = await h.call(documentWrite, { path: "plan.md", content: "第二次写入\n" });
+	assert.equal(second.isError, false, JSON.stringify(second));
+	assert.equal(await h.readLease(), undefined);
+	assert.ok(h.notices.some((notice) => /已自动恢复上次交付/.test(notice)));
+	assert.equal(await readFile(path.join(h.cwd, "plan.md"), "utf8"), "第二次写入\n");
+});
 test("显式进入后的 reload 和重开保留交付入口及普通工具，旧批准不恢复", async (t) => {
 	const h = await host(t);
 	await h.call(documentWrite, { path: "plan.md", content: "原始规划" });

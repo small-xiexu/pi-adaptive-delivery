@@ -4,7 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import type { AgentToolResult, EditToolInput, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolRenderResultOptions, WriteToolInput } from "@earendil-works/pi-coding-agent";
 import { createPlanningDocumentTools } from "./planning-documents.ts";
 import path from "node:path";
-import { getWriterStateRoot, resolveWorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseReference, WriterLeaseManager } from "./workspace.ts";
+import { getWriterStateRoot, resolveWorkspaceIdentity, type WriterLeaseOwner, type WriterLeaseRecord, type WriterLeaseReference, WriterLeaseManager, type WorkspaceIdentity } from "./workspace.ts";
 
 export const DOCUMENT_EDIT_TOOL = "delivery_document_edit";
 export const DOCUMENT_WRITE_TOOL = "delivery_document_write";
@@ -49,6 +49,7 @@ export interface SessionBinding {
 }
 
 interface DocumentRun extends SessionBinding {
+	workspace?: WorkspaceIdentity;
 	id: string;
 	name: string;
 	io: AbortController;
@@ -92,7 +93,8 @@ export async function nativeEntries(state: SessionBinding, ctx: ExtensionContext
 }
 
 // 仅协调本轮父文档操作；不注册工具、不授予批准、不从旧记录恢复 writer，也不管理外部进程。
-export function createParentDocumentWriter(pi: ExtensionAPI) {
+export function createParentDocumentWriter(pi: ExtensionAPI, recoverResidual?: (ctx: ExtensionContext, signal?: AbortSignal) => Promise<void>) {
+	let starting = false;
 	let active: DocumentRun | undefined;
 	let stopped = false;
 	let finishing: Promise<void> | undefined;
@@ -100,7 +102,14 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 
 	async function execute(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput,
 		signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
-		if (stopped || active) throw new Error("父文档 writer 尚未完成终态核验或已关闭，未开始新的写入");
+		if (stopped || starting || (active && (!active.fault || !recoverResidual))) throw new Error("父文档 writer 尚未完成终态核验或已关闭，未开始新的写入");
+		starting = true;
+		try { return await executeStarted(kind, id, input, signal, ctx); }
+		finally { starting = false; }
+	}
+
+	async function executeStarted(kind: "edit" | "write", id: string, input: EditToolInput | WriteToolInput,
+		signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
 		if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("默认 Markdown 编辑只供父 Pi TUI 使用");
 		signal?.throwIfAborted();
 		const sessionFile = ctx.sessionManager.getSessionFile();
@@ -108,22 +117,23 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 		const state: DocumentRun = { id, name: kind === "edit" ? DOCUMENT_EDIT_TOOL : DOCUMENT_WRITE_TOOL,
 			cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), sessionFile, lifetime: new AbortController(),
 			io: new AbortController(), attemptedLease: false, finished: false };
+		const workspace = state.workspace = await resolveWorkspaceIdentity(ctx.cwd);
+		const target = path.resolve(workspace.cwdPath, input.path.startsWith("@") ? input.path.slice(1) : input.path);
+		const before = await nativeEntries(state, ctx);
+		const call = before.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (!call || call.type !== "message" || call.message.role !== "assistant"
+			|| call.message.content.filter((part) => part.type === "toolCall" && part.id === id && part.name === state.name
+				&& isDeepStrictEqual(snapshot(part.arguments), snapshot(input))).length !== 1) throw new Error("未找到当前文档操作的原生工具调用");
+		before.requireEntry(call);
+		if (before.entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id)) throw new Error("文档工具调用已有结果，不能重放取得 writer");
+		await recoverResidual?.(ctx, signal);
+		current(state, ctx);
+		signal?.throwIfAborted();
+		if (stopped || active) throw new Error("父文档 writer 尚未完成终态核验或已关闭，未开始新的写入");
 		active = state;
 		const operation = AbortSignal.any([state.io.signal, state.lifetime.signal, ...(signal ? [signal] : [])]);
 		state.run = Promise.resolve().then(async () => {
 			try {
-				const workspace = await resolveWorkspaceIdentity(ctx.cwd);
-				const target = path.resolve(workspace.cwdPath, input.path.startsWith("@") ? input.path.slice(1) : input.path);
-				current(state, ctx);
-				const before = await nativeEntries(state, ctx);
-				const call = before.branch.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
-				if (!call || call.type !== "message" || call.message.role !== "assistant"
-					|| call.message.content.filter((part) => part.type === "toolCall" && part.id === id && part.name === state.name
-						&& isDeepStrictEqual(snapshot(part.arguments), snapshot(input))).length !== 1) throw new Error("未找到当前文档操作的原生工具调用");
-				before.requireEntry(call);
-				if (before.entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === id)) {
-					throw new Error("文档工具调用已有结果，不能重放取得 writer");
-				}
 				state.call = call;
 				const stateRoot = await getWriterStateRoot(workspace);
 				state.leases = new WriterLeaseManager(stateRoot);
@@ -156,6 +166,20 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 		return state.run;
 	}
 
+	async function verifyResult(state: DocumentRun, ctx: ExtensionContext): Promise<void> {
+		if (state.tools?.cleanupFailed) throw new Error("文档句柄清理失败");
+		const records = await nativeEntries(state, ctx);
+		records.requireEntry(state.call!);
+		const results = records.entries.filter((entry) => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === state.id);
+		const result = results[0];
+		if (results.length !== 1 || !result || result.type !== "message" || result.message.role !== "toolResult"
+			|| result.message.toolName !== state.name || !isDeepStrictEqual(snapshot({ content: result.message.content,
+				details: result.message.details, isError: result.message.isError }), state.result)) throw new Error("文档工具终态未唯一落盘或与实际执行不符");
+		records.requireEntry(result);
+		if (records.branch.findIndex((entry) => entry.id === result.id) <= records.branch.findIndex((entry) => entry.id === state.call!.id)) throw new Error("文档工具终态不在本次调用之后");
+		current(state, ctx);
+	}
+
 	async function finish(ctx: ExtensionContext): Promise<void> {
 		const state = active;
 		if (!state || !state.finished || state.fault) return;
@@ -163,19 +187,7 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 			if (!state.lease || !state.owner || !state.leases || !state.call || !state.result) throw new Error("父 writer 获取或执行状态不明");
 			if (state.tools?.cleanupFailed) throw new Error("文档句柄清理失败");
 			const verify = async () => {
-				const records = await nativeEntries(state, ctx);
-				records.requireEntry(state.call!);
-				const results = records.entries.filter((entry) => entry.type === "message" && entry.message.role === "toolResult"
-					&& entry.message.toolCallId === state.id);
-				const result = results[0];
-				if (results.length !== 1 || !result || result.type !== "message" || result.message.role !== "toolResult"
-					|| result.message.toolName !== state.name || !isDeepStrictEqual(snapshot({ content: result.message.content,
-						details: result.message.details, isError: result.message.isError }), state.result)) throw new Error("文档工具终态未唯一落盘或与实际执行不符");
-				records.requireEntry(result);
-				if (records.branch.findIndex((entry) => entry.id === result.id) <= records.branch.findIndex((entry) => entry.id === state.call!.id)) {
-					throw new Error("文档工具终态不在本次调用之后");
-				}
-				current(state, ctx);
+				await verifyResult(state, ctx);
 				state.terminalVerified = true;
 			};
 			await state.leases.releaseParent(state.lease, state.owner, verify, state.lifetime.signal);
@@ -218,16 +230,22 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 	});
 	return {
 		get pending() { return active !== undefined; },
-		// 仅在用户确认并成功清理与本运行态绑定的 lease 后，复位已结束的文档 writer fault。
-		canReconcileAfterUnlock(workspaceKey: string, leaseId: string): boolean {
+		// 只接受本实例已核验的终态；恢复前重新读取原生结果和完整归属。
+		async verifyRecovery(ctx: ExtensionContext, workspace: WorkspaceIdentity, record?: WriterLeaseRecord) {
 			const state = active;
-			return Boolean(state && state.finished && state.fault && state.terminalVerified && state.lease?.workspaceKey === workspaceKey && state.lease.leaseId === leaseId);
+			if (stopped || !state?.finished || !state.fault || !state.terminalVerified || !state.lease
+				|| !isDeepStrictEqual(state.workspace, workspace) || state.lease.workspaceKey !== workspace.key
+				|| (record && (state.lease.leaseId !== record.leaseId || !isDeepStrictEqual(record.workspace, workspace)
+					|| !isDeepStrictEqual(record.owner, state.owner) || record.coordinator !== undefined))) {
+				throw new Error("上次文档操作的结束状态与当前占用记录不一致，暂未清理。");
+			}
+			await verifyResult(state, ctx);
+			if (active !== state) throw new Error("恢复期间文档运行态已变化，未清理。");
+			return { runId: state.id, leaseId: state.lease.leaseId };
 		},
-		reconcileAfterUnlock(workspaceKey: string, leaseId: string): { runId: string; fault: string } | undefined {
-			const state = active;
-			if (!state || !state.finished || !state.fault || !state.terminalVerified || state.lease?.workspaceKey !== workspaceKey || state.lease.leaseId !== leaseId) return undefined;
+		reconcileAfterUnlock(workspaceKey: string, leaseId: string): void {
+			if (!active?.finished || !active.fault || !active.terminalVerified || active.lease?.workspaceKey !== workspaceKey || active.lease.leaseId !== leaseId) throw new Error("文档运行态已变化，未复位。");
 			active = undefined;
-			return { runId: state.id, fault: state.fault };
 		},
 		// 已结束且未自动收尾的失败是终态记录，不是仍在途的写入。
 		get fault() { return active?.fault; },
