@@ -55,6 +55,7 @@ interface DocumentRun extends SessionBinding {
 	run?: Promise<AgentToolResult<unknown>>;
 	attemptedLease: boolean;
 	finished: boolean;
+	terminalVerified?: boolean;
 	fault?: string;
 	call?: SessionEntry;
 	lease?: WriterLeaseReference;
@@ -161,7 +162,7 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 		try {
 			if (!state.lease || !state.owner || !state.leases || !state.call || !state.result) throw new Error("父 writer 获取或执行状态不明");
 			if (state.tools?.cleanupFailed) throw new Error("文档句柄清理失败");
-			await state.leases.releaseParent(state.lease, state.owner, async () => {
+			const verify = async () => {
 				const records = await nativeEntries(state, ctx);
 				records.requireEntry(state.call!);
 				const results = records.entries.filter((entry) => entry.type === "message" && entry.message.role === "toolResult"
@@ -175,7 +176,9 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 					throw new Error("文档工具终态不在本次调用之后");
 				}
 				current(state, ctx);
-			}, state.lifetime.signal);
+				state.terminalVerified = true;
+			};
+			await state.leases.releaseParent(state.lease, state.owner, verify, state.lifetime.signal);
 			if (active === state) active = undefined;
 		} catch (error) {
 			state.fault = String(error);
@@ -215,6 +218,17 @@ export function createParentDocumentWriter(pi: ExtensionAPI) {
 	});
 	return {
 		get pending() { return active !== undefined; },
+		// 仅在用户确认并成功清理与本运行态绑定的 lease 后，复位已结束的文档 writer fault。
+		canReconcileAfterUnlock(workspaceKey: string, leaseId: string): boolean {
+			const state = active;
+			return Boolean(state && state.finished && state.fault && state.terminalVerified && state.lease?.workspaceKey === workspaceKey && state.lease.leaseId === leaseId);
+		},
+		reconcileAfterUnlock(workspaceKey: string, leaseId: string): { runId: string; fault: string } | undefined {
+			const state = active;
+			if (!state || !state.finished || !state.fault || !state.terminalVerified || state.lease?.workspaceKey !== workspaceKey || state.lease.leaseId !== leaseId) return undefined;
+			active = undefined;
+			return { runId: state.id, fault: state.fault };
+		},
 		// 已结束且未自动收尾的失败是终态记录，不是仍在途的写入。
 		get fault() { return active?.fault; },
 		edit: (id: string, input: EditToolInput, signal: AbortSignal | undefined, ctx: ExtensionContext) => execute("edit", id, input, signal, ctx),

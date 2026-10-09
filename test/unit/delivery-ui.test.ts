@@ -212,19 +212,31 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) test(`${Renderer.name} 的
 	} finally { renderer.stop(); }
 });
 
-test("状态面板默认关闭，展开和翻页不选择结束或解除占用", () => {
-	for (const choices of [["关闭", "查看任务", "结束交付"], ["关闭", "查看任务", "解除占用", "结束交付"]]) {
-		const answers: unknown[] = [];
-		const panel = new DeliveryPanel("交付状态", "当前阶段：等待核对", "诊断证据\n".repeat(80), choices, tui, plainTheme,
-			(value) => answers.push(value), 0);
-		panel.render(100);
-		panel.handleInput("\x0f");
-		panel.render(100);
-		panel.handleInput("\x1b[F");
-		assert.deepEqual(answers, []);
-		panel.handleInput("\r");
-		assert.deepEqual(answers, ["关闭"]);
-	}
+test("状态面板默认无操作列表，详情和翻页不触发结束", () => {
+	const answers: unknown[] = [];
+	const panel = new DeliveryPanel("交付状态", "阶段：等待恢复\n下一步：说继续", "诊断证据\n".repeat(80), [], tui, plainTheme,
+		(value) => answers.push(value), 0);
+	panel.render(100);
+	panel.handleInput("\x0f");
+	panel.render(100);
+	panel.handleInput("\x1b[F");
+	assert.deepEqual(answers, []);
+	panel.handleInput("\r");
+	assert.deepEqual(answers, []);
+	panel.handleInput("\x1b");
+	assert.deepEqual(answers, [undefined]);
+});
+
+test("状态面板只有结束操作时，默认回车返回，导航后回车才执行", () => {
+	const answers: unknown[] = [];
+	const panel = new DeliveryPanel("交付状态", "阶段：可以结束交付", "详情", ["结束交付"], tui, plainTheme,
+		(value) => answers.push(value), 0);
+	panel.render(100);
+	panel.handleInput("\r");
+	assert.deepEqual(answers, [undefined]);
+	panel.handleInput("\x1b[B");
+	panel.handleInput("\r");
+	assert.deepEqual(answers, [undefined, "结束交付"]);
 });
 
 test("真实工具卡片点击按 toolCallId 打开对应详情，折叠仍保持两行", () => {

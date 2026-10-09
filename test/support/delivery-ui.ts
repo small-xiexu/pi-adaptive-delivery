@@ -15,8 +15,8 @@ export function approvalUI(select: ExtensionUIContext["select"], feedback?: () =
 		const panel = await factory({ terminal: { rows }, requestRender() {} } as any, plainTheme, {} as any, done) as (DeliveryPanel | DesignReviewPanel) & { dispose?(): void };
 		try {
 			const review = panel.title === "方案审阅", status = panel.title === "交付状态";
-			if (status) assert.equal(panel.choices[0], "关闭");
-			else assert.equal(panel.choices.at(-1), review ? "稍后再看" : panel.title === "解除上次任务的占用" ? "暂不处理" : "暂不批准");
+			if (status) assert.ok(panel.choices.length === 0 || panel.choices[0] === "结束交付");
+			else assert.equal(panel.choices.at(-1), review ? "稍后再看" : panel.title === "恢复交付" ? "暂不处理" : "暂不批准");
 			panel.render(100);
 			onPanel?.(panel);
 			const text = review ? feedback?.() : undefined;
@@ -32,7 +32,8 @@ export function approvalUI(select: ExtensionUIContext["select"], feedback?: () =
 			if (index < 0) panel.handleInput("\x1b");
 			else {
 				const delta = index - (status ? 0 : panel.choices.length - 1);
-				for (let i = 0; i < Math.abs(delta); i++) panel.handleInput(delta < 0 ? "\x1b[A" : "\x1b[B");
+				if (status && panel.choices.length === 1) panel.handleInput("\x1b[B");
+				else for (let i = 0; i < Math.abs(delta); i++) panel.handleInput(delta < 0 ? "\x1b[A" : "\x1b[B");
 				panel.handleInput("\r");
 			}
 			return await result;

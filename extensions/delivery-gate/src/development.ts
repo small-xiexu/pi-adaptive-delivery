@@ -99,6 +99,7 @@ interface DevelopmentRun extends SessionBinding {
 	pathEnded?: boolean;
 	review?: { result: Awaited<ReturnType<typeof delegateReadOnly>>; artifact: Awaited<ReturnType<typeof prepareReview>>; initialCandidate: CandidateSnapshot; candidate: CandidateSnapshot; changed: boolean };
 	problem?: unknown;
+	terminalVerified?: boolean;
 	fault?: string;
 	run?: Promise<AgentToolResult<unknown>>;
 	result?: { content: AgentToolResult<unknown>["content"]; details?: unknown; isError: boolean };
@@ -162,7 +163,7 @@ export async function verifyRecordedResult(state: DevelopmentRun, ctx: Extension
 	if (records.branch.findIndex((row) => row.id === result.id) <= records.branch.findIndex((row) => row.id === state.call!.id)) throw new Error("父交付工具终态不在本次调用之后");
 }
 
-export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnType<typeof installApprovals>) {
+export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnType<typeof installApprovals>, recoverResidual?: (ctx: ExtensionContext) => Promise<void>) {
 	let active: DevelopmentRun | undefined;
 	let stopped = false;
 	let finishing: Promise<void> | undefined;
@@ -180,10 +181,13 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 	});
 
 	async function execute(name: string, input: ChildTask, signal: AbortSignal | undefined, ctx: ExtensionContext, update: ProgressUpdate): Promise<AgentToolResult<unknown>> {
-		if (active || stopped) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
+		if (stopped) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
 		signal?.throwIfAborted();
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("没有持久父 Session，未启动交付任务");
+		const grant = await approvals.readApproval(ctx, signal);
+		await recoverResidual?.(ctx);
+		if (active) throw new Error("交付 writer 尚未完成交接或已关闭，未启动新任务");
 		const state: DevelopmentRun = { id: input.id, name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), sessionFile, lifetime: new AbortController(), finished: false, attemptedLease: false };
 		active = state;
 		const progress = state.progress = createTaskProgress(input.id, name === REVIEW_TOOL ? "审查" : "开发", input.task, update);
@@ -196,7 +200,6 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 			let dialogs: ReturnType<typeof createChildDialogs> | undefined;
 			try {
 				setStage("批准与候选准备");
-				const grant = await approvals.readApproval(ctx, operation);
 				setStage("调用前范围校验");
 				const rawPaths = input.paths ?? [], rawInputs = input.inputs ?? [];
 				if (rawPaths.some((value) => !value.trim()) || rawInputs.some((value) => !value.trim())) throw new Error("调用前范围校验失败：开发或审查路径不能是空白字符串。");
@@ -382,7 +385,10 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		if (!state?.finished || state.fault) return;
 		try {
 			if (!state.lease || !state.owner || !state.parent || !state.leases || !state.result || !state.call) throw new Error("交付 writer 获取或执行状态未知");
-			const verify = () => verifyRecordedResult(state, ctx);
+			const verify = async () => {
+				await verifyRecordedResult(state, ctx);
+				state.terminalVerified = true;
+			};
 			if (state.owner.kind === "child") await state.leases.releaseChild(state.lease, state.owner, state.parent, verify, state.lifetime.signal);
 			else await state.leases.releaseParent(state.lease, state.owner, verify, state.lifetime.signal);
 			active = undefined;
@@ -415,9 +421,13 @@ export function createDevelopmentDelegator(pi: ExtensionAPI, approvals: ReturnTy
 		get progress() { return active?.progress?.snapshot(); },
 		get pending() { return active !== undefined; },
 		// 仅在用户确认并成功清理与本运行态绑定的 lease 后，复位已结束的内存 fault；未知或仍在途状态继续关闭。
+		canReconcileAfterUnlock(workspaceKey: string, leaseId: string): boolean {
+			const state = active;
+			return Boolean(state && state.finished && state.fault && state.terminalVerified && state.lease?.workspaceKey === workspaceKey && state.lease.leaseId === leaseId);
+		},
 		reconcileAfterUnlock(workspaceKey: string, leaseId: string): { runId: string; fault: string } | undefined {
 			const state = active;
-			if (!state || !state.finished || !state.fault || state.lease?.workspaceKey !== workspaceKey || state.lease.leaseId !== leaseId) return undefined;
+			if (!state || !state.finished || !state.fault || !state.terminalVerified || state.lease?.workspaceKey !== workspaceKey || state.lease.leaseId !== leaseId) return undefined;
 			active = undefined;
 			return { runId: state.id, fault: state.fault };
 		},

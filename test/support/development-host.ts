@@ -72,7 +72,7 @@ export async function createDevelopmentHost(t: TestContext, scenario = "normal",
 		initTheme("dark");
 		const notices: string[] = [];
 		const choices: string[] = [];
-		let select: ExtensionUIContext["select"] = async (title, items) => { if (title !== "交付状态") choices.push(title); return items[0]; };
+		let select: ExtensionUIContext["select"] = async (title, items) => { if (title !== "交付状态") choices.push(title); return title === "恢复交付" ? items.at(-1) : title === "交付状态" ? undefined : items[0]; };
 		let custom = approvalUI((...args) => select(...args), undefined, 32,
 			(panel) => { if (panel.title === "交付状态") notices.push(`${panel.body}\n\n${panel.detail}`); });
 		let confirm: ExtensionUIContext["confirm"] = async () => true;

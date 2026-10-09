@@ -10,7 +10,7 @@ import { plainTheme } from "../support/delivery-ui.ts";
 import type { DeliveryPanel, DesignReviewPanel } from "../../extensions/delivery-gate/src/ui.ts";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
-test("状态面板默认回车和查看详情只关闭，不结束交付或启动任务", { timeout: 40_000 }, async (t) => {
+test("状态面板默认只显示摘要，详情和退出操作彼此独立", { timeout: 40_000 }, async (t) => {
 	const h = await host(t);
 	await h.prepare();
 	const tools = h.session.getActiveToolNames();
@@ -20,14 +20,14 @@ test("状态面板默认回车和查看详情只关闭，不结束交付或启�
 		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
 			(value) => { answer = value; }) as DeliveryPanel;
 		assert.equal(panel.title, "交付状态");
-		assert.deepEqual(panel.choices, ["关闭", "查看任务", "结束交付"]);
+		assert.deepEqual(panel.choices, ["结束交付"]);
 		assert.doesNotMatch(panel.body, /PID|Session|lease/);
+		assert.match(panel.body, /阶段：|下一步：|运行中：/);
 		panel.render(100);
 		panel.handleInput("\x0f");
-		panel.render(100);
-		panel.handleInput("\x1b[F");
-		panel.handleInput("\r");
-		assert.equal(answer, "关闭");
+		assert.match(panel.render(100).join("\n"), /PID|Session|lease/);
+		panel.handleInput("\x1b");
+		assert.equal(answer, undefined);
 		return answer;
 	}) as ExtensionUIContext["custom"]);
 	await h.session.prompt("/delivery-status");
@@ -123,15 +123,15 @@ test("复杂开发由独立子 Agent 完成并核实 writer 收尾", { timeout: 
 			panel.dispose?.();
 		} else {
 			assert.equal(panel.title, "交付状态");
-			panel.render(100);
-			panel.handleInput("\x1b[B");
-			panel.handleInput("\r");
-			assert.equal(answer, "查看任务");
+			assert.deepEqual(panel.choices, ["结束交付"]);
+			panel.handleInput("\x0f");
+			assert.match(panel.render(100).join("\n"), /任务|原始子 Session/);
+			panel.handleInput("\x1b");
 		}
 		return answer;
 	}) as ExtensionUIContext["custom"]);
-	await h.status("查看任务");
-	assert.equal(opened, true);
+	await h.status();
+	assert.equal(opened, false);
 	assert.equal(await h.readLease(), undefined);
 	const paths = h.sm.getBranch().filter((row) => row.type === "custom" && row.customType === EXECUTION_PATH_ENTRY).map((row: any) => row.data);
 	assert.ok(paths.some((row: any) => row.path === "delivery_develop" && row.phase === "started"));
@@ -150,7 +150,7 @@ test("父 Pi 直改节点记录 parent_direct，状态详情显示声明但不�
 	assert.equal(data.phase, "declared");
 	assert.equal(data.independentReview, true);
 	await h.session.prompt("/delivery-status");
-	assert.match(h.notices.at(-1)!, /交付已启用，当前无在途任务/);
+	assert.match(h.notices.at(-1)!, /阶段：|下一步：/);
 	await h.session.prompt("/delivery-status");
 	assert.match(h.notices.at(-1)!, /parent_direct.*局部配置迁移/);
 	assert.match(h.notices.at(-1)!, /父 Pi 已声明/);
@@ -193,8 +193,8 @@ test("审查子收到检查报告职责，同时继承普通写入工具", { tim
 	const blockedLease = path.join(leaseDirectory, `${workspace.key}.json`);
 	await mkdir(leaseDirectory, { recursive: true });
 	await writeFile(blockedLease, "broken");
-	await h.status("结束交付");
-	assert.match(h.notices.at(-1)!, /展开详情.*解除占用.*结束交付/);
+	await h.status();
+	assert.ok(h.notices.some((notice) => /阶段：等待恢复/.test(notice)));
 	await access(path.dirname(diffFile));
 	assert.ok(h.session.getActiveToolNames().includes("write"));
 	await rm(blockedLease);
@@ -274,13 +274,13 @@ for (const name of ["delivery_develop", "delivery_review"] as const) {
 		const starts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
 		const retry = await h.call(name, { task: "未知收尾不得启动替代 writer。", paths: ["src"], inputs: [] });
 		assert.equal(retry.isError, true);
-		assert.match(JSON.stringify(retry.content), /交付 writer 尚未完成交接或已关闭/);
+		assert.match(JSON.stringify(retry.content), /FIXTURE_CHILD_EXTENSION_ERROR|结束状态与当前占用记录不一致|writer/);
 		assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, starts);
 		assert.equal((await h.readLease())?.leaseId, lease.leaseId);
 	});
 }
 
-test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeout: 90_000 }, async (t) => {
+test("继续遇到未知收尾时保持占用，不启动替代审查", { timeout: 90_000 }, async (t) => {
 	const h = await host(t, "review-crash");
 	await mkdir(path.join(h.cwd, "src"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
@@ -290,59 +290,14 @@ test("显式解锁后复位已知终态，父 Pi 可重新发起审查", { timeo
 	const originalLease = await h.readLease();
 	assert.equal(originalLease?.owner.kind, "parent");
 	const firstStarts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
-	let accept = false;
-	h.setCustom((async (factory) => {
-		let answer: unknown;
-		const panel = await factory({ terminal: { rows: 40 }, requestRender() {} } as any, plainTheme, {} as any,
-			(value) => { answer = value; }) as DeliveryPanel;
-		if (panel.title === "交付状态") {
-			panel.render(100);
-			const index = panel.choices.indexOf("解除占用");
-			assert.ok(index > 0);
-			for (let i = 0; i < index; i++) panel.handleInput("\x1b[B");
-			panel.handleInput("\r");
-			return answer;
-		}
-		assert.equal(panel.title, "解除上次任务的占用");
-		const body = panel.render(100).join("\n");
-		assert.match(body, /保留现有代码改动/);
-		assert.match(body, /失效的方案确认不会恢复/);
-		assert.doesNotMatch(body, /PID|Session|lease|owner|请核对实施范围/);
-		assert.match(body, /暂不处理/);
-		panel.handleInput("\x0f");
-		panel.render(100);
-		panel.handleInput("\x1b[F");
-		const detail = panel.render(100).join("\n");
-		assert.match(detail, /PID/);
-		assert.ok(detail.includes(originalLease!.leaseId));
-		if (accept) panel.handleInput("\x1b[A");
-		panel.handleInput("\r");
-		return answer;
-	}) as ExtensionUIContext["custom"]);
-
-	await h.status("解除占用");
-	assert.match(h.notices.at(-1)!, /未解除占用，现场保持原样/);
-	assert.deepEqual(await h.readLease(), originalLease, "查看证据及默认回车均不清理占用");
-	assert.equal(h.sm.getBranch().some((row) => row.type === "custom" && row.customType === "delivery-unlock"), false);
-	accept = true;
-	await h.status("解除占用");
-	await h.session.waitForIdle();
-	assert.match(h.notices.at(-1)!, /已复位父进程中的已知失败运行态/);
-	assert.match(h.notices.at(-1)!, /方案确认仍有效/);
-	assert.equal(await h.readLease(), undefined);
-	const unlock = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");
-	assert.equal(unlock?.type, "custom");
-	assert.equal((unlock.data as any).inMemoryState, "cleared");
-	assert.equal(typeof (unlock.data as any).reconciledRunId, "string");
-
-	const second = await h.call("delivery_review", { task: "重新独立检查并运行相关验证。", paths: ["src"], inputs: [] });
+	const second = await h.call("delivery_review", { task: "继续独立检查并运行相关验证。", paths: ["src"], inputs: [] });
 	assert.equal(second.isError, true, JSON.stringify(second));
-	const secondStarts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
-	assert.equal(secondStarts, firstStarts + 1, "解锁后应启动新的审查子 Session，而不是被旧 active fault 拒绝");
-	assert.equal((await h.readLease())?.owner.kind, "parent", "第二次审查自身仍失败时应继续保留 lease");
+	assert.match(JSON.stringify(second.content), /结束状态与当前占用记录不一致|writer/);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, firstStarts);
+	assert.equal((await h.readLease())?.leaseId, originalLease?.leaseId);
 });
 
-test("lease ID 不匹配时解锁不复位 fault，仍阻止重放交付任务", { timeout: 90_000 }, async (t) => {
+test("lease ID 不匹配时继续不清理旧 fault 或启动替代任务", { timeout: 90_000 }, async (t) => {
 	const h = await host(t, "review-crash");
 	await mkdir(path.join(h.cwd, "src"));
 	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
@@ -354,16 +309,31 @@ test("lease ID 不匹配时解锁不复位 fault，仍阻止重放交付任务",
 	const record = JSON.parse(await readFile(leaseFile, "utf8"));
 	record.leaseId = "replacement-lease-for-test";
 	await writeFile(leaseFile, `${JSON.stringify(record)}\n`);
-
-	await h.status("解除占用");
-	await h.session.waitForIdle();
-	assert.match(h.notices.at(-1)!, /仍保留未能安全复位的交付状态/);
-	const unlock = h.sm.getBranch().findLast((row) => row.type === "custom" && row.customType === "delivery-unlock");
-	assert.equal(unlock?.type, "custom");
-	assert.equal((unlock.data as any).inMemoryState, "retained");
-	const retry = await h.call("delivery_review", { task: "不得绕过未匹配的 fault 状态。", paths: ["src"], inputs: [] });
+	const starts = (await h.audit()).filter((row) => row.child && row.phase === "start").length;
+	const retry = await h.call("delivery_review", { task: "不得绕过不匹配的失败状态。", paths: ["src"], inputs: [] });
 	assert.equal(retry.isError, true, JSON.stringify(retry));
-	assert.match(JSON.stringify(retry.content), /交付 writer 尚未完成交接或已关闭/);
+	assert.match(JSON.stringify(retry.content), /结束状态与当前占用记录不一致|writer 尚未完成交接/);
+	assert.equal((await h.audit()).filter((row) => row.child && row.phase === "start").length, starts);
+	assert.equal((await h.readLease())?.leaseId, "replacement-lease-for-test");
+});
+
+test("无法自动核实的残留只请求一次恢复选择", { timeout: 90_000 }, async (t) => {
+	const h = await host(t, "normal");
+	await mkdir(path.join(h.cwd, "src"));
+	await writeFile(path.join(h.cwd, "src/value.js"), "export const value = 1;\n");
+	await h.prepare();
+	const workspace = await resolveWorkspaceIdentity(h.cwd);
+	const leases = new (await import("../../extensions/delivery-gate/src/workspace.ts")).WriterLeaseManager(await getWriterStateRoot(workspace));
+	await leases.acquire(workspace, { kind: "parent", sessionId: "old-session", pid: 99999, runId: "old-run" });
+	const declined = await h.call("delivery_develop", { task: "残留恢复默认等待用户选择。", paths: ["src"], inputs: [] });
+	assert.equal(declined.isError, true, JSON.stringify(declined));
+	assert.match(JSON.stringify(declined.content), /已保留上次交付现场/);
+	assert.ok(await h.readLease());
+	h.setSelect(async (title, items) => title === "恢复交付" ? "清理残留并继续" : items[0]);
+	const resumed = await h.call("delivery_develop", { task: "确认后清理残留并继续。", paths: ["src"], inputs: [] });
+	assert.equal(resumed.isError, false, JSON.stringify(resumed));
+	assert.equal(await h.readLease(), undefined);
+	assert.ok(h.notices.some((notice) => /已清理上次交付的残留占用/.test(notice)));
 });
 
 test("父回合中断审查时保留中断阶段、子 Session 引用和 lease", { timeout: 60_000 }, async (t) => {

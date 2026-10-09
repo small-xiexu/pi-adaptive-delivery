@@ -157,6 +157,7 @@ export class DeliveryPanel {
 	private fits = true;
 	private optionsRow = 0;
 	private expanded = false;
+	private actionArmed = false;
 	private readonly select?: SelectList;
 	constructor(readonly title: string, public body: string, readonly detail: string,
 		readonly choices: string[], private readonly tui: TUI, private readonly theme: Theme,
@@ -184,6 +185,8 @@ export class DeliveryPanel {
 		else if (matchesKey(data, "pageDown")) this.scroll(this.pageSize);
 		else if (matchesKey(data, "home")) this.scroll(-this.total);
 		else if (matchesKey(data, "end")) this.scroll(this.total);
+		else if (this.select && this.choices.length === 1 && matchesKey(data, "enter") && !this.actionArmed) this.done(undefined);
+		else if (this.select && this.choices.length === 1 && (matchesKey(data, "up") || matchesKey(data, "down"))) { this.actionArmed = true; this.select.handleInput(data); }
 		else if (this.select) this.select.handleInput(data);
 		else if (matchesKey(data, "up")) this.scroll(-1);
 		else if (matchesKey(data, "down")) this.scroll(1);
@@ -200,9 +203,11 @@ export class DeliveryPanel {
 	render(width: number) {
 		width = Math.min(width, 100);
 		const body = wrapped(this.expanded ? this.detail : this.body, width);
-		const header = panelHeader(this.theme, width, this.title, this.select ? "请核对操作影响，再选择" : "查看信息 · Esc 关闭");
+		const header = panelHeader(this.theme, width, this.title, this.select
+			? this.choices.length === 1 ? "可执行操作" : "请选择操作"
+			: "Esc 返回");
 		const footer = panelFooter(this.theme, width,
-			this.select ? "↑↓ 选择 · Enter 确定 · Esc 取消" : "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 关闭",
+			this.select ? this.choices.length === 1 ? "Enter 执行 · Esc 返回" : "↑↓ 选择 · Enter 确定 · Esc 返回" : "↑↓ / PgUp/PgDn 滚动 · Esc 返回",
 			this.detail ? `Ctrl+O ${this.expanded ? "返回正文" : "查看详情"} · PgUp/PgDn 翻页` : "");
 		const options = this.select?.render(width).map((line) => truncateToWidth(`  ${line}`, width, "")) ?? [];
 		const notice = noticeLines(this.theme, width, this.notice);

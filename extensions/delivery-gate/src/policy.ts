@@ -6,7 +6,7 @@ import { DEVELOPMENT_TOOL, REVIEW_TOOL } from "./development.ts";
 import { GIT_STATUS_TOOL } from "./workspace.ts";
 import { EXECUTION_PATH_TOOL } from "./execution-path.ts";
 
-export const CAPABILITY_NOTICE = "交付已启用：小改动、低风险、范围明确的任务可以直接由父 Pi 完成；复杂任务才委派，必要时独立审查。交付保留 Pi 原有工具与权限检查，联网查资料、文件、Shell 和插件能力不按角色删减。方案确认后立即授权本轮实施，实施计划由父 Pi 内部维护，不另设第二次确认。交付委派和 writer 交接只管理本 Package 的开发与审查调用。普通工具不由交付 writer 接管。父负责讨论与协调，开发子按任务实现，审查子主动运行测试并独立检查；两者都应遵守用户授权，不能因工具可用就擅自写入、递归委派或执行外部操作。父 Pi 直接实施节点前调用 delivery_path 记录路径；委派路径由 Package 自动记录。旧批准不自动恢复，完成结论须有当前候选证据。交付完成时必须分开说明修改内容、实际检查命令与退出码、独立审查、限制和未执行项；未运行检查不得写成通过。delivery_develop 或 delivery_review 的 paths 只放源码、测试和配置，inputs 只放额外只读证据；父维护规划文档发生范围冲突时会在子 Session 启动前拒绝调用。若占用残留，先由父核对原始执行记录；用户可在 /delivery-status 展开详情，确认没有在途任务且占用为残留后，明确选择“解除占用”。匹配的已知失败状态复位且方案确认有效时，沿原范围继续；需要离开时在同一面板选择“结束交付”。结束交付不会强制清理占用。";
+export const CAPABILITY_NOTICE = "交付已启用：先确认方案，再按范围实施、检查和必要的独立审查。方案确认后立即授权本轮实施，不另设第二次确认。简单任务由父 Pi 直接完成，复杂任务才委派；所有普通工具和原有权限继续由 Pi 管理。范围内返工不重复确认。delivery_develop 和 delivery_review 的 paths 只放源码、测试和配置，inputs 只放额外只读证据。交付结果要区分修改、实际检查、独立审查和未验证事项。交付工具只管理自身的任务交接，不接管普通工具。若上次任务留下占用，用户说“继续”时先自动核对；能证明任务已结束就恢复，无法核实时只请求一次选择，不要求用户理解或操作内部 lease。不要向用户解释 Skill 或内部规则，不把任务收尾当作检查通过。结束交付不会强制清理占用。";
 
 // 子任务继承父实际启用的工具；交付协调工具属于父会话，不是项目原有能力。
 export function inheritedTools(pi: Pick<ExtensionAPI, "getAllTools" | "getActiveTools">, entryPath: string) {

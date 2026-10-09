@@ -133,8 +133,9 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	h.api.setActiveTools([...h.session.getActiveToolNames(), "write", "plugin_tool"]);
 	assert.equal((await h.call("write", { path: "blocked.txt", content: "原工具" })).isError, false);
 	assert.equal((await h.call("plugin_tool", {})).isError, false);
-	assert.match(h.prompts.at(-1)!, /交付已启用：小改动、低风险、范围明确的任务可以直接由父 Pi 完成/);
+	assert.match(h.prompts.at(-1)!, /交付已启用：先确认方案/);
 	assert.ok(h.prompts.at(-1)!.includes(fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))));
+	assert.equal((await h.approve("design", [])).isError, false);
 	await h.status("结束交付");
 	assert.deepEqual(h.session.getActiveToolNames(), original);
 	assert.ok(!h.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
@@ -143,7 +144,7 @@ test("未启用交付时普通写入、Shell 和第三方工具沿用原行为�
 	assert.ok(!h.prompts.at(-1)!.includes("交付已启用："));
 	assert.equal(await readFile(path.join(h.cwd, "normal.txt"), "utf8"), "正常写入");
 	assert.equal(await readFile(path.join(h.cwd, "blocked.txt"), "utf8"), "原工具");
-	assert.equal(h.choices.length, 0);
+	assert.equal(h.choices.length, 1);
 });
 
 test("真实 Pi 在方案批准回合结束前衔接实施，全部回合完成后只通知一次 settled", { timeout: 40_000 }, async (t) => {
@@ -194,7 +195,7 @@ test("显式进入后的 reload 和重开保留交付入口及普通工具，旧
 	await reopened.status("结束交付");
 	const normal = await host(t, undefined, undefined, { cwd: h.cwd, sessionFile: h.sm.getSessionFile()! }, false);
 	assert.ok(normal.session.getActiveToolNames().includes("write"));
-	assert.ok(!normal.session.getAllTools().some((tool) => tool.name.startsWith("delivery_")));
+	assert.ok(normal.session.getAllTools().some((tool) => tool.name === "delivery_approval"));
 });
 
 for (const failure of ["record", "lock"]) test(`真实 SDK 退出遇到未知 writer ${failure} 保持门禁与现场`, async (t) => {
@@ -207,7 +208,8 @@ for (const failure of ["record", "lock"]) test(`真实 SDK 退出遇到未知 wr
 	else await mkdir(file);
 	await h.status("结束交付");
 	assert.ok(h.session.getActiveToolNames().includes("write"));
-	assert.ok(h.notices.some((text) => text.startsWith("暂不能结束交付")));
+	assert.ok(h.session.getActiveToolNames().includes("write"));
+	assert.ok(h.notices.every((text) => !text.startsWith("暂不能结束交付")));
 	await access(file);
 	assert.ok(!h.sm.getEntries().some((row) => row.type === "custom" && row.customType === "delivery-activation" && (row.data as any).enabled === false));
 });

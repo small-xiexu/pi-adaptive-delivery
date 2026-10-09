@@ -49,7 +49,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		if (state.enabled) {
 			originalTools = state.tools ?? [];
 			await enter(ctx);
-			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载。说“继续”即可核对已有方案和进度；继续开发需要重新确认。用 /delivery-status 查看任务、处理占用或结束交付。", "info");
+			if (event.reason === "reload") ctx.ui.notify("交付扩展已重载。旧实施确认已失效；重新确认方案后再继续。需要退出时使用 /delivery-status。", "info");
 		} else if (state.tools) {
 			restoreTools = state.tools;
 		}
@@ -62,12 +62,12 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 		restoreTools = undefined;
 	});
 	pi.registerCommand("delivery-status", {
-		description: "查看交付状态、任务详情，处理占用或结束交付",
+		description: "查看交付进度和详情，结束交付",
 		handler: async (_args, ctx) => {
 			if (!runtime) { ctx.ui.notify("交付未启用，当前沿用 Pi 原有工具。使用 /delivery-shape 进入交付流程。", "info"); return; }
 			if (!await runtime.showStatus(ctx)) return;
 			if (changing || !ctx.isIdle() || ctx.hasPendingMessages()) {
-				ctx.ui.notify("暂不能结束交付：仍有执行或排队消息。请等收尾后在 /delivery-status 中选择“结束交付”。", "warning");
+				ctx.ui.notify("暂不能结束交付：仍有任务或占用未完成。先说“继续”完成恢复，或等待当前回合结束。", "warning");
 				return;
 			}
 			changing = true;
@@ -104,7 +104,7 @@ export function installActivation(pi: ExtensionAPI, start: (ctx: ExtensionContex
 					pi.appendEntry(ENTRY, { enabled: true, tools: originalTools });
 					await enter(ctx);
 				}
-				ctx.ui.notify("交付已启用。确认方案后开始实施；之后直接说“继续”或提出修改意见。用 /delivery-status 查看任务、处理占用或结束交付。", "info");
+				ctx.ui.notify("交付已启用。确认方案后会自动实施；中断后直接说“继续”。需要退出时使用 /delivery-status。", "info");
 				if (args.trim()) pi.sendUserMessage(`先读取并遵循 ${fileURLToPath(new URL("../../../skills/adaptive-delivery/SKILL.md", import.meta.url))}，核实项目事实并对齐需求；明确需求可以零追问，简单任务无须规划文档。当前需求：\n${args}`, { expandPromptTemplates: false });
 			} finally { changing = false; }
 		},

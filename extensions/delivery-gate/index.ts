@@ -46,7 +46,7 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	pi.on("before_agent_start", (event, ctx) => {
 		promptOptions = structuredClone(event.systemPromptOptions);
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n只有用户执行 /delivery-shape 才启用交付；模型回复、普通对话和旧记录不改变交付状态。/delivery-status 是唯一的查看与操作入口，用户在面板中明确选择才能解除占用或结束交付。`
+			systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTICE}\n只有用户执行 /delivery-shape 才启用交付；模型回复、普通对话和旧记录不改变交付状态。/delivery-status 用于查看简要进度和详情；结束交付需要用户明确选择。恢复优先由用户说“继续”触发，插件会自动核对已结束的残留占用。`
 				+ (child ? "" : `\n受控交付已启用。先读取并遵循 ${fileURLToPath(new URL("../../skills/adaptive-delivery/SKILL.md", import.meta.url))}；没有变化时不重复全文读取。`)
 				+ (childDevelopment ? "\n开发子会话沿用父 Pi 原有工具，遵守本次节点范围，不修改父规划文档、不批准或继续委派。"
 					: child ? "\n本次子任务沿用父 Pi 的全部普通工具和权限；具体职责由委派任务说明。不批准、不继续委派，外部操作仍须遵守本轮授权。" : "\n方案确认后由 AI 内部维护实施计划：简单任务由父 Pi 直接修改并检查，复杂任务按需委派。每次委派明确提供当前 paths 和 inputs；范围内调整不重复请求确认。需要持续维护时沿用已有方案/台账；Markdown 编辑使用父文档工具并保留用户内容，每回合一次变更。委派时按工作场景、复杂度和风险选择推理级别，不另选模型。")
@@ -79,11 +79,52 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 	}
 	const approvals = installApprovals(pi);
 	const writer = createParentDocumentWriter(pi);
-	const developer = createDevelopmentDelegator(pi, approvals);
+	let recoverResidual!: (ctx: ExtensionContext) => Promise<"none" | "recovered">;
+	const developer = createDevelopmentDelegator(pi, approvals, async (ctx) => { await recoverResidual(ctx); });
 	const active = new Map<AbortController, { run: Promise<unknown>; progress: ReturnType<typeof createTaskProgress> }>();
 	const tasks = () => [...active.values()].map((item) => item.progress.snapshot()).concat(developer.progress ? [developer.progress] : []);
 	const openTask = installTaskDetails(pi, tasks, initialContext);
 	installExecutionPath(pi, approvals);
+	recoverResidual = async (ctx: ExtensionContext): Promise<"none" | "recovered"> => {
+		if (approvals.pending || active.size || (writer.pending && !writer.fault) || ctx.hasPendingMessages()) {
+			throw new Error("当前仍有交互或任务在进行，等待本轮收尾后再继续。");
+		}
+		const workspace = await resolveWorkspaceIdentity(ctx.cwd);
+		const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
+		const blockage = await leases.inspectBlockage(workspace.key);
+		if (!blockage.lease && !blockage.operationLock) return "none";
+		const leaseId = blockage.lease?.leaseId;
+		const target = leaseId
+			? developer.canReconcileAfterUnlock(workspace.key, leaseId) ? "development"
+				: writer.canReconcileAfterUnlock(workspace.key, leaseId) ? "document" : undefined
+			: undefined;
+		if (developer.fault || writer.fault) {
+			if (!target) throw new Error("上次交付的结束状态与当前占用记录不一致，暂未清理；请查看详情后再继续。");
+		}
+		if (!target && (ctx.mode !== "tui" || !ctx.hasUI)) throw new Error("上次交付留下了无法自动核实的占用，当前模式不能确认清理。");
+		if (!target) {
+			const owner = blockage.lease?.record?.owner;
+			const body = [
+				"上次交付留下了占用记录，但原执行无法完整核实。",
+				"当前会话没有在途交付任务；清理后保留已有改动，继续当前方案。",
+				"清理不会恢复旧批准，也不代表检查或审查通过。",
+			].join("\n");
+			const detail = [body, "", `占用记录：${leaseId ?? "无法解析"}`,
+				...(owner ? [`归属：${owner.kind}，PID ${owner.pid}，Session ${owner.sessionId}，执行 ${owner.runId ?? "未记录"}`] : []),
+				`残留操作锁：${blockage.operationLock ? "存在" : "无"}`].join("\n");
+			const choice = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) =>
+				new DeliveryPanel("恢复交付", body, detail, ["清理残留并继续", "暂不处理"], tui, theme, done, 1));
+			if (choice !== "清理残留并继续") throw new Error("已保留上次交付现场，未开始新的任务。");
+		}
+		const removed = await leases.discard(workspace.key, blockage);
+		const reconciled = target === "development" && leaseId ? developer.reconcileAfterUnlock(workspace.key, leaseId)
+			: target === "document" && leaseId ? writer.reconcileAfterUnlock(workspace.key, leaseId) : undefined;
+		pi.appendEntry("delivery-unlock", { workspaceKey: workspace.key, leaseId, owner: blockage.lease?.record?.owner,
+			operationLock: removed.operationLock, at: new Date().toISOString(),
+			...(reconciled ? { reconciledRunId: reconciled.runId, inMemoryState: "cleared", recovery: "automatic" } : { inMemoryState: "none", recovery: "confirmed" }) });
+		ctx.ui.notify(reconciled ? "已自动恢复上次交付，继续当前方案。" : "已清理上次交付的残留占用，继续当前方案。", "info");
+		return "recovered";
+	};
 	pi.registerTool({ name: GIT_STATUS_TOOL, label: "Git 现状",
 		description: "固定只读查询当前 worktree 的分支、HEAD、暂存/未暂存及未跟踪改动，路径按 JSON 转义。无 HEAD 或 detached 明确返回 null。最多读取 50 KiB，超限报错，不隐藏改动；没有命令或路径参数，不获取源码差异、不产生批准。",
 		parameters: Type.Object({}, { additionalProperties: false }),
@@ -167,111 +208,59 @@ function installDelivery(pi: ExtensionAPI, initialContext?: ExtensionContext) {
 		const results = await Promise.allSettled([...active.values()].map((item) => item.run));
 		if (results.some((result) => result.status === "rejected")) ctx.ui.notify("委派已停止；存在取消或失败，请核对原生会话记录。", "warning");
 	});
-	const unlock = async (ctx: ExtensionContext) => {
-			if (ctx.mode !== "tui" || !ctx.hasUI) { ctx.ui.notify("强制清理需要父 Pi TUI。", "warning"); return; }
-			if (!ctx.isIdle() || ctx.hasPendingMessages()) { ctx.ui.notify("请等待当前回合和排队消息结束后再清理。", "warning"); return; }
-			if (approvals.pending || active.size || (writer.pending && !writer.fault) || (developer.pending && !developer.fault)) {
-				ctx.ui.notify("未清理：仍有交互或任务在途。等收尾后重试；需要核对现场时用 /delivery-status。", "warning");
-				return;
-			}
-			try {
-				const workspace = await resolveWorkspaceIdentity(ctx.cwd);
-				const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
-				const blockage = await leases.inspectBlockage(workspace.key);
-				if (!blockage.lease && !blockage.operationLock) {
-					ctx.ui.notify("没有残留占用记录。若仍不能继续，请在 /delivery-status 展开详情核对执行状态。", "info");
-					return;
-				}
-				const owner = blockage.lease?.record?.owner;
-				const body = [
-					"发现工作区写入占用记录，后续交付受阻。",
-					...(blockage.lease && !owner ? ["记录无法核实归属，请先查看详情。"] : []),
-					"仅凭记录不能证明原任务已停止，请先确认没有运行中的任务。",
-					...(blockage.operationLock ? ["此次也会清理残留操作锁。"] : []),
-					"",
-					"解除后清除占用记录，保留现有代码改动。",
-					"失效的方案确认不会恢复，也不代表检查或审查通过。",
-					"下一步核对当前代码和进度，再继续或重新确认方案。",
-				].join("\n");
-				const evidence = [
-					`lease 记录：${blockage.lease ? blockage.lease.leaseId ?? "存在但无法解析，不能核对归属" : "无"}`,
-					...(owner ? [`owner：${owner.kind}，PID ${owner.pid}，Session ${owner.sessionId}，执行 ${owner.runId ?? "未记录"}`,
-						`记录时间：${blockage.lease?.record?.createdAt} → ${blockage.lease?.record?.updatedAt}`] : []),
-					`残留操作锁：${blockage.operationLock ? "存在，会阻止取得新的 writer" : "无"}`,
-					"",
-					"该记录不能证明原执行已经停止，也不代表代码已核对。强制清理保留原失败事实，不会恢复上次任务；请检查现有代码改动。",
-				].join("\n");
-				const choice = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) =>
-					new DeliveryPanel("解除上次任务的占用", body, `${body}\n\n任务归属和诊断证据\n${evidence}`,
-						["解除占用", "暂不处理"], tui, theme, done, 1));
-				if (choice !== "解除占用") { ctx.ui.notify("未解除占用，现场保持原样。", "info"); return; }
-				const removed = await leases.discard(workspace.key, blockage);
-				const reconciled = blockage.lease?.leaseId ? developer.reconcileAfterUnlock(workspace.key, blockage.lease.leaseId) : undefined;
-				pi.appendEntry("delivery-unlock", { workspaceKey: workspace.key, leaseId: blockage.lease?.leaseId, owner,
-					operationLock: removed.operationLock, at: new Date().toISOString(),
-					...(reconciled ? { reconciledRunId: reconciled.runId, inMemoryState: "cleared" } : { inMemoryState: developer.pending ? "retained" : "none" }) });
-				const next = reconciled
-					? "已复位父进程中的已知失败运行态；旧失败事实仍保留在本次 Session。" + (approvals.confirmedStage === "design"
-						? "方案确认仍有效；核对已有改动后，说“继续”即可接着处理。"
-						: "当前没有有效的实施确认；核对已有方案和现场后，重新确认即可继续。")
-					: developer.pending ? "父进程仍保留未能安全复位的交付状态；在 /delivery-status 选择“结束交付”后，重新进入并核对已有方案。"
-					: "核对已有代码和进度后，说“继续”即可接着处理；需要离开时，在 /delivery-status 选择“结束交付”。";
-				ctx.ui.notify(`已解除占用：${[removed.lease ? "写入占用记录" : "", removed.operationLock ? "残留操作锁" : ""].filter(Boolean).join("、") || "无"}。${next} 请检查已有代码改动。`, "warning");
-			} catch (error) {
-				ctx.ui.notify(`未清理：${error instanceof Error ? error.message : String(error)}`, "error");
-			}
-	};
 	const showStatus = async (ctx: ExtensionContext) => {
-			try {
-				const workspace = await resolveWorkspaceIdentity(ctx.cwd);
-				const stateRoot = await getWriterStateRoot(workspace);
-				const blockage = await new WriterLeaseManager(stateRoot).inspectBlockage(workspace.key);
-				const lease = blockage.lease?.record;
-				const running = tasks();
-				const inherited = inheritedTools(pi, entryPath).map((tool) => tool.name);
-				const executing = running.filter((task) => !task.endedAt);
-				const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
-				let stage = deliveryStage(approvals.confirmedStage === "design", !ctx.isIdle(), ctx.hasPendingMessages());
-				let next = approvals.confirmedStage === "design" ? "核对实际改动、检查命令和审查结果；完成后退出交付。" : "整理方案并提交给你确认；暂停后说“继续看方案”即可继续审阅。";
-				if (approvals.pending) next = "在当前审阅面板选择确认、提出意见或暂停。";
-				if (executing.length) { if (approvals.confirmedStage === "design") stage = "实施进行中"; next = "等待当前任务收尾，再核对检查结论。"; }
-				else if (!ctx.isIdle() || ctx.hasPendingMessages()) next = "等待父 Pi 回合和排队消息收尾，再核对结果。";
-				else if (writer.fault || developer.fault) { stage = "需要核对未收尾的执行"; next = "展开详情核对原执行；确认没有在途任务且占用为残留后，可选择“解除占用”。"; }
-				else if (writer.pending || developer.pending) { stage = "等待收尾"; next = "等待文件操作和执行记录交回，暂不重放任务。"; }
-				if ((blockage.lease || blockage.operationLock) && !writer.pending && !developer.pending) { stage = "需要核对未结束的执行"; next = "展开详情核对原执行；确认没有在途任务且占用为残留后，可选择“解除占用”。"; }
-				const body = `交付状态\n当前阶段：${stage}\n下一步：${next}`
-					+ (running.length ? `\n当前任务：${running.map((task) => `${taskLabel(task)}（${task.status}${task.stage ? `，阶段：${task.stage}` : ""}）`).join("；")}` : !ctx.isIdle() ? "\n当前任务：父 Pi 回合运行中（无交付子任务）" : ctx.hasPendingMessages() ? "\n当前任务：等待排队消息" : "\n当前任务：无");
-				const detail = `${body}\n\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inherited.join(", ") || "无"}\n执行路径：\n${formatExecutionPaths(ctx.sessionManager.getBranch(), running)}\n`
-					+ (lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n记录不证明执行已停止。` : blockage.lease ? "占用记录无法解析，执行归属未知。" : "未发现 lease；不等于已取得授权。")
-					+ `\n残留操作锁：${blockage.operationLock ? "存在" : "无"}\n状态目录：${stateRoot}`
-					+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("");
-				if (ctx.mode !== "tui" || !ctx.hasUI) { ctx.ui.notify(detail, "info"); return false; }
-				const choices = ["关闭", "查看任务", ...(blockage.lease || blockage.operationLock ? ["解除占用"] : []), "结束交付"];
-				const choice = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) =>
-					new DeliveryPanel("交付状态", body, detail, choices, tui, theme, done, 0));
-				if (choice === "查看任务") await openTask(undefined, ctx);
-				else if (choice === "解除占用") await unlock(ctx);
-				return choice === "结束交付";
-			} catch (error) {
-				ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");
-				return false;
+		try {
+			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
+			const stateRoot = await getWriterStateRoot(workspace);
+			const blockage = await new WriterLeaseManager(stateRoot).inspectBlockage(workspace.key);
+			const lease = blockage.lease?.record;
+			const running = tasks();
+			const executing = running.filter((task) => !task.endedAt);
+			const taskLabel = (task: ReturnType<typeof tasks>[number]) => task.name.split(" · ", 1)[0] || task.name;
+			let stage = approvals.confirmedStage === "design" ? "等待下一步" : "等待方案确认";
+			let next = approvals.confirmedStage === "design" ? "说“继续”推进剩余工作。" : "整理方案并提交确认。";
+			if (approvals.pending) next = "在方案面板选择确认、提出意见或暂停。";
+			else if (executing.length) { stage = "实施进行中"; next = "等待当前任务完成。"; }
+			else if (!ctx.isIdle() || ctx.hasPendingMessages()) { stage = "当前回合未结束"; next = "等待本轮回合和排队消息完成。"; }
+			else if (writer.pending || developer.pending || blockage.lease || blockage.operationLock) {
+				stage = "等待恢复";
+				next = "说“继续”，插件会自动核对并在安全时恢复。";
+			} else if (approvals.confirmedStage === "design") {
+				stage = "可以结束交付";
+				next = "确认改动和结果后，可选择结束交付。";
 			}
+			const body = [`阶段：${stage}`, `下一步：${next}`, `运行中：${executing.length ? executing.map(taskLabel).join("；") : "无"}`].join("\n");
+			const detail = `${body}\n\n工作区：${workspace.workspacePath}\n运行模式：Pi 原生\n沿用 Pi 的工具：${inheritedTools(pi, entryPath).map((tool) => tool.name).join(", ") || "无"}\n执行路径：\n${formatExecutionPaths(ctx.sessionManager.getBranch(), running)}\n`
+				+ (lease ? `现场 lease：${lease.leaseId}\nowner：${lease.owner.kind}，PID ${lease.owner.pid}，Session ${lease.owner.sessionId}，执行 ${lease.owner.runId ?? "未记录"}\n记录不证明执行已停止。` : blockage.lease ? "占用记录无法解析，执行归属未知。" : "未发现 lease。")
+				+ `\n残留操作锁：${blockage.operationLock ? "存在" : "无"}\n状态目录：${stateRoot}`
+				+ running.map((task) => `\n任务 ${task.id}\n原始子 Session：${task.sessionFile ?? "尚未取得"}`).join("");
+			if (ctx.mode !== "tui" || !ctx.hasUI) { ctx.ui.notify(`交付状态\n${body}\n\n使用 /delivery-status 查看详情。`, "info"); return false; }
+			const canEnd = approvals.confirmedStage === "design" && !approvals.pending && !active.size && !ctx.hasPendingMessages()
+				&& ctx.isIdle() && !writer.pending && !developer.pending && !blockage.lease && !blockage.operationLock;
+			const choices = canEnd ? ["结束交付"] : [];
+			const choice = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) =>
+				new DeliveryPanel("交付状态", body, detail, choices, tui, theme, done, 0));
+			return choice === "结束交付";
+		} catch (error) {
+			ctx.ui.notify(`交付状态读取失败：${String(error)}`, "error");
+			return false;
+		}
 	};
 	return {
 		showStatus,
 		initialize: async () => {},
 		assertCanExit: async (ctx: ExtensionContext) => {
 			if (approvals.pending || active.size || (writer.pending && !writer.fault) || (developer.pending && !developer.fault)) {
-				throw new Error("交互或执行尚未收尾。请等待原始结果与写入权限交回，再选择“结束交付”。");
+				throw new Error("交互或执行尚未收尾；先等待当前任务结束或说“继续”完成恢复。");
 			}
 			// 已结束且未自动收尾的失败是终态记录；退出时说明，不再永久阻塞。
 			const stalled = [...(writer.pending && writer.fault ? [`父文档写入未收尾：${writer.fault}`] : []),
 				...(developer.pending && developer.fault ? [`交付委派未收尾：${developer.fault}`] : [])];
-			if (stalled.length) ctx.ui.notify(`以下现场未自动收尾。请展开状态详情核对；确认没有在途任务且占用为残留后，选择“解除占用”：\n${stalled.join("\n")}`, "warning");
+			if (stalled.length) ctx.ui.notify("上次交付有未自动收尾的记录；说“继续”后会先核对，再决定是否恢复。", "warning");
 			const workspace = await resolveWorkspaceIdentity(ctx.cwd);
 			const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 			try { await leases.assertIdle(workspace.key); }
-			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 请在状态面板展开详情核对；确认没有在途任务且占用为残留后，选择“解除占用”，再结束交付。`); }
+			catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)} 先说“继续”完成恢复，再结束交付。`); }
 		},
 		cleanup: async (ctx: ExtensionContext) => {
 			const directories = ctx.sessionManager.getEntries().flatMap((entry) => {

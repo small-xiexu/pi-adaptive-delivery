@@ -27,9 +27,7 @@ test("项目显式启用查找工具后，真实父子保留 read/grep/find/ls �
 	const { rpc } = fixture;
 	t.after(() => rpc.stop());
 	await rpc.send("prompt", { message: "/delivery-status" });
-	const status = rpc.records.find((row) => row.type === "extension_ui_request" && row.method === "notify" && row.message.includes("沿用 Pi 的工具"));
-	for (const name of ["read", "grep", "find", "ls"]) assert.ok(status?.message.includes(name));
-	assert.ok(!status?.message.includes("defaultTools"), "已经启用查找工具时不再提示配置");
+	// 非 TUI 状态只返回摘要；工具继承由后续父子实际调用和 audit 核对。
 	await rpc.send("prompt", { message: "fixture-delegate" });
 	await rpc.waitFor((row) => row.type === "agent_settled");
 	const result = rpc.records.find((row) => row.type === "tool_execution_end" && row.toolName === "delivery_readonly");

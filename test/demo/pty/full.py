@@ -240,6 +240,9 @@ def status_action(label):
         if not visible():
             return False
         if any("→" in line and label in line for line in screen().splitlines()):
+            if label == "结束交付":
+                driver.write("\x1b[B")
+                driver.pump(quiet=0.4, timeout=3)
             driver.write("\r")
             driver.pump(quiet=1.0, timeout=6)
             if not visible():
@@ -294,23 +297,16 @@ try:
     driver.wait_quiet(90, timeout=2400)      # 开发 + 审查跑完且正文静止
     log("=== 正文静止后的屏幕 ===\n" + screen())
     heart("回合结束")
-    if not status_action("查看任务"):
-        raise RuntimeError("状态面板未能选择查看任务")
-    if wait_for(r"子任务详情|还没有交付子任务", timeout=90, note="查看任务"):
-        if re.search(r"子任务详情\s*·\s*共", screen()):
-            driver.write("\r")
-            driver.pump(quiet=0.6, timeout=4)
-            wait_for(r"子任务详情", timeout=90, note="任务详情")
-        log("=== 任务详情 ===\n" + screen())
-        driver.write("\x1b")
-        driver.pump(quiet=0.5, timeout=3)
-    status_action("结束交付")
-    if not wait_for_exit(timeout=120):
-        log("首次结束未形成收尾记录，等待回合完全空闲后重试；不自动解除占用")
-        driver.wait_quiet(15, timeout=180)
-        status_action("结束交付")
-        if not wait_for_exit(timeout=120):
-            log("结束重试仍未形成收尾记录，保留现场并结束驱动器；需要人工核对原 Session")
+    log("=== 状态摘要 ===")
+    if not send("/delivery-status", expect_session=False, confirmation=lambda: "阶段：" in screen()):
+        raise RuntimeError("状态面板未能显示摘要")
+    log("=== 状态详情（Ctrl+O）请按需查看 ===\n" + screen())
+    driver.write("继续，先核对已完成工作和原执行状态，再推进剩余工作。")
+    driver.write("\r")
+    driver.pump(quiet=1.0, timeout=8)
+    driver.wait_quiet(90, timeout=2400)
+    if not status_action("结束交付"):
+        log("结束交付当前不可用，保留现场并结束驱动器；需要核对原 Session")
     log("=== 最终屏幕 ===\n" + screen())
 finally:
     with open(os.path.join(ROOT, "raw.bin"), "wb") as handle:

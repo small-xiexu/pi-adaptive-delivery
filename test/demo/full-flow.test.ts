@@ -41,8 +41,10 @@ function createCaptureUI() {
 			}
 			panels.push({ title: panel.title ?? "", width: 100, lines: panel.render(100) });
 			panels.push({ title: `${panel.title ?? ""} · 窄屏 52 列`, width: 52, lines: panel.render(52) });
-			const action = planned.shift();
 			const choices = panel.choices ?? [];
+			if (!choices.length) { done(undefined); return await result; }
+			const action = planned.shift();
+			if (panel.title === "交付状态" && !action) { done(undefined); return await result; }
 			if (action?.kind === "feedback") {
 				// 与真实 TUI 相同：上移到“提出修改意见”，回车打开输入，粘贴正文后再回车发送。
 				panel.handleInput?.("\x1b[A");
@@ -54,7 +56,7 @@ function createCaptureUI() {
 			const label = action?.kind === "choice" ? action.label : fallback(panel.title ?? "", choices);
 			const index = choices.indexOf(label);
 			assert.ok(index >= 0, `面板 ${panel.title} 没有选项「${label}」，实际：${choices.join(" / ")}`);
-			if (panel.title === "解除上次任务的占用") confirm = panel.render(100).join("\n");
+			if (panel.title === "交付状态" && choices.length === 1 && index === 0) panel.handleInput?.("\x1b[B");
 			const delta = index - (panel.title === "交付状态" ? 0 : choices.length - 1);
 			for (let i = 0; i < Math.abs(delta); i++) panel.handleInput?.(delta < 0 ? "\x1b[A" : "\x1b[B");
 			panel.handleInput?.("\r");
@@ -178,36 +180,27 @@ test("demo：真实 demo 项目走完整交付流程并打印交互原文", { ti
 	show("改动后检查", [`$ node inputs/command.cjs → 退出码 ${after.code}`, brief(after.output, 400)]);
 	assert.equal(after.code, 0);
 
-	section("8 · 状态面板与任务详情");
+	section("8 · 状态摘要和技术详情");
 	await h.status();
 	show("交付状态面板", capture.panels.filter((panel) => panel.title === "交付状态").at(-1)?.lines ?? []);
-	capture.planned.push({ kind: "choice", label: "查看任务" });
-	await h.status("查看任务");
-	const detailPanels = capture.panels.filter((panel) => panel.width === 100).slice(-1);
-	show("任务详情面板（原文）", detailPanels.length ? detailPanels[0]!.lines : ["（未打开）"]);
 
-	section("9 · 残留现场：结束被拒 → 明确解除占用 → 正常结束");
+	section("9 · 继续时核对残留并恢复");
 	const workspace = await resolveWorkspaceIdentity(h.cwd);
 	const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 	const stale = await leases.acquire(workspace, { kind: "parent", sessionId: "demo-crashed-session", pid: process.pid, runId: "demo-stale" });
 	assert.ok(stale.ok);
 	await mkdir(path.join(await getWriterStateRoot(workspace), "leases", `${workspace.key}.operation-lock`), { recursive: true });
-	capture.planned.push({ kind: "choice", label: "结束交付" });
-	await h.status("结束交付");
-	show("第一次结束（应被拒并给出线索）", [h.notices.at(-1)!]);
-	assert.match(h.notices.at(-1)!, /暂不能结束交付/);
-	assert.ok((h.session as unknown as { getActiveToolNames(): string[] }).getActiveToolNames().includes("delivery_approval"));
-
-	capture.planned.push({ kind: "choice", label: "解除占用" }, { kind: "choice", label: "解除占用" });
-	await h.status("解除占用");
-	show("强制清理确认框（原文）", [capture.confirmText ?? "（未触发确认）"]);
-	show("清理结果", [h.notices.at(-1)!]);
+	capture.planned.push({ kind: "choice", label: "清理残留并继续" });
+	const recovered = await h.call("delivery_develop", { task: "继续前核对残留并完成最后复验。", paths: ["src"], inputs: [] });
+	assert.equal(recovered.isError, false, JSON.stringify(recovered));
+	show("恢复结果", [h.notices.at(-1) ?? "未产生恢复提示"]);
 	assert.equal(await leases.read(workspace.key), undefined);
 	ok("残留操作锁是否清理", (await leases.inspectBlockage(workspace.key)).operationLock ? "仍在（异常）" : "已清理");
 
+	section("10 · 明确结束交付");
 	capture.planned.push({ kind: "choice", label: "结束交付" });
 	await h.status("结束交付");
-	show("第二次结束", h.notices.slice(-2));
+	show("结束结果", h.notices.slice(-2));
 	const active = (h.session as unknown as { getActiveToolNames(): string[] }).getActiveToolNames();
 	ok("退出后主 Pi 工具", active.join(", "));
 	assert.ok(!active.some((name) => name.startsWith("delivery_")), "退出后不应残留交付命令工具");

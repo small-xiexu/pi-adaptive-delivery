@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // 真实模型全流程验证：真实 SDK 父会话 + 真实子 Pi CLI + 真实项目检查 + 真实 writer lease。
 // 覆盖：拷问式对齐 → 规划文档落盘 → 意见轮 → 一次方案确认并开始实施 → 开发 → 注入缺陷 → 审查报缺陷 →
-//       返工（按新默认规则）→ 状态/任务弹层 → 残留占用 → 结束被拒 → 面板明确解除占用 → 正常结束。
+//       返工（按新默认规则）→ 状态摘要与技术详情 → 继续时核对残留 → 明确结束交付。
 // 认证由 Pi 自己从符号链接的 auth.json 读取；本脚本不读取、不复制、不打印任何凭证。
 // 用法：node --import tsx test/demo/real-model-full.ts
 import { execFileSync, spawnSync } from "node:child_process";
@@ -88,8 +88,7 @@ const confirmations: string[] = [];
 let feedbackGiven = false;
 let injected = false;
 let injectNote = "";
-let unlockConfirmed = false;
-let statusAction = "关闭";
+let statusAction: string | undefined;
 const custom = (async (factory: any, options: any) => {
 	let done!: (value: unknown) => void;
 	const result = new Promise<unknown>((resolve) => { done = resolve; });
@@ -113,14 +112,13 @@ const custom = (async (factory: any, options: any) => {
 			panel.handleInput?.("\r");
 			return await result;
 		}
-		const label = panel.title === "交付状态" ? statusAction : choices[0]!;
-		if (panel.title === "解除上次任务的占用") {
-			unlockConfirmed = true;
-			confirmations.push(panel.render(100).join("\n"));
-		}
+		if (!choices.length) { done(undefined); return await result; }
+		if (panel.title === "交付状态" && !statusAction) { done(undefined); return await result; }
+		const label = panel.title === "交付状态" ? statusAction! : choices[0]!;
 		say(`\n【面板】${panel.title} → ${label}`);
 		const index = choices.indexOf(label);
 		if (index < 0) throw new Error(`状态操作不存在：${label}`);
+		if (panel.title === "交付状态" && choices.length === 1 && label === "结束交付") panel.handleInput?.("\x1b[B");
 		const delta = index - (panel.title === "交付状态" ? 0 : choices.length - 1);
 		for (let i = 0; i < Math.abs(delta); i++) panel.handleInput?.(delta < 0 ? "\x1b[A" : "\x1b[B");
 		panel.handleInput?.("\r");
@@ -130,7 +128,6 @@ const custom = (async (factory: any, options: any) => {
 const confirmFn: ExtensionUIContext["confirm"] = async (title, message) => {
 	confirmations.push(`${title}\n${brief(message, 400)}`);
 	say(`\n【确认框】${title}`);
-	if (title.includes("强制清理")) unlockConfirmed = true;
 	return true;
 };
 const selectFn: ExtensionUIContext["select"] = async (_title, items) => items[0];
@@ -256,34 +253,23 @@ const leases = new WriterLeaseManager(await getWriterStateRoot(workspace));
 say(`残留 lease：${(await leases.read(workspace.key)) ? "有" : "无"}`);
 say(`git status：\n${spawnSync("/usr/bin/git", ["status", "--short"], { cwd, encoding: "utf8" }).stdout.trim()}`);
 
-section("5 · 状态、任务弹层、退出与人工解锁");
+section("5 · 状态摘要、继续恢复与结束");
 await step("/delivery-status", "/delivery-status", 2000);
-say(`\n[通知] ${brief(notices.at(-1) ?? "", 400)}`);
-statusAction = "查看任务";
-await step("状态面板查看任务", "/delivery-status", 4000);
-statusAction = "关闭";
-const detail = panels.at(-1);
-if (detail) say(`\n【任务弹层】${detail.title}\n${detail.lines.slice(0, 12).join("\n")}`);
-// 造残留现场：真实 lease + 操作锁
+say(`\n[状态] ${brief(notices.at(-1) ?? "", 400)}`);
+// 造残留现场：真实 lease + 操作锁；下一次继续由交付工具先核对恢复。
 const stale = await leases.acquire(workspace, { kind: "parent", sessionId: "demo-crashed", pid: process.pid, runId: "demo-stale" });
 if (stale.ok) await mkdir(path.join(await getWriterStateRoot(workspace), "leases", `${workspace.key}.operation-lock`), { recursive: true });
+await step("继续时自动核对残留", "继续，先核对原执行和当前占用，再推进剩余工作。", 4000);
+say(`\n[恢复后 lease] ${(await leases.read(workspace.key)) ? "仍有" : "已清理"}`);
+await step("再次查看状态", "/delivery-status", 2000);
 statusAction = "结束交付";
-await step("结束（应被拒）", "/delivery-status", 2500);
-say(`\n[通知] ${brief(notices.at(-1) ?? "", 300)}`);
-statusAction = "解除占用";
-await step("明确解除占用", "/delivery-status", 2500);
-say(`\n[确认框原文]\n${confirmations.at(-1) ?? "（未触发）"}`);
-say(`[通知] ${brief(notices.at(-1) ?? "", 300)}`);
-say(`解锁后残留 lease：${(await leases.read(workspace.key)) ? "仍有" : "已清理"}`);
-statusAction = "结束交付";
-await step("再次结束", "/delivery-status", 5000);
-statusAction = "关闭";
+await step("明确结束交付", "/delivery-status", 5000);
 say(`\n[通知] ${brief(notices.at(-1) ?? "", 300)}`);
 
 section("6 · 证据位置");
 say(`隔离根：${root}`);
 say(`父会话：${sm.getSessionFile()}`);
 say(`子会话目录：${path.join(agentDir, "sessions")}`);
-say(`解锁二次确认：${unlockConfirmed ? "已触发" : "未触发"}`);
+say(`恢复确认记录：${confirmations.length ? `${confirmations.length} 条` : "无"}`);
 say(`剩余时间：${Math.max(0, Math.round((deadline - Date.now()) / 1000))} 秒`);
 session.dispose();
